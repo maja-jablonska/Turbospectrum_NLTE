@@ -7,3 +7,7 @@
 /DATA/E161 filter=lfs diff=lfs merge=lfs -text
 /DATA/energy-levels-BarberH2O.txt filter=lfs diff=lfs merge=lfs -text
 /COM-v19.2/TEST-data/nlte_linelist_test.txt filter=lfs diff=lfs merge=lfs -text
+/COM/DATA/Anstee-1802-2014.dat filter=lfs diff=lfs merge=lfs -text
+/COM/DATA/E161 filter=lfs diff=lfs merge=lfs -text
+/COM/DATA/energy-levels-BarberH2O.txt filter=lfs diff=lfs merge=lfs -text
+/COM/TEST-data/nlte_linelist_test.txt filter=lfs diff=lfs merge=lfs -text
