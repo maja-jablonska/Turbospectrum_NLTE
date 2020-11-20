@@ -13,3 +13,6 @@
 /COM/TEST-data/nlte_linelist_test.txt filter=lfs diff=lfs merge=lfs -text
 /COM/TEST-data/lte_linelist_test.txt filter=lfs diff=lfs merge=lfs -text
 /COM/TEST-data/nlte_ges_linelist_ca_only.txt filter=lfs diff=lfs merge=lfs -text
+/COM/OBSOLETE/Anstee-1802-2014.dat filter=lfs diff=lfs merge=lfs -text
+/COM/OBSOLETE/E161 filter=lfs diff=lfs merge=lfs -text
+/COM/OBSOLETE/energy-levels-BarberH2O.txt filter=lfs diff=lfs merge=lfs -text
