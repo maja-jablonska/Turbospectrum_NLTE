@@ -18,3 +18,4 @@
 /COM/OBSOLETE/energy-levels-BarberH2O.txt filter=lfs diff=lfs merge=lfs -text
 /COM/TEST-data/atom.fe607a filter=lfs diff=lfs merge=lfs -text
 /COM/TEST-data/nlte_ges_linelist_ca_fe.txt filter=lfs diff=lfs merge=lfs -text
+/DATA/MODELATOMS/atom.fe607a filter=lfs diff=lfs merge=lfs -text
