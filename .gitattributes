@@ -20,3 +20,4 @@
 /COM/TEST-data/nlte_ges_linelist_ca_fe.txt filter=lfs diff=lfs merge=lfs -text
 /DATA/MODELATOMS/atom.fe607a filter=lfs diff=lfs merge=lfs -text
 /DATA/nlte_ges_linelist.txt filter=lfs diff=lfs merge=lfs -text
+/COM/linelists/nlte_ges_linelist_jmg17feb2022_I_II filter=lfs diff=lfs merge=lfs -text
