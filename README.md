@@ -17,5 +17,11 @@ https://github.com/EkaterinaSe/TurboSpectrum-Wrapper/
 and another one there:
 https://github.com/JGerbs13/TSFitPy
 
+Ida Hellqvist (https://github.com/littlepadawan) has developped a wrapper (TASS) that allows the automatic generation of large amounts of synthetic spectra from a grid of model atmospheres. It is available there:
+https://github.com/littlepadawan/TASS
+
+Her Bachelor thesis is available here: 
+https://uu.diva-portal.org/smash/record.jsf?pid=diva2:1880829
+
 Molecular line lists can be found at: 
 https://box.in2p3.fr/s/Sn72KPCmC8rYQqa
