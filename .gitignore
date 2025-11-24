@@ -43,3 +43,7 @@ tmp/
 logs/
 scripts/*.pyc
 
+COM/contopac/*
+input_files/*
+
+*/*.code-workspace
