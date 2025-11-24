@@ -1,0 +1,51 @@
+# Configuration for the parameter grid
+
+# Stellar Parameters
+teff:
+  min: 5000
+  max: 6250
+  step: 250
+
+logg:
+  min: 3.5
+  max: 5.0
+  step: 0.5
+
+feh:
+  min: -1.0
+  max: 0.5
+  step: 0.5
+
+# Microturbulence parameter (t_value)
+# Refer to your model_list for available values (e.g., 00, 01, 02, 05)
+t_value: ["00", "01", "02", "05"]
+
+# Abundance parameters (a, c, n, o, r, s)
+# These should be lists of strings, e.g., ["+0.00", "+0.10"]
+a: ["+0.00"]
+c: ["+0.00"]
+n: ["+0.00"]
+o: ["+0.00"]
+r: ["+0.00"]
+s: ["+0.00"]
+
+# Synthesis Parameters
+lam_min: 6000
+lam_max: 6100
+lam_step: 0.01
+
+# Turbospectrum velocity (turbvel) - should be a two-digit string (e.g., 00, 01, 10)
+turbvel: "01"
+
+# --- Calculation Modes ---
+
+# output_mode: The type of spectrum to calculate. Can be 'Flux' or 'Intensity'.
+# Note: Both modes produce a continuum-normalized output (Fx/Fcont or Ix/Icont)
+# alongside the absolute flux/intensity, as per the documentation.
+output_mode: "Flux"
+
+# mode: The model dimensionality. Can be '1D' or '3D'.
+mode: "1D"
+
+# calculation_mode: The physics to use. Can be 'LTE' or 'NLTE'.
+calculation_mode: "LTE"

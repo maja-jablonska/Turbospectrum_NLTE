@@ -658,7 +658,6 @@ c-------------------------------------------------------------------------------
      & bTAULN,NbTAU,IbTER,erad
       common /radius/ radius
       OPEN(UNIT=10,FILE=FILE,STATUS='OLD',FORM='UNFORMATTED')
-c     &     convert='big_endian')
 ccc     &     RECL=152600)
 *
       CALL READMO(10,NDEPTH,TEFF,GG,metal,sph)
