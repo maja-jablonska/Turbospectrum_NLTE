@@ -36,3 +36,10 @@ babsma_lu
 *.exe
 *.out
 *.app
+
+spectra/
+*/*.dat
+tmp/
+logs/
+scripts/*.pyc
+
