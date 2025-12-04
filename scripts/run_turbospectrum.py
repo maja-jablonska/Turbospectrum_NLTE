@@ -5,8 +5,10 @@ import multiprocessing
 import time
 import glob
 import re
+import dataclasses
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict
+import json
 
 # =============================================================================
 # CONFIGURATION
@@ -17,6 +19,10 @@ class TurbospectrumConfig:
     # Paths
     project_root: str
     compiler: str = "gf"  # 'gf' or 'intel'
+    # NLTE options
+    nlte: bool = False
+    nlte_info_file: str = ""
+    force: bool = False
     
     # Input Directories (Absolute paths recommended)
     model_atmosphere_path: str = ""
@@ -37,6 +43,16 @@ class TurbospectrumConfig:
     calculate_intensity: bool = False
     mu_angles: List[float] = field(default_factory=list)
 
+    # Synthesis Parameters
+    lambda_min: float = 4000
+    lambda_max: float = 8000
+    lambda_step: float = 0.1
+    model_opac_dir: str = "COM/contopac"
+
+    # Grid Points
+    # Format: [[Teff, logg, Fe/H, microturb_str], ...]
+    grid_points: List[Tuple] = field(default_factory=list)
+
     def __post_init__(self):
         # Set derived paths if not provided
         if not self.model_atmosphere_path:
@@ -46,6 +62,9 @@ class TurbospectrumConfig:
         if self.linelist_files is None:
             # Default to the one we found or empty
             self.linelist_files = ["nlte_ges_linelist_jmg6may2025_I_II"]
+        # Ensure NLTE info file has a default if NLTE is enabled
+        if self.nlte and not self.nlte_info_file:
+            self.nlte_info_file = os.path.join(self.project_root, "DATA", "SPECIES_LTE_NLTE.dat")
         if not self.output_dir:
             self.output_dir = os.path.join(self.project_root, "spectra")
         if not self.log_dir:
@@ -60,25 +79,12 @@ class TurbospectrumConfig:
         # Interpolator is usually in a separate directory
         self.interpol_path = os.path.join(self.project_root, "interpolator", self.interpol_exec)
 
-# =============================================================================
-# INPUT PARAMETERS
-# =============================================================================
+        print("\n--- Turbospectrum Configuration ---")
+        for key, value in dataclasses.asdict(self).items():
+            print(f"{key}: {value}")
+        print("-----------------------------------")
 
-# Define the grid of parameters here or load from a file
-# Format: (Teff, logg, Fe/H, microturb_str)
-# Example grid points:
-# You should populate this list with your desired parameters.
-# Ensure that model atmosphere files exist for these parameters.
-GRID_POINTS = [
-    (2500, 3.0, 0.00, "01"),  # Example point (corresponds to t=1.0 km/s)
-    # (5777, 4.44, 0.00, "01"), # Sun
-]
 
-# Synthesis Parameters
-LAMBDA_MIN = 4800
-LAMBDA_MAX = 4900
-LAMBDA_STEP = 0.01
-MODEL_OPAC_DIR = "COM/contopac" # Relative to project root usually, or absolute
 
 # =============================================================================
 # LOGIC
@@ -88,7 +94,7 @@ def ensure_directories(config: TurbospectrumConfig):
     for path in [config.output_dir, config.log_dir, config.tmp_dir]:
         os.makedirs(path, exist_ok=True)
     # Also ensure opac dir exists
-    opac_full_path = os.path.join(config.project_root, MODEL_OPAC_DIR)
+    opac_full_path = os.path.join(config.project_root, config.model_opac_dir)
     os.makedirs(opac_full_path, exist_ok=True)
 
 def create_linelist_file(config: TurbospectrumConfig) -> str:
@@ -268,8 +274,24 @@ def run_single_synthesis(args):
     
     base_name = os.path.splitext(model_file)[0]
     log_file = os.path.join(config.log_dir, f"{base_name}.log")
-    opac_path = os.path.join(config.project_root, MODEL_OPAC_DIR, f"{base_name}opac")
+    opac_path = os.path.join(config.project_root, config.model_opac_dir, f"{base_name}opac")
     result_file = os.path.join(config.output_dir, f"{base_name}.spec")
+    
+    # Check if output exists and skip if force is False
+    expected_outputs = []
+    if config.calculate_intensity:
+        expected_outputs.append(os.path.join(config.output_dir, f"{base_name}.intensity.spec"))
+    else:
+        expected_outputs.append(os.path.join(config.output_dir, f"{base_name}.spec"))
+
+    if not config.force:
+        all_exist = True
+        for f in expected_outputs:
+            if not os.path.exists(f):
+                all_exist = False
+                break
+        if all_exist:
+            return f"WARNING: Skipping {base_name}, output exists."
     
     # Check if model exists, if not try to interpolate
     if not os.path.exists(model_path):
@@ -302,9 +324,9 @@ def run_single_synthesis(args):
         # ---------------------------------------------------------------------
         # Step 1: BABSMA (Continuous Opacity)
         # ---------------------------------------------------------------------
-        babsma_input = f"""'LAMBDA_MIN:'  '{LAMBDA_MIN}'
-'LAMBDA_MAX:'  '{LAMBDA_MAX}'
-'LAMBDA_STEP:' '{LAMBDA_STEP}'
+        babsma_input = f"""'LAMBDA_MIN:'  '{config.lambda_min}'
+'LAMBDA_MAX:'  '{config.lambda_max}'
+'LAMBDA_STEP:' '{config.lambda_step}'
 'MODELINPUT:' '{model_path}'
 'MARCS-FILE:' '{marcs_flag}'
 'MODELOPAC:' '{opac_path}'
@@ -364,11 +386,11 @@ def run_single_synthesis(args):
             
             current_result_file = os.path.join(config.output_dir, f"{base_name}{suffix}.spec")
             
-            bsyn_input = f"""'NLTE :'          '.false.'
-'NLTEINFOFILE:'  'DATA/SPECIES_LTE_NLTE.dat'
-'LAMBDA_MIN:'     '{LAMBDA_MIN}'
-'LAMBDA_MAX:'     '{LAMBDA_MAX}'
-'LAMBDA_STEP:'    '{LAMBDA_STEP}'
+            bsyn_input = f"""'NLTE :'          '{'.true.' if config.nlte else '.false.'}'
+'NLTEINFOFILE:'  '{config.nlte_info_file if config.nlte_info_file else 'DATA/SPECIES_LTE_NLTE.dat'}'
+'LAMBDA_MIN:'     '{config.lambda_min}'
+'LAMBDA_MAX:'     '{config.lambda_max}'
+'LAMBDA_STEP:'    '{config.lambda_step}'
 'INTENSITY/FLUX:' '{mode_str}'
 'MODELOPAC:' '{opac_path}'
 'RESULTFILE :' '{current_result_file}'
@@ -451,13 +473,33 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir) if os.path.basename(script_dir) == "scripts" else script_dir
     
-    config = TurbospectrumConfig(project_root=project_root)
+    # Parse arguments manually to handle --force and config file
+    args = sys.argv[1:]
+    force_flag = False
+    if "--force" in args:
+        force_flag = True
+        args.remove("--force")
+    
+    # Load configuration from JSON file if provided as argument
+    if len(args) > 0:
+        config_path = args[0]
+        with open(config_path, 'r') as f:
+            cfg_data = json.load(f)
+        if 'project_root' not in cfg_data:
+            cfg_data['project_root'] = project_root
+        config = TurbospectrumConfig(**cfg_data)
+    else:
+        config = TurbospectrumConfig(project_root=project_root)
+    
+    # Apply force flag
+    if force_flag:
+        config.force = True
     
     # Example: Enable intensity calculation
     # config.calculate_intensity = True
     # config.mu_angles = [1.0, 0.8, 0.6, 0.4, 0.2]
     
-    run_grid(config, GRID_POINTS)
+    run_grid(config, config.grid_points)
 
 if __name__ == "__main__":
     main()
