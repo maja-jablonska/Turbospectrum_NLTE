@@ -6,10 +6,12 @@ import time
 import glob
 import re
 import dataclasses
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Iterator
 import json
 import csv
+from datetime import datetime
 
 # =============================================================================
 # CONFIGURATION
@@ -351,7 +353,20 @@ class ModelInterpolator:
 def run_single_synthesis(args):
     params, config = args
     teff, logg, feh, turb_str = params
-    
+
+    def build_result(status: str, message: str):
+        return {
+            "base_name": base_name,
+            "params": {
+                "teff": teff,
+                "logg": logg,
+                "feh": feh,
+                "turb": turb_str,
+            },
+            "status": status,
+            "message": message,
+        }
+
     # Map turb_str to float for babsma input if needed
     # Assuming "01" -> 1.0, "02" -> 2.0 etc.
     try:
@@ -383,7 +398,7 @@ def run_single_synthesis(args):
                 all_exist = False
                 break
         if all_exist:
-            return f"WARNING: Skipping {base_name}, output exists."
+            return build_result("skipped", "Output already exists")
     
     # Check if model exists, if not try to interpolate
     if not os.path.exists(model_path):
@@ -393,7 +408,7 @@ def run_single_synthesis(args):
         interpolator = ModelInterpolator(config)
         success, message = interpolator.interpolate(teff, logg, feh, turb_str, model_path)
         if not success:
-            return f"ERROR: Model not found and interpolation failed: {model_path}\nReason: {message}"
+            return build_result("error", f"Model missing and interpolation failed: {message}")
         else:
             # Log interpolation success?
             pass
@@ -446,9 +461,9 @@ def run_single_synthesis(args):
                 cwd=config.project_root # Run from root so relative paths in Fortran work if needed
             )
             if process.returncode != 0:
-                return f"ERROR: babsma failed for {base_name}"
+                return build_result("error", "babsma failed")
         except Exception as e:
-            return f"EXCEPTION: babsma execution failed: {e}"
+            return build_result("exception", f"babsma execution failed: {e}")
 
         # ---------------------------------------------------------------------
         # Step 2: BSYN (Spectral Synthesis)
@@ -515,11 +530,11 @@ def run_single_synthesis(args):
                     cwd=config.project_root
                 )
                 if process.returncode != 0:
-                    return f"ERROR: bsyn failed for {base_name} ({mode_str})"
+                    return build_result("error", f"bsyn failed ({mode_str})")
             except Exception as e:
-                return f"EXCEPTION: bsyn execution failed: {e}"
+                return build_result("exception", f"bsyn execution failed: {e}")
 
-    return f"SUCCESS: {base_name}"
+    return build_result("success", "Synthesis complete")
 
 def run_grid(config: TurbospectrumConfig, grid_points: List[Tuple]):
     """
@@ -548,16 +563,38 @@ def run_grid(config: TurbospectrumConfig, grid_points: List[Tuple]):
         results = pool.map(run_single_synthesis, tasks)
         
     end_time = time.time()
-    
+
     # Report results
     print("\n--- Summary ---")
-    success_count = 0
+    status_counts = Counter(res["status"] for res in results)
+    summary_lines = []
+
     for res in results:
-        print(res)
-        if res.startswith("SUCCESS"):
-            success_count += 1
-            
-    print(f"\nCompleted {success_count}/{len(grid_points)} calculations in {end_time - start_time:.2f} seconds.")
+        params = res["params"]
+        line = (
+            f"{res['status'].upper():<9} {res['base_name']} "
+            f"(Teff={params['teff']}, logg={params['logg']}, FeH={params['feh']}, turb={params['turb']}): "
+            f"{res['message']}"
+        )
+        print(line)
+        summary_lines.append(line)
+
+    print(f"\nCompleted {status_counts.get('success', 0)}/{len(grid_points)} calculations in {end_time - start_time:.2f} seconds.")
+
+    summary_header = [
+        f"Turbospectrum synthesis summary - {datetime.now().isoformat()}",
+        f"Total grid points: {len(grid_points)}",
+        "Status counts: " + ", ".join(
+            f"{status}={count}" for status, count in sorted(status_counts.items())
+        ),
+        "",
+    ]
+
+    summary_path = os.path.join(config.log_dir, f"synthesis_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    with open(summary_path, "w") as summary_file:
+        summary_file.write("\n".join(summary_header + summary_lines))
+
+    print(f"Summary log written to {summary_path}")
 
 def main():
     # Detect project root (assuming this script is in scripts/ or root)
