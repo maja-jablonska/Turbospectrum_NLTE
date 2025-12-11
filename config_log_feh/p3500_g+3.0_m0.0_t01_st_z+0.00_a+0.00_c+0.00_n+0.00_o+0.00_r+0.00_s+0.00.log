@@ -1,0 +1,930 @@
+
+ ***********************
+ * BABSMA version 20.1 *
+ ***********************
+
+ Babsma.f HI k,edge(k)           2   3647.0008206568491     
+ Babsma.f HI k,edge(k)           3   8207.0035545063820     
+ Babsma.f HI k,edge(k)           4   14588.002834593892     
+ Babsma.f HI k,edge(k)           5   22794.000047787813     
+ Babsma.f HI k,edge(k)           6   32915.002767557271     
+ LAMBDA_MIN:4000
+ LAMBDA_MAX:8000
+ LAMBDA_STEP:0.1
+ MODELINPUT:/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/model_atmospheres/1D/marcs_standard_comp/marcs_standard_comp/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod
+ MARCS-FILE:.true.
+ MODELOPAC:/Users/mjablons/Documents/Turbospectrum_NLTE/COM/contopac/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00opac
+ ABUND_SOURCE:magg
+ METALLICITY:0.0
+ ALPHA/Fe   :0.00
+ HELIUM     :0.00
+ R-PROCESS  :0.00
+ S-PROCESS  :0.00
+ INDIVIDUAL ABUNDANCES:0
+ XIFIX:T
+ Following atomic species included in molecular equilibrium:
+ H  He Li Be B  C  N  O  F  Ne 
+ Na Mg Al Si P  S  Cl Ar K  Ca 
+ Sc Ti V  Cr Mn Fe Co Ni Cu Zn 
+ Ga Ge As Se Br Kr Rb Sr Y  Zr 
+ Nb Mo Tc Ru Rh Pd Ag Cd In Sn 
+ Sb Te I  Xe Cs Ba La Ce Pr Nd 
+ Pm Sm Eu Gd Tb Dy Ho Er Tm Yb 
+ Lu Hf Ta W  Re Os Ir Pt Au Hg 
+ Tl Pb Bi Po At Rn Fr Ra Ac Th 
+ Pa U                          
+        4101  wavelengths for continuum between:    4000.00000      and    8100.00000    
+ babsma callinbg makeabudmagg        
+ Abundance is scaled from Magg et al. 2022
+ metallicity changed by    0.00000000      dex
+ opened unformatted
+ read record 1
+ iostat=           0
+ read record 2
+ iostat=          -1
+ mocodep3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.0
+ MARCS model format is ascii     
+ p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.0
+ This model seems to be an ascii MARCS model
+  this model is PLANE PARALLEL
+ Beware !! Lambda standard assumed to be 5000 A
+  Make sure it is consistent with the model
+ injon; after inquire, model format (marcsformat) is: FORMATTED                     
+ UTPUT:          11           7
+ WARNING! we do not use the model abundances!!!
+ adopted abundances: 
+   12.0000000       10.9300003       8.56000042       7.98000002       8.77000046       8.14999962       6.32999992       7.57999992       6.48000002       7.56699991       7.21000004       5.11999989       6.32000017       5.69000006       7.51000023       6.25000000       3.08999991       4.96000004       4.01000023       5.53000021       4.92000008    
+ inabs done
+ ELEMENT  ATOMIC NUMBER   LOG(ABUNDANCE)
+     H             1       12.000
+     He            2       10.930
+     Li            3        1.050
+     Be            4        1.380
+     B             5        2.700
+     C             6        8.560
+     N             7        7.980
+     O             8        8.770
+     F             9        4.670
+     Ne           10        8.150
+     Na           11        6.330
+     Mg           12        7.580
+     Al           13        6.480
+     Si           14        7.567
+     P            15        5.480
+     S            16        7.210
+     Cl           17        5.290
+     Ar           18        6.500
+     K            19        5.120
+     Ca           20        6.320
+     Sc           21        3.090
+     Ti           22        4.960
+     V            23        4.010
+     Cr           24        5.690
+     Mn           25        5.530
+     Fe           26        7.510
+     Co           27        4.920
+     Ni           28        6.250
+     Cu           29        4.210
+     Zn           30        4.600
+     Ga           31        2.880
+     Ge           32        3.580
+     As           33        2.290
+     Se           34        3.330
+     Br           35        2.560
+     Kr           36        3.250
+     Rb           37        2.600
+     Sr           38        2.920
+     Y            39        2.210
+     Zr           40        2.580
+     Nb           41        1.420
+     Mo           42        1.920
+     Ru           44        1.840
+     Rh           45        1.120
+     Pd           46        1.660
+     Ag           47        0.940
+     Cd           48        1.770
+     In           49        1.600
+     Sn           50        2.000
+     Sb           51        1.000
+     Te           52        2.190
+     I            53        1.510
+     Xe           54        2.240
+     Cs           55        1.070
+     Ba           56        2.170
+     La           57        1.130
+     Ce           58        1.700
+     Pr           59        0.580
+     Nd           60        1.450
+     Sm           62        1.000
+     Eu           63        0.520
+     Gd           64        1.110
+     Tb           65        0.280
+     Dy           66        1.140
+     Ho           67        0.510
+     Er           68        0.930
+     Tm           69        0.000
+     Yb           70        1.080
+     Lu           71        0.060
+     Hf           72        0.880
+     Ta           73       -0.170
+     W            74        1.110
+     Re           75        0.230
+     Os           76        1.250
+     Ir           77        1.380
+     Pt           78        1.640
+     Au           79        1.010
+     Hg           80        1.130
+     Tl           81        0.900
+     Pb           82        2.000
+     Bi           83        0.650
+     Th           90        0.060
+     U            92       -0.520
+ MOLECPARTF. suppressing:         206  LaH                 (unknown D00)
+ MOLECPARTF. suppressing:         209  LuH                 (unknown D00)
+ MOLECPARTF. suppressing:         212  NbN                 (unknown D00)
+ MOLECPARTF. suppressing:         231  SbH                 (unknown D00)
+ MOLECPARTF. suppressing:         252  TeCl                (unknown D00)
+ MOLECPARTF. suppressing:         267  Al+ H               (unknown D00)
+ MOLECPARTF. suppressing:         267  As+ O               (unknown D00)
+ MOLECPARTF. suppressing:         269  B + O               (unknown D00)
+ H- electron affinity will be changed by -2dxi
+  data may be added in IRWIN_molecule file
+  to update older data from Tsuji
+ using Tsuji's old data for C C C H             
+ using Tsuji's old data for C C N               
+ using Tsuji's old data for B B O               
+ using Tsuji's old data for C -                 
+ using Tsuji's old data for C H -               
+ using Tsuji's old data for N O O -             
+ using Tsuji's old data for N H H -             
+ using Tsuji's old data for N N H H             
+ using Tsuji's old data for N N H H H H         
+ using Tsuji's old data for C N N               
+ using Tsuji's old data for N C N               
+ using Tsuji's old data for C C C C N N         
+ using Tsuji's old data for N O O               
+ using Tsuji's old data for N O O O             
+ using Tsuji's old data for N N O               
+ using Tsuji's old data for N N O O O O         
+ using Tsuji's old data for H N O               
+ using Tsuji's old data for H N O O             
+ using Tsuji's old data for H N O O O           
+ using Tsuji's old data for H C N O             
+ using Tsuji's old data for O -                 
+ using Tsuji's old data for O O -               
+ using Tsuji's old data for H C H O             
+ using Tsuji's old data for AlO O               
+ using Tsuji's old data for Si-                 
+ using Tsuji's old data for SiH H               
+ using Tsuji's old data for SiH H H             
+ using Tsuji's old data for SiSiC C             
+ using Tsuji's old data for SiF F               
+ using Tsuji's old data for SiClCl              
+ using Tsuji's old data for P F F               
+ using Tsuji's old data for S S O               
+ using Tsuji's old data for S O O O             
+ using Tsuji's old data for C ClCl              
+ using Tsuji's old data for C ClClCl            
+ using Tsuji's old data for C ClClClCl          
+ using Tsuji's old data for ClO O               
+ using Tsuji's old data for ClClO               
+ using Tsuji's old data for S Cl                
+ using Tsuji's old data for S ClCl              
+ using Tsuji's old data for H ClO               
+ using Tsuji's old data for C ClO               
+ using Tsuji's old data for ScSc                
+ using Tsuji's old data for ScN                 
+ using Tsuji's old data for ScO O               
+ using Tsuji's old data for ScScO               
+ using Tsuji's old data for TiC C               
+ using Tsuji's old data for TiF                 
+ using Tsuji's old data for TiCl                
+ using Tsuji's old data for V C C               
+ using Tsuji's old data for V N                 
+ using Tsuji's old data for V F F               
+ using Tsuji's old data for V ClCl              
+ using Tsuji's old data for CrN                 
+ using Tsuji's old data for CrF                 
+ using Tsuji's old data for CrF F               
+ using Tsuji's old data for CrCl                
+ using Tsuji's old data for CrClCl              
+ using Tsuji's old data for MnO O               
+ using Tsuji's old data for MnS S               
+ using Tsuji's old data for MnF F               
+ using Tsuji's old data for MnClCl              
+ using Tsuji's old data for FeS                 
+ using Tsuji's old data for FeF F               
+ using Tsuji's old data for SrSrO               
+ using Tsuji's old data for Y C C               
+ using Tsuji's old data for Y C C C C           
+ using Tsuji's old data for Y O O               
+ using Tsuji's old data for Y Y O               
+ using Tsuji's old data for Y F F               
+ using Tsuji's old data for ZrH                 
+ using Tsuji's old data for ZrC C               
+ using Tsuji's old data for ZrS                 
+ using Tsuji's old data for ZrF                 
+ using Tsuji's old data for ZrCl                
+ using Tsuji's old data for BaBaO               
+ using Tsuji's old data for LaC C               
+ using Tsuji's old data for LaN                 
+ using Tsuji's old data for LaO O               
+ using Tsuji's old data for LaLaO               
+ using Tsuji's old data for LaLaO O             
+ using Tsuji's old data for LaF F               
+ using Tsuji's old data for CeC C               
+ using Tsuji's old data for CeO O               
+ using Tsuji's old data for CeS                 
+ using Tsuji's old data for CeF                 
+ using Tsuji's old data for NdC C               
+ using Tsuji's old data for NdO                 
+ using Tsuji's old data for NdO O               
+ using Tsuji's old data for NdF                 
+ using Tsuji's old data for NdF F               
+ using Tsuji's old data for N N N H             
+ using Tsuji's old data for C C H H H H H H     
+ using Tsuji's old data for H C C C N           
+ using Tsuji's old data for C C C C C H         
+ using Tsuji's old data for C C H H H           
+ using Tsuji's old data for C C C C H H H       
+ using Tsuji's old data for C C C C H H H H     
+ using Tsuji's old data for C C C C H           
+ using Tsuji's old data for C C C C H H         
+ using Tsuji's old data for C C C H H H         
+ using Tsuji's old data for C C C H H           
+ using Tsuji's old data for C C C C N           
+ using Tsuji's old data for C H H H C N         
+ using Tsuji's old data for C C C H H H H       
+ using Tsuji's old data for C C C N             
+ Atomic partition function data read
+ MARCS model. romod=    0.00000000     rocalc=    1.70205086E-10
+ H-      
+  H      
+ FeI     
+ (H+H)   
+ H2+     
+ H2-     
+ HeI     
+ HeIff  P
+ He-     
+ C_I     
+ C_II    
+ C_Iff   
+ CIIff  P
+ C-      
+ N_I     
+ N_II    
+ N-      
+ O_I     
+ O_II    
+ O-      
+ CO-     
+ H2O-    
+ MgI    P
+ MgII   O
+ AlI    O
+ AlII   O
+ SiI    P
+ SiII   O
+ CaI   bf
+ CaII   O
+ FeII    
+ CHcont  
+ OHcont  
+ MgIff  P
+ SiIff  P
+ MeIff  O
+ H2+H2   
+ He+H2   
+ H2+H    
+ He+H    
+ e-sc    
+ H-sc    
+ H2sc    
+ He-sc   
+DATA/NHcont_Stancil_2019.dat
+tau,T,Pe,Pg,ro,P6   1  7.649E-06   2493.6  1.084E-04  2.679E+01  1.702E-10  2.537E+01
+ MARCS model. romod=    0.00000000     rocalc=    2.09504358E-10
+tau,T,Pe,Pg,ro,P6   2  1.205E-05   2515.0  1.359E-04  3.323E+01  2.095E-10  3.146E+01
+ MARCS model. romod=    0.00000000     rocalc=    2.66079575E-10
+tau,T,Pe,Pg,ro,P6   3  1.872E-05   2537.1  1.748E-04  4.250E+01  2.661E-10  4.022E+01
+ MARCS model. romod=    0.00000000     rocalc=    3.44905604E-10
+tau,T,Pe,Pg,ro,P6   4  2.849E-05   2558.1  2.277E-04  5.538E+01  3.449E-10  5.237E+01
+ MARCS model. romod=    0.00000000     rocalc=    4.51238436E-10
+tau,T,Pe,Pg,ro,P6   5  4.247E-05   2577.7  2.972E-04  7.271E+01  4.512E-10  6.871E+01
+ MARCS model. romod=    0.00000000     rocalc=    5.91618865E-10
+tau,T,Pe,Pg,ro,P6   6  6.227E-05   2596.3  3.873E-04  9.555E+01  5.916E-10  9.019E+01
+ MARCS model. romod=    0.00000000     rocalc=    7.75849440E-10
+tau,T,Pe,Pg,ro,P6   7  9.030E-05   2614.3  5.035E-04  1.255E+02  7.758E-10  1.183E+02
+ MARCS model. romod=    0.00000000     rocalc=    1.01763953E-09
+tau,T,Pe,Pg,ro,P6   8  1.304E-04   2632.4  6.545E-04  1.647E+02  1.018E-09  1.550E+02
+ MARCS model. romod=    0.00000000     rocalc=    1.33569633E-09
+tau,T,Pe,Pg,ro,P6   9  1.887E-04   2651.6  8.530E-04  2.163E+02  1.336E-09  2.034E+02
+ MARCS model. romod=    0.00000000     rocalc=    1.75817250E-09
+tau,T,Pe,Pg,ro,P6  10  2.751E-04   2672.6  1.119E-03  2.852E+02  1.758E-09  2.677E+02
+ MARCS model. romod=    0.00000000     rocalc=    2.32487074E-09
+tau,T,Pe,Pg,ro,P6  11  4.069E-04   2696.8  1.483E-03  3.783E+02  2.325E-09  3.546E+02
+ MARCS model. romod=    0.00000000     rocalc=    2.67934830E-09
+tau,T,Pe,Pg,ro,P6  12  4.980E-04   2709.3  1.712E-03  4.366E+02  2.679E-09  4.090E+02
+ MARCS model. romod=    0.00000000     rocalc=    3.09168136E-09
+tau,T,Pe,Pg,ro,P6  13  6.124E-04   2723.1  1.985E-03  5.049E+02  3.092E-09  4.727E+02
+ MARCS model. romod=    0.00000000     rocalc=    3.57235708E-09
+tau,T,Pe,Pg,ro,P6  14  7.574E-04   2738.0  2.308E-03  5.852E+02  3.572E-09  5.475E+02
+ MARCS model. romod=    0.00000000     rocalc=    4.13580326E-09
+tau,T,Pe,Pg,ro,P6  15  9.425E-04   2753.9  2.695E-03  6.798E+02  4.136E-09  6.358E+02
+ MARCS model. romod=    0.00000000     rocalc=    4.79605466E-09
+tau,T,Pe,Pg,ro,P6  16  1.181E-03   2770.9  3.159E-03  7.916E+02  4.796E-09  7.399E+02
+ MARCS model. romod=    0.00000000     rocalc=    5.57199753E-09
+tau,T,Pe,Pg,ro,P6  17  1.489E-03   2789.0  3.716E-03  9.240E+02  5.572E-09  8.634E+02
+ MARCS model. romod=    0.00000000     rocalc=    6.48326726E-09
+tau,T,Pe,Pg,ro,P6  18  1.890E-03   2808.3  4.387E-03  1.081E+03  6.483E-09  1.010E+03
+ MARCS model. romod=    0.00000000     rocalc=    7.55748886E-09
+tau,T,Pe,Pg,ro,P6  19  2.417E-03   2828.7  5.199E-03  1.268E+03  7.557E-09  1.184E+03
+ MARCS model. romod=    0.00000000     rocalc=    8.81895001E-09
+tau,T,Pe,Pg,ro,P6  20  3.110E-03   2850.4  6.182E-03  1.489E+03  8.819E-09  1.390E+03
+ MARCS model. romod=    0.00000000     rocalc=    1.03080460E-08
+tau,T,Pe,Pg,ro,P6  21  4.029E-03   2873.2  7.376E-03  1.753E+03  1.031E-08  1.637E+03
+ MARCS model. romod=    0.00000000     rocalc=    1.20590942E-08
+tau,T,Pe,Pg,ro,P6  22  5.252E-03   2897.3  8.829E-03  2.068E+03  1.206E-08  1.930E+03
+ MARCS model. romod=    0.00000000     rocalc=    1.41176235E-08
+tau,T,Pe,Pg,ro,P6  23  6.887E-03   2922.7  1.060E-02  2.442E+03  1.412E-08  2.279E+03
+ MARCS model. romod=    0.00000000     rocalc=    1.65448117E-08
+tau,T,Pe,Pg,ro,P6  24  9.082E-03   2949.3  1.276E-02  2.888E+03  1.654E-08  2.696E+03
+ MARCS model. romod=    0.00000000     rocalc=    1.93967296E-08
+tau,T,Pe,Pg,ro,P6  25  1.204E-02   2977.3  1.541E-02  3.420E+03  1.940E-08  3.192E+03
+ MARCS model. romod=    0.00000000     rocalc=    2.27440431E-08
+tau,T,Pe,Pg,ro,P6  26  1.603E-02   3006.7  1.866E-02  4.053E+03  2.274E-08  3.784E+03
+ MARCS model. romod=    0.00000000     rocalc=    2.66685998E-08
+tau,T,Pe,Pg,ro,P6  27  2.144E-02   3037.7  2.265E-02  4.807E+03  2.667E-08  4.490E+03
+ MARCS model. romod=    0.00000000     rocalc=    3.12613118E-08
+tau,T,Pe,Pg,ro,P6  28  2.879E-02   3070.3  2.757E-02  5.705E+03  3.126E-08  5.330E+03
+ MARCS model. romod=    0.00000000     rocalc=    3.66306772E-08
+tau,T,Pe,Pg,ro,P6  29  3.879E-02   3104.9  3.368E-02  6.774E+03  3.663E-08  6.332E+03
+ MARCS model. romod=    0.00000000     rocalc=    4.28722338E-08
+tau,T,Pe,Pg,ro,P6  30  5.246E-02   3142.0  4.131E-02  8.045E+03  4.287E-08  7.524E+03
+ MARCS model. romod=    0.00000000     rocalc=    5.01347763E-08
+tau,T,Pe,Pg,ro,P6  31  7.117E-02   3181.7  5.089E-02  9.557E+03  5.013E-08  8.945E+03
+ MARCS model. romod=    0.00000000     rocalc=    5.85070481E-08
+tau,T,Pe,Pg,ro,P6  32  9.685E-02   3225.0  6.307E-02  1.135E+04  5.851E-08  1.063E+04
+ MARCS model. romod=    0.00000000     rocalc=    6.81019969E-08
+tau,T,Pe,Pg,ro,P6  33  1.321E-01   3272.5  7.872E-02  1.347E+04  6.810E-08  1.264E+04
+ MARCS model. romod=    0.00000000     rocalc=    7.89221346E-08
+tau,T,Pe,Pg,ro,P6  34  1.807E-01   3327.5  9.962E-02  1.598E+04  7.892E-08  1.501E+04
+ MARCS model. romod=    0.00000000     rocalc=    9.09813238E-08
+tau,T,Pe,Pg,ro,P6  35  2.475E-01   3389.9  1.278E-01  1.891E+04  9.098E-08  1.779E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.04110654E-07
+tau,T,Pe,Pg,ro,P6  36  3.381E-01   3459.8  1.663E-01  2.227E+04  1.041E-07  2.099E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.17948602E-07
+tau,T,Pe,Pg,ro,P6  37  4.585E-01   3538.3  2.197E-01  2.603E+04  1.179E-07  2.458E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.31685454E-07
+tau,T,Pe,Pg,ro,P6  38  6.133E-01   3627.3  2.958E-01  3.006E+04  1.317E-07  2.844E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.44629610E-07
+tau,T,Pe,Pg,ro,P6  39  8.057E-01   3727.9  4.065E-01  3.422E+04  1.446E-07  3.244E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.56107888E-07
+tau,T,Pe,Pg,ro,P6  40  1.037E+00   3839.8  5.678E-01  3.833E+04  1.561E-07  3.639E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.65883378E-07
+tau,T,Pe,Pg,ro,P6  41  1.308E+00   3961.0  7.982E-01  4.227E+04  1.659E-07  4.018E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.74029736E-07
+tau,T,Pe,Pg,ro,P6  42  1.622E+00   4090.7  1.120E+00  4.601E+04  1.740E-07  4.378E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.80625946E-07
+tau,T,Pe,Pg,ro,P6  43  1.986E+00   4230.3  1.558E+00  4.955E+04  1.806E-07  4.718E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.86079632E-07
+tau,T,Pe,Pg,ro,P6  44  2.408E+00   4381.3  2.139E+00  5.299E+04  1.861E-07  5.048E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.90593383E-07
+tau,T,Pe,Pg,ro,P6  45  2.901E+00   4545.8  2.878E+00  5.641E+04  1.906E-07  5.375E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.94663244E-07
+tau,T,Pe,Pg,ro,P6  46  3.484E+00   4725.9  3.781E+00  5.998E+04  1.947E-07  5.716E+04
+ MARCS model. romod=    0.00000000     rocalc=    1.98780214E-07
+tau,T,Pe,Pg,ro,P6  47  4.178E+00   4924.5  4.861E+00  6.387E+04  1.988E-07  6.088E+04
+ MARCS model. romod=    0.00000000     rocalc=    2.03689041E-07
+tau,T,Pe,Pg,ro,P6  48  5.018E+00   5144.7  6.200E+00  6.842E+04  2.037E-07  6.521E+04
+ MARCS model. romod=    0.00000000     rocalc=    2.10503075E-07
+tau,T,Pe,Pg,ro,P6  49  6.044E+00   5388.1  8.191E+00  7.408E+04  2.105E-07  7.061E+04
+ MARCS model. romod=    0.00000000     rocalc=    2.19476306E-07
+tau,T,Pe,Pg,ro,P6  50  7.313E+00   5654.0  1.205E+01  8.107E+04  2.195E-07  7.727E+04
+ MARCS model. romod=    0.00000000     rocalc=    2.28315443E-07
+tau,T,Pe,Pg,ro,P6  51  8.898E+00   5928.7  1.979E+01  8.845E+04  2.283E-07  8.429E+04
+ MARCS model. romod=    0.00000000     rocalc=    2.41227866E-07
+tau,T,Pe,Pg,ro,P6  52  1.336E+01   6370.3  4.809E+01  1.005E+05  2.412E-07  9.568E+04
+ MARCS model. romod=    0.00000000     rocalc=    2.49870027E-07
+tau,T,Pe,Pg,ro,P6  53  2.033E+01   6729.3  9.795E+01  1.100E+05  2.499E-07  1.047E+05
+ MARCS model. romod=    0.00000000     rocalc=    2.57734143E-07
+tau,T,Pe,Pg,ro,P6  54  3.117E+01   7036.7  1.747E+02  1.187E+05  2.577E-07  1.128E+05
+ MARCS model. romod=    0.00000000     rocalc=    2.65948984E-07
+tau,T,Pe,Pg,ro,P6  55  4.797E+01   7316.4  2.874E+02  1.274E+05  2.659E-07  1.209E+05
+ MARCS model. romod=    0.00000000     rocalc=    2.75149347E-07
+tau,T,Pe,Pg,ro,P6  56  7.396E+01   7580.5  4.490E+02  1.368E+05  2.751E-07  1.295E+05
+  CONTROLE: k, R, tau, log10tau, T
+           1   1.29900006E+09   7.64892229E-06  -5.11639977       2493.60010    
+           2   1.26499994E+09   1.20531340E-05  -4.91890001       2515.00000    
+           3   1.22499994E+09   1.87154419E-05  -4.72779989       2537.10010    
+           4   1.18200000E+09   2.84904945E-05  -4.54530001       2558.10010    
+           5   1.13699994E+09   4.24717255E-05  -4.37190008       2577.69995    
+           6   1.09200000E+09   6.22730440E-05  -4.20569992       2596.30005    
+           7   1.04600000E+09   9.03025284E-05  -4.04430008       2614.30005    
+           8   1.00100000E+09   1.30406712E-04  -3.88470006       2632.39990    
+           9   955400000.       1.88668797E-04  -3.72429991       2651.60010    
+          10   909500032.       2.75106024E-04  -3.56049991       2672.60010    
+          11   862700032.       4.06911480E-04  -3.39050007       2696.80005    
+          12   839400000.       4.97966423E-04  -3.30279994       2709.30005    
+          13   815800000.       6.12350297E-04  -3.21300006       2723.10010    
+          14   791800000.       7.57356058E-04  -3.12069988       2738.00000    
+          15   767400000.       9.42540239E-04  -3.02570009       2753.89990    
+          16   742499968.       1.18059223E-03  -2.92790008       2770.89990    
+          17   717200000.       1.48867560E-03  -2.82719994       2789.00000    
+          18   691400000.       1.89016620E-03  -2.72350001       2808.30005    
+          19   665000000.       2.41657300E-03  -2.61680007       2828.69995    
+          20   638200000.       3.11028375E-03  -2.50720000       2850.39990    
+          21   610899968.       4.02902579E-03  -2.39479995       2873.19995    
+          22   583000000.       5.25170052E-03  -2.27970004       2897.30005    
+          23   554700032.       6.88652368E-03  -2.16199994       2922.69995    
+          24   525900000.       9.08238627E-03  -2.04180002       2949.30005    
+          25   496600000.       1.20364940E-02  -1.91949999       2977.30005    
+          26   466900000.       1.60287637E-02  -1.79509997       3006.69995    
+          27   436600000.       2.14387774E-02  -1.66880000       3037.69995    
+          28   405900000.       2.87872404E-02  -1.54079998       3070.30005    
+          29   374800000.       3.87882367E-02  -1.41129994       3104.89990    
+          30   343100000.       5.24565838E-02  -1.28020000       3142.00000    
+          31   311000000.       7.11705014E-02  -1.14769995       3181.69995    
+          32   278300000.       9.68500748E-02  -1.01390004       3225.00000    
+          33   245100000.      0.132129565     -0.879000008       3272.50000    
+          34   211500000.      0.180717424     -0.742999971       3327.50000    
+          35   177500000.      0.247514129     -0.606400013       3389.89990    
+          36   143600000.      0.338142693     -0.470899999       3459.80005    
+          37   110500000.      0.458458483     -0.338699996       3538.30005    
+          38   79010000.0      0.613338172     -0.212300003       3627.30005    
+          39   49850000.0      0.805749416      -9.38000008E-02   3727.89990    
+          40   23530000.0       1.03657329       1.56000145E-02   3839.80005    
+          41   1.00000000       1.30767548      0.116499983       3961.00000    
+          42  -21160000.0       1.62181008      0.209999993       4090.69995    
+          43  -40560000.0       1.98563766      0.297899991       4230.29980    
+          44  -58850000.0       2.40768671      0.381599963       4381.29980    
+          45  -76720000.0       2.90134907      0.462599993       4545.79980    
+          46  -94920000.0       3.48417544      0.542100012       4725.89990    
+          47  -114300000.       4.17830372      0.620999992       4924.50000    
+          48  -135600000.       5.01764584      0.700500011       5144.70020    
+          49  -159100000.       6.04365969      0.781300008       5388.10010    
+          50  -183800000.       7.31307411      0.864099979       5654.00000    
+          51  -207100000.       8.89815521      0.949299991       5928.70020    
+          52  -248800000.       13.3567257       1.12570000       6370.29980    
+          53  -283800000.       20.3282490       1.30809999       6729.29980    
+          54  -316600000.       31.1673603       1.49370003       7036.70020    
+          55  -349400000.       47.9733429       1.68099999       7316.39990    
+          56  -383700000.       73.9605179       1.86899996       7580.50000    
+
+ **************************************************
+ * BSYN version 20.1                              *
+ * Warning, now Flux is so that F=sigma.Teff^4 !  *
+ * consistent with MARCS.                         *
+ * Versions 10.1 and lower give f=sigma.Teff^4/pi *
+ **************************************************
+
+ NLTE :.false.
+ NLTEINFOFILE:DATA/SPECIES_LTE_NLTE.dat
+ LAMBDA_MIN:4000
+ LAMBDA_MAX:8000
+ LAMBDA_STEP:0.1
+ INTENSITY/FLUX:Flux
+ MODELOPAC:/Users/mjablons/Documents/Turbospectrum_NLTE/COM/contopac/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00opac
+ RESULTFILE :config_test_feh/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.spec
+ ABUND_SOURCE:magg
+ METALLICITY:0.0
+ ALPHA/Fe   :0.00
+ HELIUM     :0.00
+ R-PROCESS  :0.00
+ S-PROCESS  :0.00
+ INDIVIDUAL ABUNDANCES:0
+ ISOTOPES :0
+ LIST_OF_LINELISTS:/Users/mjablons/Documents/Turbospectrum_NLTE/tmp/linelists.txt
+ SPHERICAL:F
+ Following atomic species included in molecular equilibrium:
+ H  He Li Be B  C  N  O  F  Ne 
+ Na Mg Al Si P  S  Cl Ar K  Ca 
+ Sc Ti V  Cr Mn Fe Co Ni Cu Zn 
+ Ga Ge As Se Br Kr Rb Sr Y  Zr 
+ Nb Mo Tc Ru Rh Pd Ag Cd In Sn 
+ Sb Te I  Xe Cs Ba La Ce Pr Nd 
+ Pm Sm Eu Gd Tb Dy Ho Er Tm Yb 
+ Lu Hf Ta W  Re Os Ir Pt Au Hg 
+ Tl Pb Bi Po At Rn Fr Ra Ac Th 
+ Pa U                          
+ hydrovelo, computeIplus : F F
+ T  DATA/LISTE_molecules_all_v19.1.dat 
+           3  line lists:
+ /Users/mjablons/Documents/Turbospectrum_NLTE/input_files/linelists/molecules-420-920nm/FeH_GESv5.bsyn 
+ /Users/mjablons/Documents/Turbospectrum_NLTE/input_files/linelists/molecules-420-920nm/12C12C_GESv5.bsyn 
+ /Users/mjablons/Documents/Turbospectrum_NLTE/input_files/linelists/molecules-420-920nm/CaH_GESv5.bsyn 
+ F          30   300.000000              15   1.00000000    
+ dummy-output.dat 
+  
+ /Users/mjablons/Documents/Turbospectrum_NLTE/COM/contopac/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00opac 
+ config_test_feh/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.spec 
+    Full molecular equilibrium, using:
+       
+      DATA/LISTE_molecules_all_v19.1.dat 
+  
+  Transfer treated in the plane parallel approximation
+  
+ Abundance is scaled from Magg et al. 2022
+ metallicity changed by    0.00000000      dex
+ old abundh:  0.735058844    
+ MODEL IDENTIFICATION=MRXF; MAIN PROGRAMME BSYN
+ Bsyn; k, pgmod, pg_calc, romod, ro_calc
+ ELEMENT  ATOMIC NUMBER   LOG(ABUNDANCE)
+     H             1       12.000
+     He            2       10.930
+     Li            3        1.050
+     Be            4        1.380
+     B             5        2.700
+     C             6        8.560
+     N             7        7.980
+     O             8        8.770
+     F             9        4.670
+     Ne           10        8.150
+     Na           11        6.330
+     Mg           12        7.580
+     Al           13        6.480
+     Si           14        7.567
+     P            15        5.480
+     S            16        7.210
+     Cl           17        5.290
+     Ar           18        6.500
+     K            19        5.120
+     Ca           20        6.320
+     Sc           21        3.090
+     Ti           22        4.960
+     V            23        4.010
+     Cr           24        5.690
+     Mn           25        5.530
+     Fe           26        7.510
+     Co           27        4.920
+     Ni           28        6.250
+     Cu           29        4.210
+     Zn           30        4.600
+     Ga           31        2.880
+     Ge           32        3.580
+     As           33        2.290
+     Se           34        3.330
+     Br           35        2.560
+     Kr           36        3.250
+     Rb           37        2.600
+     Sr           38        2.920
+     Y            39        2.210
+     Zr           40        2.580
+     Nb           41        1.420
+     Mo           42        1.920
+     Ru           44        1.840
+     Rh           45        1.120
+     Pd           46        1.660
+     Ag           47        0.940
+     Cd           48        1.770
+     In           49        1.600
+     Sn           50        2.000
+     Sb           51        1.000
+     Te           52        2.190
+     I            53        1.510
+     Xe           54        2.240
+     Cs           55        1.070
+     Ba           56        2.170
+     La           57        1.130
+     Ce           58        1.700
+     Pr           59        0.580
+     Nd           60        1.450
+     Sm           62        1.000
+     Eu           63        0.520
+     Gd           64        1.110
+     Tb           65        0.280
+     Dy           66        1.140
+     Ho           67        0.510
+     Er           68        0.930
+     Tm           69        0.000
+     Yb           70        1.080
+     Lu           71        0.060
+     Hf           72        0.880
+     Ta           73       -0.170
+     W            74        1.110
+     Re           75        0.230
+     Os           76        1.250
+     Ir           77        1.380
+     Pt           78        1.640
+     Au           79        1.010
+     Hg           80        1.130
+     Tl           81        0.900
+     Pb           82        2.000
+     Bi           83        0.650
+     Th           90        0.060
+     U            92       -0.520
+ MOLECPARTF. suppressing:         206  LaH                 (unknown D00)
+ MOLECPARTF. suppressing:         209  LuH                 (unknown D00)
+ MOLECPARTF. suppressing:         212  NbN                 (unknown D00)
+ MOLECPARTF. suppressing:         231  SbH                 (unknown D00)
+ MOLECPARTF. suppressing:         252  TeCl                (unknown D00)
+ MOLECPARTF. suppressing:         267  Al+ H               (unknown D00)
+ MOLECPARTF. suppressing:         267  As+ O               (unknown D00)
+ MOLECPARTF. suppressing:         269  B + O               (unknown D00)
+ H- electron affinity will be changed by -2dxi
+  data may be added in IRWIN_molecule file
+  to update older data from Tsuji
+ using Tsuji's old data for C C C H             
+ using Tsuji's old data for C C N               
+ using Tsuji's old data for B B O               
+ using Tsuji's old data for C -                 
+ using Tsuji's old data for C H -               
+ using Tsuji's old data for N O O -             
+ using Tsuji's old data for N H H -             
+ using Tsuji's old data for N N H H             
+ using Tsuji's old data for N N H H H H         
+ using Tsuji's old data for C N N               
+ using Tsuji's old data for N C N               
+ using Tsuji's old data for C C C C N N         
+ using Tsuji's old data for N O O               
+ using Tsuji's old data for N O O O             
+ using Tsuji's old data for N N O               
+ using Tsuji's old data for N N O O O O         
+ using Tsuji's old data for H N O               
+ using Tsuji's old data for H N O O             
+ using Tsuji's old data for H N O O O           
+ using Tsuji's old data for H C N O             
+ using Tsuji's old data for O -                 
+ using Tsuji's old data for O O -               
+ using Tsuji's old data for H C H O             
+ using Tsuji's old data for AlO O               
+ using Tsuji's old data for Si-                 
+ using Tsuji's old data for SiH H               
+ using Tsuji's old data for SiH H H             
+ using Tsuji's old data for SiSiC C             
+ using Tsuji's old data for SiF F               
+ using Tsuji's old data for SiClCl              
+ using Tsuji's old data for P F F               
+ using Tsuji's old data for S S O               
+ using Tsuji's old data for S O O O             
+ using Tsuji's old data for C ClCl              
+ using Tsuji's old data for C ClClCl            
+ using Tsuji's old data for C ClClClCl          
+ using Tsuji's old data for ClO O               
+ using Tsuji's old data for ClClO               
+ using Tsuji's old data for S Cl                
+ using Tsuji's old data for S ClCl              
+ using Tsuji's old data for H ClO               
+ using Tsuji's old data for C ClO               
+ using Tsuji's old data for ScSc                
+ using Tsuji's old data for ScN                 
+ using Tsuji's old data for ScO O               
+ using Tsuji's old data for ScScO               
+ using Tsuji's old data for TiC C               
+ using Tsuji's old data for TiF                 
+ using Tsuji's old data for TiCl                
+ using Tsuji's old data for V C C               
+ using Tsuji's old data for V N                 
+ using Tsuji's old data for V F F               
+ using Tsuji's old data for V ClCl              
+ using Tsuji's old data for CrN                 
+ using Tsuji's old data for CrF                 
+ using Tsuji's old data for CrF F               
+ using Tsuji's old data for CrCl                
+ using Tsuji's old data for CrClCl              
+ using Tsuji's old data for MnO O               
+ using Tsuji's old data for MnS S               
+ using Tsuji's old data for MnF F               
+ using Tsuji's old data for MnClCl              
+ using Tsuji's old data for FeS                 
+ using Tsuji's old data for FeF F               
+ using Tsuji's old data for SrSrO               
+ using Tsuji's old data for Y C C               
+ using Tsuji's old data for Y C C C C           
+ using Tsuji's old data for Y O O               
+ using Tsuji's old data for Y Y O               
+ using Tsuji's old data for Y F F               
+ using Tsuji's old data for ZrH                 
+ using Tsuji's old data for ZrC C               
+ using Tsuji's old data for ZrS                 
+ using Tsuji's old data for ZrF                 
+ using Tsuji's old data for ZrCl                
+ using Tsuji's old data for BaBaO               
+ using Tsuji's old data for LaC C               
+ using Tsuji's old data for LaN                 
+ using Tsuji's old data for LaO O               
+ using Tsuji's old data for LaLaO               
+ using Tsuji's old data for LaLaO O             
+ using Tsuji's old data for LaF F               
+ using Tsuji's old data for CeC C               
+ using Tsuji's old data for CeO O               
+ using Tsuji's old data for CeS                 
+ using Tsuji's old data for CeF                 
+ using Tsuji's old data for NdC C               
+ using Tsuji's old data for NdO                 
+ using Tsuji's old data for NdO O               
+ using Tsuji's old data for NdF                 
+ using Tsuji's old data for NdF F               
+ using Tsuji's old data for N N N H             
+ using Tsuji's old data for C C H H H H H H     
+ using Tsuji's old data for H C C C N           
+ using Tsuji's old data for C C C C C H         
+ using Tsuji's old data for C C H H H           
+ using Tsuji's old data for C C C C H H H       
+ using Tsuji's old data for C C C C H H H H     
+ using Tsuji's old data for C C C C H           
+ using Tsuji's old data for C C C C H H         
+ using Tsuji's old data for C C C H H H         
+ using Tsuji's old data for C C C H H           
+ using Tsuji's old data for C C C C N           
+ using Tsuji's old data for C H H H C N         
+ using Tsuji's old data for C C C H H H H       
+ using Tsuji's old data for C C C N             
+ Atomic partition function data read
+ eqmol_pe calculated            1  iterations
+          56   136750.391       138168.203       2.75149347E-07   2.78011697E-07
+ eqmol_pe calculated            1  iterations
+          55   127439.742       128559.672       2.65948984E-07   2.68291529E-07
+ eqmol_pe calculated            1  iterations
+          54   118686.383       119544.367       2.57734143E-07   2.59600256E-07
+ eqmol_pe calculated            1  iterations
+          53   109971.023       110591.531       2.49870027E-07   2.51281364E-07
+ eqmol_pe calculated            1  iterations
+          52   100456.367       100852.633       2.41227866E-07   2.42180107E-07
+ eqmol_pe calculated            1  iterations
+          51   88454.1562       88640.5781       2.28315443E-07   2.28796935E-07
+ eqmol_pe calculated            1  iterations
+          50   81072.2188       81171.0781       2.19476306E-07   2.19744095E-07
+ eqmol_pe calculated            1  iterations
+          49   74080.8672       74133.8906       2.10503075E-07   2.10653894E-07
+ eqmol_pe calculated            1  iterations
+          48   68418.1484       68459.3906       2.03689041E-07   2.03811950E-07
+ eqmol_pe calculated            1  iterations
+          47   63873.8516       63917.5312       1.98780214E-07   1.98916368E-07
+ eqmol_pe calculated            1  iterations
+          46   59976.3320       60025.4648       1.94663244E-07   1.94823116E-07
+ eqmol_pe calculated            1  iterations
+          45   56414.8359       56468.4023       1.90593383E-07   1.90775040E-07
+ eqmol_pe calculated            1  iterations
+          44   52993.3359       53048.3906       1.86079632E-07   1.86273979E-07
+ eqmol_pe calculated            1  iterations
+          43   49546.8555       49599.6094       1.80625946E-07   1.80819711E-07
+ eqmol_pe calculated            1  iterations
+          42   46007.3359       46054.4805       1.74029736E-07   1.74209987E-07
+ eqmol_pe calculated            1  iterations
+          41   42270.7656       42310.1602       1.65883378E-07   1.66040252E-07
+ eqmol_pe calculated            1  iterations
+          40   38332.0078       38362.9727       1.56107888E-07   1.56236524E-07
+ eqmol_pe calculated            1  iterations
+          39   34221.8984       34245.0391       1.44629610E-07   1.44729952E-07
+ eqmol_pe calculated            1  iterations
+          38   30061.2324       30077.9727       1.31685454E-07   1.31761269E-07
+ eqmol_pe calculated            1  iterations
+          37   26031.4141       26043.3652       1.17948602E-07   1.18004948E-07
+ eqmol_pe calculated            1  iterations
+          36   22272.0918       22280.6230       1.04110647E-07   1.04152370E-07
+ eqmol_pe calculated            1  iterations
+          35   18912.0430       18918.1816       9.09813238E-08   9.10124029E-08
+ eqmol_pe calculated            1  iterations
+          34   15980.7871       15985.2578       7.89221346E-08   7.89455186E-08
+ eqmol_pe calculated            1  iterations
+          33   13473.5781       13476.8828       6.81019969E-08   6.81197108E-08
+ eqmol_pe calculated            1  iterations
+          32   11351.0908       11353.5693       5.85070481E-08   5.85206479E-08
+ eqmol_pe calculated            1  iterations
+          31   9557.18262       9559.05664       5.01347763E-08   5.01452746E-08
+ eqmol_pe calculated            1  iterations
+          30   8044.64355       8046.07129       4.28722338E-08   4.28803730E-08
+ eqmol_pe calculated            1  iterations
+          29   6774.04590       6775.13916       3.66306772E-08   3.66370045E-08
+ eqmol_pe calculated            1  iterations
+          28   5704.88379       5705.72461       3.12613118E-08   3.12662465E-08
+ eqmol_pe calculated            1  iterations
+          27   4807.39160       4808.04004       2.66685998E-08   2.66724580E-08
+ eqmol_pe calculated            1  iterations
+          26   4053.06396       4053.56641       2.27440431E-08   2.27470629E-08
+ eqmol_pe calculated            1  iterations
+          25   3419.82520       3420.21533       1.93967296E-08   1.93991010E-08
+ eqmol_pe calculated            1  iterations
+          24   2888.02783       2888.33154       1.65448117E-08   1.65466840E-08
+ eqmol_pe calculated            1  iterations
+          23   2441.63965       2441.87646       1.41176244E-08   1.41190970E-08
+ eqmol_pe calculated            1  iterations
+          22   2067.57617       2067.76172       1.20590942E-08   1.20602559E-08
+ eqmol_pe calculated            1  iterations
+          21   1753.29211       1753.43774       1.03080460E-08   1.03089661E-08
+ eqmol_pe calculated            1  iterations
+          20   1489.15112       1489.26587       8.81895001E-09   8.81968010E-09
+ eqmol_pe calculated            1  iterations
+          19   1267.58313       1267.67371       7.55748886E-09   7.55806884E-09
+ eqmol_pe calculated            1  iterations
+          18   1080.93762       1081.00940       6.48326726E-09   6.48372867E-09
+ eqmol_pe calculated            1  iterations
+          17   924.000427       924.057556       5.57199753E-09   5.57236657E-09
+ eqmol_pe calculated            1  iterations
+          16   791.588623       791.634155       4.79605466E-09   4.79634954E-09
+ eqmol_pe calculated            1  iterations
+          15   679.814331       679.850830       4.13580326E-09   4.13603995E-09
+ eqmol_pe calculated            1  iterations
+          14   585.155884       585.185181       3.57235708E-09   3.57254870E-09
+ eqmol_pe calculated            1  iterations
+          13   504.926666       504.950317       3.09168136E-09   3.09183634E-09
+ eqmol_pe calculated            1  iterations
+          12   436.578552       436.597717       2.67934830E-09   2.67947287E-09
+ eqmol_pe calculated            1  iterations
+          11   378.256165       378.271698       2.32487074E-09   2.32497266E-09
+ eqmol_pe calculated            1  iterations
+          10   285.180634       285.190948       1.75817250E-09   1.75823978E-09
+ eqmol_pe calculated            1  iterations
+           9   216.346039       216.352951       1.33569633E-09   1.33574130E-09
+ eqmol_pe calculated            1  iterations
+           8   164.691391       164.696045       1.01763953E-09   1.01766962E-09
+ eqmol_pe calculated            1  iterations
+           7   125.471863       125.475006       7.75849440E-10   7.75869702E-10
+ eqmol_pe calculated            1  iterations
+           6   95.5544128       95.5565262       5.91618865E-10   5.91632465E-10
+ eqmol_pe calculated            1  iterations
+           5   72.7127609       72.7141876       4.51238436E-10   4.51247539E-10
+ eqmol_pe calculated            1  iterations
+           4   55.3790588       55.3800201       3.44905604E-10   3.44911849E-10
+ eqmol_pe calculated            1  iterations
+           3   42.4984894       42.4991417       2.66079575E-10   2.66083794E-10
+ eqmol_pe calculated            1  iterations
+           2   33.2306824       33.2311401       2.09504358E-10   2.09507342E-10
+ eqmol_pe calculated            1  iterations
+           1   26.7908745       26.7912102       1.70205086E-10   1.70207251E-10
+ new abundh:  0.734972179    
+  starting scan of linelist
+ 0126.000000               
+ getlele FeH                 
+ after getlele:          126 FeH                 
+ Mass used for lines of          126 FeH                  is    56.8546715    
+species: 0126.000000       FeH                  iel:      126 ion:  1 isotopes:   0  0
+ nlines         3926
+ /b1/plez/FeH/linelist/FeH_scaledLanghoff.list                                                                                                                                                                                                                   
+         728  considered for element          126           1
+           0  lines rejected because of negative c6
+  starting scan of linelist
+ 0606.012012               
+ getlele C C                 
+ after getlele:          606 C C                 
+ Mass used for lines of          606 C C                  is    24.0000000    
+species: 0606.012012       C C                  iel:      606 ion:  1 isotopes:  12 12
+ nlines        96213
+ Sneden web                                                                                                                                                                                                                                                      
+       30000  lines done
+       60000  lines done
+       87519  considered for element          606           1
+           0  lines rejected because of negative c6
+  starting scan of linelist
+ 0120.000000               
+ getlele CaH                 
+ after getlele:          120 CaH                 
+ Mass used for lines of          120 CaH                  is    41.0858841    
+species: 0120.000000       CaH                  iel:      120 ion:  1 isotopes:   0  0
+ nlines        29636
+ /b1/plez/CaH/linelist/linelist_CaH_B-X.dat                                                                                                                                                                                                                      
+       25285  considered for element          120           1
+           0  lines rejected because of negative c6
+    16243 LINES WERE REJECTED, ONLY LINES BETWEEN  3998.000 AND  8002.000 A CONSIDERED
+  CENTRAL WAVELENGTH=  6000.000 A
+ now solve
+      113532  lines in the interval
+ FLUX SPECTRUM BETWEEN  4000.000 A AND   8000.000 A WITH STEP 0.100 A
+Starting synthesis for p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00
+
+--- BABSMA INPUT ---
+'LAMBDA_MIN:'  '4000'
+'LAMBDA_MAX:'  '8000'
+'LAMBDA_STEP:' '0.1'
+'MODELINPUT:' '/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/model_atmospheres/1D/marcs_standard_comp/marcs_standard_comp/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod'
+'MARCS-FILE:' '.true.'
+'MODELOPAC:' '/Users/mjablons/Documents/Turbospectrum_NLTE/COM/contopac/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00opac'
+'ABUND_SOURCE:' 'magg'
+'METALLICITY:'    '0.0'
+'ALPHA/Fe   :'    '0.00'
+'HELIUM     :'    '0.00'
+'R-PROCESS  :'    '0.00'
+'S-PROCESS  :'    '0.00'
+'INDIVIDUAL ABUNDANCES:'   '0'
+'XIFIX:' 'T'
+1.0
+
+--------------------
+
+--- BSYN INPUT (Flux) ---
+'NLTE :'          '.false.'
+'NLTEINFOFILE:'  'DATA/SPECIES_LTE_NLTE.dat'
+'LAMBDA_MIN:'     '4000'
+'LAMBDA_MAX:'     '8000'
+'LAMBDA_STEP:'    '0.1'
+'INTENSITY/FLUX:' 'Flux'
+'MODELOPAC:' '/Users/mjablons/Documents/Turbospectrum_NLTE/COM/contopac/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00opac'
+'RESULTFILE :' 'config_test_feh/p3500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.spec'
+'ABUND_SOURCE:'   'magg'
+'METALLICITY:'    '0.0'
+'ALPHA/Fe   :'    '0.00'
+'HELIUM     :'    '0.00'
+'R-PROCESS  :'    '0.00'
+'S-PROCESS  :'    '0.00'
+'INDIVIDUAL ABUNDANCES:'   '0'
+'ISOTOPES : ' '0'
+'LIST_OF_LINELISTS:' '/Users/mjablons/Documents/Turbospectrum_NLTE/tmp/linelists.txt'
+'SPHERICAL:'  'F'
+  30
+  300.00
+  15
+  1.00
+
+------------------
