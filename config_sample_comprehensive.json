@@ -1,0 +1,278 @@
+{
+    "_comment": "Comprehensive Turbospectrum Configuration File - All Possible Parameters",
+    "_note": "This file contains all possible parameters for Turbospectrum synthesis. Set unused parameters to empty strings, false, or empty arrays as appropriate.",
+    "_key_feature": "ABUNDANCES AND ISOTOPES CAN VARY PER GRID POINT - see 'grid_points' section for examples",
+    "_abundance_override": "Each grid point can override: abund_source, metallicity, alpha_fe, helium, r_process, s_process, individual_abundances, isotopes, and turbvel",
+    
+    "project_root": "/Users/mjablons/Documents/Turbospectrum_NLTE",
+    
+    "compiler": "gf",
+    "_compiler_options": ["gf", "intel"],
+    
+    "force": false,
+    "_force_note": "If true, overwrite existing output files",
+    
+    "executables": {
+        "babsma_exec": "babsma_lu",
+        "bsyn_exec": "bsyn_lu",
+        "interpol_exec": "interpol_modeles"
+    },
+    
+    "paths": {
+        "model_atmosphere_path": "",
+        "_model_atmosphere_path_note": "Path to model atmosphere directory. If empty, defaults to project_root/input_files/model_atmospheres/1D/marcs_standard_comp/marcs_standard_comp",
+        
+        "linelist_path": "",
+        "_linelist_path_note": "Path to linelist directory. If empty, defaults to project_root/input_files/linelists",
+        
+        "linelist_files": [
+            "nlte_ges_linelist_jmg6may2025_I_II"
+        ],
+        "_linelist_files_note": "List of linelist filenames (relative to linelist_path) or absolute paths",
+        
+        "output_dir": "",
+        "_output_dir_note": "Output directory for spectra. If empty, defaults to project_root/spectra",
+        
+        "log_dir": "",
+        "_log_dir_note": "Directory for log files. If empty, defaults to project_root/logs",
+        
+        "tmp_dir": "",
+        "_tmp_dir_note": "Temporary directory. If empty, defaults to project_root/tmp",
+        
+        "model_opac_dir": "COM/contopac",
+        "_model_opac_dir_note": "Directory for continuous opacity files (relative to project_root)"
+    },
+    
+    "synthesis_parameters": {
+        "lambda_min": 4000.0,
+        "lambda_max": 8000.0,
+        "lambda_step": 0.1,
+        "_lambda_note": "Wavelength range and step in Angstroms",
+        
+        "calculate_intensity": false,
+        "_calculate_intensity_note": "If true, calculate intensity instead of flux",
+        
+        "mu_angles": [],
+        "_mu_angles_note": "List of mu angles (cos(theta)) for intensity calculations. If empty and calculate_intensity=true, uses default 12 Gauss-Radau points. Maximum 30 points.",
+        
+        "mu_points_file": "",
+        "_mu_points_file_note": "File containing mu points (alternative to mu_angles). Format: first line is number of points, subsequent lines are mu values",
+        
+        "segments_file": "",
+        "_segments_file_note": "File defining multiple wavelength segments. If specified, overrides lambda_min/max/step",
+        
+        "resolution": 500000.0,
+        "_resolution_note": "Spectral resolution (used with segments_file). Default: 500000",
+        
+        "intensity_flux": "Flux",
+        "_intensity_flux_options": ["Flux", "Intensity"]
+    },
+    
+    "nlte": {
+        "enabled": false,
+        "_enabled_note": "Enable NLTE calculations",
+        
+        "nlte_info_file": "",
+        "_nlte_info_file_note": "Path to NLTE info file (e.g., DATA/SPECIES_LTE_NLTE.dat). If empty and nlte enabled, defaults to project_root/DATA/SPECIES_LTE_NLTE.dat",
+        
+        "model_atom_file": "",
+        "_model_atom_file_note": "Path to model atom file (optional, usually specified in nlte_info_file)",
+        
+        "departure_file": "",
+        "_departure_file_note": "Path to departure coefficient file (optional, usually specified in nlte_info_file)",
+        
+        "departure_binary": true,
+        "_departure_binary_note": "Whether departure file is binary (true) or ASCII (false)"
+    },
+    
+    "model_atmosphere": {
+        "marcs_file": true,
+        "_marcs_file_note": "Whether model atmosphere is MARCS format (true) or other format (false)",
+        
+        "spherical": false,
+        "_spherical_note": "Use spherical geometry (true) or plane-parallel (false)",
+        
+        "spherical_parameters": {
+            "mihal": 30,
+            "_mihal_note": "Number of impact parameters for spherical RT",
+            
+            "taum": 300.0,
+            "_taum_note": "Maximum optical depth for spherical RT",
+            
+            "ncore": 15,
+            "_ncore_note": "Number of core rays for spherical RT",
+            
+            "diflog": 1.30,
+            "_diflog_note": "Logarithmic step for intercepting rays. Decrease (e.g., 1.001) for better accuracy but slower computation"
+        }
+    },
+    
+    "abundances": {
+        "_defaults_note": "Default abundance values used for all grid points unless overridden per grid point",
+        
+        "abund_source": "magg",
+        "_abund_source_options": ["magg", "asp2007", "gs1998"],
+        "_abund_source_note": "Solar abundance reference: magg=Magg et al. 2022, asp2007=Asplund et al. 2007, gs1998=Grevesse & Sauval 1998",
+        
+        "metallicity": 0.0,
+        "_metallicity_note": "Default overall metallicity [Fe/H] in dex",
+        
+        "alpha_fe": 0.0,
+        "_alpha_fe_note": "Default [alpha/Fe] enhancement in dex",
+        
+        "helium": 0.0,
+        "_helium_note": "Default [He/H] enhancement in dex (0.0 = solar)",
+        
+        "r_process": 0.0,
+        "_r_process_note": "Default [r-process/Fe] enhancement in dex",
+        
+        "s_process": 0.0,
+        "_s_process_note": "Default [s-process/Fe] enhancement in dex",
+        
+        "individual_abundances": [],
+        "_individual_abundances_note": "Default list of individual element abundances. Format: [[atomic_number, abundance], ...] where abundance is absolute log abundance (H=12.0 scale). Can be overridden per grid point.",
+        "_individual_abundances_example": [[26, 7.50], [20, 6.34]],
+        "_individual_abundances_elements": "Atomic numbers: 1=H, 2=He, 3=Li, 4=Be, 5=B, 6=C, 7=N, 8=O, 9=F, 10=Ne, 11=Na, 12=Mg, 13=Al, 14=Si, 15=P, 16=S, 17=Cl, 18=Ar, 19=K, 20=Ca, 21=Sc, 22=Ti, 23=V, 24=Cr, 25=Mn, 26=Fe, 27=Co, 28=Ni, 29=Cu, 30=Zn, 31=Ga, 32=Ge, 33=As, 34=Se, 35=Br, 36=Kr, 37=Rb, 38=Sr, 39=Y, 40=Zr, 41=Nb, 42=Mo, 43=Tc, 44=Ru, 45=Rh, 46=Pd, 47=Ag, 48=Cd, 49=In, 50=Sn, 51=Sb, 52=Te, 53=I, 54=Xe, 55=Cs, 56=Ba, 57=La, 58=Ce, 59=Pr, 60=Nd, 61=Pm, 62=Sm, 63=Eu, 64=Gd, 65=Tb, 66=Dy, 67=Ho, 68=Er, 69=Tm, 70=Yb, 71=Lu, 72=Hf, 73=Ta, 74=W, 75=Re, 76=Os, 77=Ir, 78=Pt, 79=Au, 80=Hg, 81=Tl, 82=Pb, 83=Bi, 84=Po, 85=At, 86=Rn, 87=Fr, 88=Ra, 89=Ac, 90=Th, 91=Pa, 92=U",
+        
+        "isotopes": [],
+        "_isotopes_note": "Default list of isotopic fraction changes. Format: [[isotope_code, fraction], ...] where isotope_code is element.isotope (e.g., 6.012 for 12C, 6.013 for 13C). Can be overridden per grid point.",
+        "_isotopes_example": [[6.012, 0.9], [6.013, 0.1]],
+        "_isotopes_note2": "Fractions should sum to 1.0 for each element"
+    },
+    
+    "microturbulence": {
+        "xifix": true,
+        "_xifix_note": "If true, use fixed microturbulence from turbvel. If false, read from model atmosphere",
+        
+        "turbvel": 1.0,
+        "_turbvel_note": "Default microturbulence velocity in km/s (used when xifix=true). Can be overridden per grid point."
+    },
+    
+    "grid_points": [
+        {
+            "_note": "Grid points can be specified in two formats:",
+            "_format1": "Simple: [Teff, logg, Fe/H, microturb_str] - uses default abundances from 'abundances' section",
+            "_format2": "Extended: object with teff, logg, feh, microturb_str + optional abundance overrides",
+            "_examples": "Examples below show extended format with per-point abundance variations"
+        },
+        
+        {
+            "_comment": "Example 1: Simple format would be: [2500, 3.0, 0.00, \"01\"]",
+            "_comment2": "Below are extended format examples with custom abundances per grid point"
+        },
+        
+        {
+            "teff": 5000,
+            "logg": 4.0,
+            "feh": -0.5,
+            "microturb_str": "01",
+            "alpha_fe": 0.3,
+            "turbvel": 1.5,
+            "_example": "Custom alpha enhancement and microturbulence"
+        },
+        
+        {
+            "teff": 5777,
+            "logg": 4.4,
+            "feh": 0.0,
+            "microturb_str": "01",
+            "individual_abundances": [[26, 7.50]],
+            "_example": "Individual Fe abundance override (absolute log abundance, H=12.0 scale)"
+        },
+        
+        {
+            "teff": 4500,
+            "logg": 2.5,
+            "feh": -1.0,
+            "microturb_str": "02",
+            "isotopes": [[6.012, 0.95], [6.013, 0.05]],
+            "_example": "Custom C isotopes (12C/13C = 19:1 ratio)"
+        },
+        
+        {
+            "teff": 6000,
+            "logg": 4.5,
+            "feh": 0.2,
+            "microturb_str": "01",
+            "alpha_fe": 0.1,
+            "r_process": 0.2,
+            "s_process": 0.15,
+            "individual_abundances": [[26, 7.60], [20, 6.40], [12, 7.70]],
+            "isotopes": [[6.012, 0.98], [6.013, 0.02]],
+            "_example": "Multiple custom abundances (Fe, Ca, Mg) and C isotopes"
+        },
+        
+        {
+            "teff": 5500,
+            "logg": 3.5,
+            "feh": -0.3,
+            "microturb_str": "01",
+            "abund_source": "asp2007",
+            "alpha_fe": 0.2,
+            "_example": "Different abundance source (Asplund 2007) with alpha enhancement"
+        },
+        
+        {
+            "teff": 4000,
+            "logg": 1.5,
+            "feh": -2.0,
+            "microturb_str": "02",
+            "helium": 0.1,
+            "r_process": 0.5,
+            "s_process": 0.3,
+            "individual_abundances": [[3, 1.0], [6, 5.5], [7, 6.0]],
+            "_example": "Metal-poor star with enhanced He, r/s-process, and individual Li, C, N abundances"
+        }
+    ],
+    "_grid_points_note": "List of grid points. Each point can be either a simple array [Teff, logg, Fe/H, microturb_str] or an object with extended parameters.",
+    "_grid_points_simple_format": "Simple: [effective_temperature_K, surface_gravity_dex, metallicity_dex, microturbulence_id]",
+    "_grid_points_extended_format": "Extended: object with teff, logg, feh, microturb_str, and optional: abund_source, metallicity, alpha_fe, helium, r_process, s_process, individual_abundances, isotopes, turbvel",
+    "_grid_points_override_note": "If extended format is used, any abundance/isotope parameters specified override the defaults. Omitted parameters use defaults.",
+    
+    "grid_points_file": "",
+    "_grid_points_file_note": "CSV file containing grid points (alternative to grid_points). CSV should have columns: teff, logg, feh, t_value (or turbvel/turbulence/microturb), and optionally: abund_source, metallicity, alpha_fe, helium, r_process, s_process, individual_abundances (JSON string), isotopes (JSON string), turbvel. If specified, grid_points is ignored",
+    
+    "advanced_options": {
+        "tsuji": true,
+        "_tsuji_note": "Use Tsuji molecular equilibrium (true) or other method (false)",
+        
+        "limbdark": false,
+        "_limbdark_note": "Calculate limb-darkening coefficients",
+        
+        "multidump": false,
+        "_multidump_note": "Dump intermediate results",
+        
+        "abfind": false,
+        "_abfind_note": "Iterate on abundance to match equivalent width",
+        
+        "hydrovelo": false,
+        "_hydrovelo_note": "Include hydrodynamic velocity field",
+        
+        "scattfrac": 0.0,
+        "_scattfrac_note": "Fraction of line opacity to include in scattering (0.0 to 1.0)",
+        
+        "pureLTE": false,
+        "_pureLTE_note": "Force pure LTE even if NLTE files are present",
+        
+        "continuous_opacities_file": "",
+        "_continuous_opacities_file_note": "Path to continuous opacities data file. Default: DATA/jonabs_vac_v19.2.dat",
+        
+        "molecules_file": "",
+        "_molecules_file_note": "Path to molecules data file. Default: DATA/LISTE_molecules_all_v19.1.dat",
+        
+        "wavelengths_file": "",
+        "_wavelengths_file_note": "Path to wavelengths file. Default: DATA/wavelengths.UVIS",
+        
+        "atomdata_path": "",
+        "_atomdata_path_note": "Path to atomdata directory (optional)"
+    },
+    
+    "output_options": {
+        "logfile": "",
+        "_logfile_note": "Detailed output log file path (optional, separate from log_dir logs)",
+        
+        "include_atoms": [],
+        "_include_atoms_note": "List of atomic symbols to include (e.g., ['H', 'He', 'Li']). If empty, includes all atoms",
+        "_include_atoms_max": "Maximum 100 atoms"
+    }
+}
