@@ -1,0 +1,36 @@
+{
+    "project_root": "/Users/mjablons/Documents/Turbospectrum_NLTE",
+    "compiler": "gf",
+    "model_atmosphere_path": "",
+    "linelist_path": "",
+    "linelist_files": [
+        "molecules-420-920nm/FeH_GESv5.bsyn",
+        "molecules-420-920nm/12C12C_GESv5.bsyn",
+        "molecules-420-920nm/CaH_GESv5.bsyn"
+    ],
+    "output_dir": "config_test_feh",
+    "log_dir": "config_log_feh",
+    "tmp_dir": "",
+    "calculate_intensity": false,
+    "mu_angles": [],
+    "nlte": false,
+    "nlte_info_file": "",
+    "lambda_min": 4000,
+    "lambda_max": 8000,
+    "lambda_step": 0.1,
+    "model_opac_dir": "COM/contopac",
+    "grid_points": [
+        [
+            2500,
+            3.0,
+            0.00,
+            "01"
+        ],
+        [
+            3500,
+            3.0,
+            0.00,
+            "01"
+        ]
+    ]
+}
