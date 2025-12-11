@@ -74,11 +74,11 @@ This YAML file allows you to specify the minimum, maximum, and step size for `te
 
 ### 2. Generate the Parameter CSV
 
-Once you have configured `grid_config.yml`, you can generate the `parameter_grid.csv` file by running the `generate_grid.py` script. This script requires the `PyYAML` package to be installed.
+Once you have configured `grid_config.yml`, you can generate the `parameter_grid.csv` file by running the `generate_grid.py` script. This script requires the `PyYAML` and `numpy` packages to be installed so it can resolve lists, ranges, and sampled distributions.
 
 ```bash
-# Install PyYAML if you haven't already
-pip install PyYAML
+# Install dependencies if you haven't already
+pip install PyYAML numpy
 
 # Run the script to generate the grid
 python3 scripts/generate_grid.py
@@ -98,3 +98,20 @@ To run the script:
 ```
 
 This will populate the `input_files/model_atmospheres/` directory with any newly interpolated models.
+
+### 4. Synthesize a Grid of Spectra
+
+With atmospheres and a parameter grid in place, you can generate spectra for every sampled point using `scripts/synthesize_spectra.sh`. Make sure `scripts/env.sh` points to your local paths for model atmospheres, line lists, and Turbospectrum executables.
+
+```bash
+# Generate a reproducible grid with sampling controls
+python3 scripts/generate_grid.py
+
+# Ensure atmospheres exist for each grid point
+./scripts/interpolate_models.sh
+
+# Synthesize Flux/Intensity spectra in parallel across the grid
+./scripts/synthesize_spectra.sh
+```
+
+Each run reads `scripts/parameter_grid.csv` (including `grid_version`, abundances, and sampling metadata), uses the corresponding model file, and writes logs under `logs/` with filenames containing the grid version, atmosphere parameters, output mode, and calculation mode. Synthetic spectra are written to the directory specified by `SPECTRA_PATH` in `scripts/env.sh`.
