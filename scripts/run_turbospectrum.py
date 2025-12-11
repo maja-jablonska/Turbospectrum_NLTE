@@ -7,8 +7,9 @@ import glob
 import re
 import dataclasses
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Iterator
 import json
+import csv
 
 # =============================================================================
 # CONFIGURATION
@@ -52,6 +53,12 @@ class TurbospectrumConfig:
     # Grid Points
     # Format: [[Teff, logg, Fe/H, microturb_str], ...]
     grid_points: List[Tuple] = field(default_factory=list)
+    
+    # External grid points file (CSV format)
+    # If specified, grid_points will be loaded from this file instead
+    # CSV should have columns: teff, logg, feh, t_value (or similar)
+    # This is optimized for very large grids to avoid loading all points into memory
+    grid_points_file: str = ""
 
     def __post_init__(self):
         # Set derived paths if not provided
@@ -89,6 +96,91 @@ class TurbospectrumConfig:
 # =============================================================================
 # LOGIC
 # =============================================================================
+
+def load_grid_points_from_csv(file_path: str, project_root: str = "") -> Iterator[Tuple]:
+    """
+    Load grid points from a CSV file in a memory-efficient way.
+    
+    Args:
+        file_path: Path to CSV file (can be relative to project_root or absolute)
+        project_root: Project root directory for resolving relative paths
+        
+    Yields:
+        Tuples of (teff, logg, feh, t_value) for each grid point
+        
+    CSV Format:
+        Expected columns: teff, logg, feh, and one of: turbvel, t_value, turbulence, microturb
+        The CSV can have additional columns which will be ignored.
+        Column matching is case-insensitive and flexible (e.g., 'feh' or 'fe_h' or 'metallicity').
+    """
+    # Resolve path
+    if not os.path.isabs(file_path):
+        if project_root:
+            file_path = os.path.join(project_root, file_path)
+        else:
+            # Try relative to current working directory
+            pass
+    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Grid points file not found: {file_path}")
+    
+    with open(file_path, 'r') as f:
+        reader = csv.DictReader(f)
+        
+        # Try to find the right column names (case-insensitive, flexible)
+        # Map internal names to possible CSV column names
+        col_mapping = {}
+        
+        # Map each required field to possible column names
+        field_mappings = {
+            'teff': ['teff'],
+            'logg': ['logg'],
+            'feh': ['feh', 'fe_h', 'metallicity'],
+            'turb': ['turbvel', 't_value', 'turbulence', 'microturb']
+        }
+        
+        for internal_name, possible_names in field_mappings.items():
+            found = False
+            # Try exact match first (case-sensitive)
+            for possible_name in possible_names:
+                if possible_name in reader.fieldnames:
+                    col_mapping[internal_name] = possible_name
+                    found = True
+                    break
+            
+            # Try case-insensitive match if not found
+            if not found:
+                for possible_name in possible_names:
+                    for col in reader.fieldnames:
+                        if col.lower() == possible_name.lower():
+                            col_mapping[internal_name] = col
+                            found = True
+                            break
+                    if found:
+                        break
+            
+            if not found:
+                raise ValueError(f"Required column for '{internal_name}' not found in CSV file. "
+                               f"Tried: {possible_names}. Available columns: {reader.fieldnames}")
+        
+        for row in reader:
+            try:
+                teff = int(float(row[col_mapping['teff']]))
+                logg = float(row[col_mapping['logg']])
+                feh = float(row[col_mapping['feh']])
+                t_value = str(row[col_mapping['turb']]).strip()
+                
+                # Format t_value to match expected format (e.g., "01", "02")
+                # Remove leading zeros if needed, but keep as string
+                if t_value.isdigit():
+                    # Ensure it's zero-padded to 2 digits if it's a number
+                    t_value = f"{int(t_value):02d}"
+                
+                yield (teff, logg, feh, t_value)
+            except (ValueError, KeyError) as e:
+                # Skip invalid rows but warn
+                print(f"WARNING: Skipping invalid row in grid points file: {row}. Error: {e}")
+                continue
 
 def ensure_directories(config: TurbospectrumConfig):
     for path in [config.output_dir, config.log_dir, config.tmp_dir]:
@@ -495,11 +587,19 @@ def main():
     if force_flag:
         config.force = True
     
+    # Load grid points from external file if specified
+    if config.grid_points_file:
+        print(f"Loading grid points from file: {config.grid_points_file}")
+        grid_points = list(load_grid_points_from_csv(config.grid_points_file, config.project_root))
+        print(f"Loaded {len(grid_points)} grid points from file")
+    else:
+        grid_points = config.grid_points
+    
     # Example: Enable intensity calculation
     # config.calculate_intensity = True
     # config.mu_angles = [1.0, 0.8, 0.6, 0.4, 0.2]
     
-    run_grid(config, config.grid_points)
+    run_grid(config, grid_points)
 
 if __name__ == "__main__":
     main()
