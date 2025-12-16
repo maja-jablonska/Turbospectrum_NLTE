@@ -19,7 +19,7 @@ https://github.com/JGerbs13/TSFitPy
 
 ## Downloading Data
 
-A script is provided to download the necessary data to run Turbospectrum. This includes model atmospheres, NLTE data, and line lists.
+A script is provided to download the necessary data to run Turbospectrum. This includes model atmospheres, NLTE data, and line lists. Downloads are resume-safe: existing files are skipped, and partial downloads continue where they left off. Use `--force` to re-download everything if needed.
 
 ### Usage
 
@@ -55,6 +55,11 @@ Then, run the script with one of the following options:
 *   **Download line lists:**
     ```bash
     ./scripts/download_data.sh --linelists
+    ```
+
+*   **Download the gold sample dataset (path configurable via `GOLD_SAMPLE_URL`/`GOLD_SAMPLE_PATH`):**
+    ```bash
+    ./scripts/download_data.sh --gold-sample
     ```
 
 For more information, you can view the help message:

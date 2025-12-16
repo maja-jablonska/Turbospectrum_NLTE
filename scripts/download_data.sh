@@ -10,9 +10,11 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --atmospheres <type>   Download model atmospheres. <type> can be 'MARCS', 'STAGGER', or 'all'."
-    echo "  --nlte-atoms <atoms>   Download NLTE data. <atoms> is a space-separated list (e.g., "O Mg Si")."
+    echo "  --nlte-atoms <atoms>   Download NLTE data. <atoms> is a space-separated list (e.g., 'O Mg Si')."
     echo "                         Use 'all' to download data for all available atoms."
     echo "  --linelists            Download the recommended line lists."
+    echo "  --gold-sample          Download the gold sample dataset (configurable via GOLD_SAMPLE_URL/GOLD_SAMPLE_PATH)."
+    echo "  --force                Re-download files even if a previous run completed successfully."
     echo "  --all                  Download all available default files."
     echo "  -h, --help             Display this help message."
 }
@@ -31,9 +33,78 @@ fi
 BASE_URL="https://keeper.mpdl.mpg.de/d/6eaecbf95b88448f98a4/files/?p="
 
 # Define paths for NLTE data, as they are not in env.sh
-NLTE_BASE_PATH="/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/nlte_data"
-NLTE_ATOM_PATH="$NLTE_BASE_PATH/model_atoms"
-NLTE_GRID_PATH="$NLTE_BASE_PATH/departure_grids"
+NLTE_BASE_PATH="${NLTE_BASE_PATH:-/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/nlte_data}"
+NLTE_ATOM_PATH="${NLTE_ATOM_PATH:-$NLTE_BASE_PATH/model_atoms}"
+NLTE_GRID_PATH="${NLTE_GRID_PATH:-$NLTE_BASE_PATH/departure_grids}"
+
+# Allow overriding STAGGER path
+STAGGER_PATH="${STAGGER_PATH:-/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/model_atmospheres/STAGGER_grid}"
+
+# Optional gold sample download location (override via env)
+GOLD_SAMPLE_URL="${GOLD_SAMPLE_URL:-${BASE_URL}/gold_sample/}"
+GOLD_SAMPLE_PATH="${GOLD_SAMPLE_PATH:-$PWD/gold_sample}"
+
+# Whether to force re-download even if a previous run completed
+FORCE_DOWNLOAD=false
+
+# --- Helpers ---
+
+should_skip_download() {
+    local target_dir="$1"
+    local label="$2"
+    local marker="$target_dir/.download_complete"
+
+    if [ -f "$marker" ] && [ "$FORCE_DOWNLOAD" = false ]; then
+        echo "$label already downloaded at $target_dir. Skipping (use --force to re-download)."
+        return 0
+    fi
+    return 1
+}
+
+mark_download_complete() {
+    local target_dir="$1"
+    mkdir -p "$target_dir"
+    touch "$target_dir/.download_complete"
+}
+
+download_with_resume() {
+    local url="$1"
+    local target_dir="$2"
+    local cut_dirs="$3"
+    local label="$4"
+    local accept="$5"
+
+    mkdir -p "$target_dir"
+    mkdir -p "$TMP_PATH"
+
+    if should_skip_download "$target_dir" "$label"; then
+        return 0
+    fi
+
+    echo "Syncing $label from $url to $target_dir..."
+    local wget_args=(
+        -q --show-progress -r -np -nH
+        --cut-dirs="$cut_dirs"
+        --no-check-certificate
+        --continue
+        --timestamping
+        -P "$target_dir"
+        -R "index.html*"
+    )
+
+    if [ -n "$accept" ]; then
+        wget_args+=(--accept="$accept")
+    fi
+
+    if wget "${wget_args[@]}" "$url"; then
+        mark_download_complete "$target_dir"
+        echo "$label download complete."
+        return 0
+    else
+        echo "Warning: $label download encountered errors. You can re-run the script to resume."
+        return 1
+    fi
+}
 
 
 # --- Download Functions ---
@@ -44,9 +115,9 @@ download_marcs() {
     local zip_url="https://keeper.mpdl.mpg.de/d/6eaecbf95b88448f98a4/files/?p=/atmospheres/marcs_standard_comp.zip"
     local zip_file="$TMP_PATH/marcs_standard_comp.zip"
 
-    echo "Downloading MARCS model atmospheres to $target_dir..."
-    mkdir -p "$target_dir"
-    mkdir -p "$TMP_PATH"
+    if should_skip_download "$target_dir" "MARCS atmospheres"; then
+        return 0
+    fi
 
     if [ ! -f "$zip_file" ]; then
         echo ""
@@ -62,6 +133,9 @@ download_marcs() {
     fi
 
     echo "Unzipping models to $target_dir..."
+    mkdir -p "$target_dir"
+    mkdir -p "$TMP_PATH"
+
     unzip -o "$zip_file" -d "$target_dir"
     if [ $? -ne 0 ]; then
         echo "Error: Failed to unzip MARCS models. The zip file might be corrupted."
@@ -79,16 +153,13 @@ download_marcs() {
         echo "Removed old model_list file."
     fi
 
+    mark_download_complete "$target_dir"
     echo "MARCS atmospheres extraction complete."
 }
 
 # Download STAGGER model atmospheres
 download_stagger() {
-    local target_dir="/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/model_atmospheres/STAGGER_grid"
-    echo "Downloading STAGGER model atmospheres to $target_dir..."
-    mkdir -p "$target_dir"
-    wget -q --show-progress -r -np -nH --cut-dirs=4 --no-check-certificate -R "index.html*" -P "$target_dir" "${BASE_URL}/STAGGER_grid/"
-    echo "STAGGER atmospheres download complete."
+    download_with_resume "${BASE_URL}/STAGGER_grid/" "$STAGGER_PATH" 4 "STAGGER atmospheres"
 }
 
 # Download NLTE data (model atoms and departure coefficient grids)
@@ -96,26 +167,28 @@ download_nlte() {
     echo "Downloading NLTE data..."
     echo "Model atoms will be saved to: $NLTE_ATOM_PATH"
     echo "Departure coefficient grids will be saved to: $NLTE_GRID_PATH"
-    mkdir -p "$NLTE_ATOM_PATH"
-    mkdir -p "$NLTE_GRID_PATH"
 
-    # Note: Due to the complex mapping of atoms to filenames, this script downloads all
-    # available NLTE data to ensure consistency.
-    echo "Downloading all model atoms..."
-    wget -q --show-progress -r -np -nH --cut-dirs=5 --no-check-certificate -R "index.html*" --accept="atom.*" -P "$NLTE_ATOM_PATH" "${BASE_URL}/NLTE_data/"
+    local status=0
+    download_with_resume "${BASE_URL}/NLTE_data/" "$NLTE_ATOM_PATH" 5 "NLTE model atoms" "atom.*" || status=1
+    download_with_resume "${BASE_URL}/NLTE_data/" "$NLTE_GRID_PATH" 5 "NLTE departure coefficient grids" "NLTEgrid*,auxData*" || status=1
 
-    echo "Downloading all departure coefficient grids..."
-    wget -q --show-progress -r -np -nH --cut-dirs=5 --no-check-certificate -R "index.html*" --accept="NLTEgrid*,auxData*" -P "$NLTE_GRID_PATH" "${BASE_URL}/NLTE_data/"
+    if [ $status -eq 0 ]; then
+        echo "NLTE data download complete (resume-safe)."
+    else
+        echo "NLTE data download completed with warnings; re-run to fetch any missing files."
+    fi
 
-    echo "NLTE data download complete."
+    return $status
 }
 
 # Download recommended line lists
 download_linelists() {
-    echo "Downloading recommended line lists to $LINELIST_PATH..."
-    mkdir -p "$LINELIST_PATH"
-    wget -q --show-progress -r -np -nH --cut-dirs=4 --no-check-certificate -R "index.html*" -P "$LINELIST_PATH" "${BASE_URL}/Linelists/"
-    echo "Line lists download complete."
+    download_with_resume "${BASE_URL}/Linelists/" "$LINELIST_PATH" 4 "Line lists"
+}
+
+# Download gold sample dataset (path configurable via GOLD_SAMPLE_URL)
+download_gold_sample() {
+    download_with_resume "$GOLD_SAMPLE_URL" "$GOLD_SAMPLE_PATH" 4 "Gold sample"
 }
 
 
@@ -130,7 +203,15 @@ fi
 # Parse command-line arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
+        --force)
+            FORCE_DOWNLOAD=true
+            ;;
         --atmospheres)
+            if [[ -z "$2" ]]; then
+                echo "Error: --atmospheres requires an argument."
+                exit 1
+            fi
+
             if [[ "$2" == "MARCS" ]]; then
                 download_marcs
             elif [[ "$2" == "STAGGER" ]]; then
@@ -157,6 +238,9 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --linelists)
             download_linelists
+            ;;
+        --gold-sample)
+            download_gold_sample
             ;;
         --all)
             download_marcs
