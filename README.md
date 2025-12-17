@@ -91,6 +91,16 @@ python3 scripts/generate_grid.py
 
 This will create the `scripts/parameter_grid.csv` file, which will be used by the subsequent scripts in the pipeline.
 
+#### Quick sampling for machine learning
+
+If you just need a compact, Latin-Hypercube-sampled grid for ML experiments, edit `config_ml_sampling.json` to set parameter bounds, abundance defaults, and synthesis settings, then run:
+
+```bash
+python3 scripts/sample_machine_learning_grid.py  # add --resume to append up to num_samples
+```
+
+The helper writes a CSV at `scripts/ml_parameter_grid.csv` (override with `--output`) and a compressed Zarr store at `scripts/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput CSV output and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. The layout matches the existing synthesis scripts, so you can plug it directly into `scripts/synthesize_spectra.sh` after copying or renaming it as needed.
+
 ### 3. Interpolate Model Atmospheres
 
 With the parameter grid generated, the next step is to ensure that a model atmosphere exists for each point in the grid. The `interpolate_models.sh` script handles this by interpolating new models from the existing grid as needed.
