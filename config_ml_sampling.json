@@ -1,0 +1,40 @@
+{
+    "grid_version": "ml-demo",
+    "num_samples": 40,
+    "seed": 777,
+    "bounds": {
+        "teff": {"min": 4000, "max": 7000},
+        "logg": {"min": 0.0, "max": 5.0},
+        "feh": {"min": -2.5, "max": 0.5}
+    },
+    "turbvel": "01",
+    "t_value_options": ["00", "01", "02", "05"],
+    "abundances": {
+        "a": "+0.00",
+        "c": "+0.00",
+        "n": "+0.00",
+        "o": "+0.00",
+        "r": "+0.00",
+        "s": "+0.00"
+    },
+    "synthesis": {
+        "lam_min": 6000,
+        "lam_max": 6100,
+        "lam_step": 0.01,
+        "output_mode": "Flux"
+    },
+    "mode": "1D",
+    "calculation_mode": "LTE",
+    "output_csv": "scripts/ml_parameter_grid.csv",
+    "csv_compression": "zstd",
+    "csv_compression_level": 5,
+    "zarr": {
+        "path": "scripts/ml_parameter_grid.zarr",
+        "chunks": 2048,
+        "compressor": {
+            "cname": "zstd",
+            "clevel": 5,
+            "shuffle": true
+        }
+    }
+}
