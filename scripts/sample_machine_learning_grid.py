@@ -148,6 +148,14 @@ def main() -> None:
     csv_compression = config.get("csv_compression")
     csv_compression_level = config.get("csv_compression_level")
 
+    def _write_csv(df: pl.DataFrame, path: str, append: bool) -> None:
+        if csv_compression or csv_compression_level:
+            print(
+                "CSV compression options are configured but not applied because Polars append mode "
+                "does not support compression in this environment; writing uncompressed instead."
+            )
+        df.write_csv(path, include_header=not append, append=append)
+
     existing_rows = 0
     if args.resume and os.path.exists(output_path):
         existing_rows = int(pl.scan_csv(output_path).select(pl.count()).collect().item())
@@ -188,9 +196,8 @@ def main() -> None:
         }
     )
 
-    write_mode = "ab" if args.resume and os.path.exists(output_path) else "wb"
-    with open(output_path, write_mode) as handle:
-        df.write_csv(handle, include_header=write_mode == "wb", compression=csv_compression, compression_level=csv_compression_level)
+    append_mode = args.resume and os.path.exists(output_path)
+    _write_csv(df, output_path, append=append_mode)
     total_rows = existing_rows + sample_count_new
     print(f"Wrote {sample_count_new} samples to {output_path} using Polars (total rows now {total_rows})")
 
@@ -210,7 +217,7 @@ def main() -> None:
         store = zarr.DirectoryStore(zarr_path)
 
         if args.resume and os.path.exists(zarr_path):
-            root = zarr.open_group(store=store, mode="a")
+            root = zarr.open_group(store=store, mode="a", zarr_format=3)
             if not root.arrays():
                 raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
             existing_len = len(next(iter(root.arrays()))[1])
@@ -224,7 +231,7 @@ def main() -> None:
                 arr[existing_len:new_len] = data
             print(f"Appended {sample_count_new} samples to Zarr store at {zarr_path} (total rows now {new_len})")
         else:
-            root = zarr.group(store=store, overwrite=True)
+            root = zarr.group(store=store, overwrite=True, zarr_format=3)
             for column in df.columns:
                 series = df[column]
                 if series.dtype == pl.Utf8:
