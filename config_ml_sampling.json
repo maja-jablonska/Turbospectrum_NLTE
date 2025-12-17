@@ -7,15 +7,17 @@
         "logg": {"min": 0.0, "max": 5.0},
         "feh": {"min": -2.5, "max": 0.5}
     },
+    "sample_turbvel": true,
+    "turbvel_options": ["01", "02", "03", "04", "05"],
     "turbvel": "01",
     "t_value_options": ["00", "01", "02", "05"],
     "abundances": {
-        "a": "+0.00",
+        "a": {"min": -0.15, "max": 0.15},
         "c": "+0.00",
-        "n": "+0.00",
+        "n": {"min": -0.10, "max": 0.25},
         "o": "+0.00",
         "r": "+0.00",
-        "s": "+0.00"
+        "s": {"min": -0.05, "max": 0.20}
     },
     "synthesis": {
         "lam_min": 6000,
