@@ -52,6 +52,10 @@ class TurbospectrumConfig:
     lambda_step: float = 0.1
     model_opac_dir: str = "COM/contopac"
 
+    # Parallelization
+    # If None, the script will try to detect the assigned CPUs from the environment
+    max_workers: Optional[int] = None
+
     # Grid Points
     # Format: [[Teff, logg, Fe/H, microturb_str], ...]
     grid_points: List[Tuple] = field(default_factory=list)
@@ -190,6 +194,76 @@ def ensure_directories(config: TurbospectrumConfig):
     # Also ensure opac dir exists
     opac_full_path = os.path.join(config.project_root, config.model_opac_dir)
     os.makedirs(opac_full_path, exist_ok=True)
+
+
+def _parse_int_env(var_name: str) -> Optional[int]:
+    """Parse integer-like environment variables robustly."""
+    raw_value = os.environ.get(var_name)
+    if not raw_value:
+        return None
+
+    match = re.search(r"\d+", raw_value)
+    if match:
+        try:
+            return int(match.group())
+        except ValueError:
+            return None
+    return None
+
+
+def determine_worker_count(config: TurbospectrumConfig) -> int:
+    """Determine how many worker processes to spawn on HPC systems."""
+    # Prefer explicit configuration
+    configured = config.max_workers if config.max_workers and config.max_workers > 0 else None
+
+    # Respect SLURM, PBS, and similar schedulers
+    scheduler_env_vars = [
+        "SLURM_CPUS_PER_TASK",
+        "SLURM_CPUS_ON_NODE",
+        "PBS_NP",
+        "NSLOTS",
+        "OMP_NUM_THREADS",
+    ]
+    env_value = None
+    env_source = None
+    for var in scheduler_env_vars:
+        env_val = _parse_int_env(var)
+        if env_val:
+            env_value = env_val
+            env_source = var
+            break
+
+    # Respect cgroup/affinity limits if present (common on HPC nodes)
+    affinity_count = None
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            affinity_count = len(os.sched_getaffinity(0))
+        except Exception:
+            affinity_count = None
+
+    # Fallback to Python's view of the system
+    host_cpu_count = multiprocessing.cpu_count()
+
+    # Start with the most specific value available
+    worker_count = configured or env_value or host_cpu_count
+
+    # Never exceed affinity limits
+    if affinity_count:
+        worker_count = min(worker_count, affinity_count)
+
+    worker_count = max(1, worker_count)
+
+    print("Parallelization setup:")
+    if configured:
+        print(f"  Using user-configured max_workers={configured}")
+    if env_source:
+        print(f"  Detected {env_value} CPUs from {env_source}")
+    if affinity_count:
+        print(f"  CPU affinity allows {affinity_count} workers")
+    print(f"  Host reports {host_cpu_count} CPUs")
+    print(f"  Spawning {worker_count} worker processes")
+
+    return worker_count
 
 def create_linelist_file(config: TurbospectrumConfig) -> str:
     """Creates a file containing the list of linelists to use."""
@@ -553,9 +627,8 @@ def run_grid(config: TurbospectrumConfig, grid_points: List[Tuple]):
     # We pass config to each worker
     tasks = [(point, config) for point in grid_points]
     
-    # Determine number of CPUs
-    num_cpus = multiprocessing.cpu_count()
-    print(f"Using {num_cpus} CPUs")
+    # Determine number of CPUs, respecting HPC scheduler assignments
+    num_cpus = determine_worker_count(config)
     
     start_time = time.time()
     
