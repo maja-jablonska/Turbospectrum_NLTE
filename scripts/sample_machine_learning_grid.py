@@ -106,6 +106,7 @@ def main() -> None:
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to JSON config with sampling bounds and defaults")
     parser.add_argument("--output", default=None, help="Where to write the sampled CSV (defaults to config or scripts/ml_parameter_grid.csv)")
     parser.add_argument("--zarr-output", default=None, help="Optional override for Zarr output path")
+    parser.add_argument("--resume", action="store_true", help="Append new samples up to num_samples if outputs already exist")
     parser.add_argument("--samples", type=int, default=None, help="Override the number of samples without editing the config")
     args = parser.parse_args()
 
@@ -147,38 +148,51 @@ def main() -> None:
     csv_compression = config.get("csv_compression")
     csv_compression_level = config.get("csv_compression_level")
 
+    existing_rows = 0
+    if args.resume and os.path.exists(output_path):
+        existing_rows = int(pl.scan_csv(output_path).select(pl.count()).collect().item())
+        if existing_rows >= sample_count:
+            print(f"Resume requested, but output already has {existing_rows} rows (>= target {sample_count}). Nothing to do.")
+            return
+
+    lhs = lhs[existing_rows:]
+    sample_count_new = lhs.shape[0]
+
     int_teff = np.rint(lhs[:, 0]).astype(int)
     logg_vals = np.round(lhs[:, 1], 3)
     feh_vals = np.round(lhs[:, 2], 3)
 
-    turbvel_series = _choose_series(turbvel_cfg, rng, sample_count, "turbvel")
-    t_value_series = _choose_series(t_value_options, rng, sample_count, "t_value_options")
+    turbvel_series = _choose_series(turbvel_cfg, rng, sample_count_new, "turbvel")
+    t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
 
     df = pl.DataFrame(
         {
-            "grid_version": np.full(sample_count, grid_version, dtype=object),
+            "grid_version": np.full(sample_count_new, grid_version, dtype=object),
             "teff": int_teff,
             "logg": logg_vals,
             "feh": feh_vals,
-            "lam_min": np.full(sample_count, lam_min, dtype=float),
-            "lam_max": np.full(sample_count, lam_max, dtype=float),
-            "lam_step": np.full(sample_count, lam_step, dtype=float),
+            "lam_min": np.full(sample_count_new, lam_min, dtype=float),
+            "lam_max": np.full(sample_count_new, lam_max, dtype=float),
+            "lam_step": np.full(sample_count_new, lam_step, dtype=float),
             "turbvel": turbvel_series,
             "t_value": t_value_series,
-            "a": np.full(sample_count, a_val, dtype=object),
-            "c": np.full(sample_count, c_val, dtype=object),
-            "n": np.full(sample_count, n_val, dtype=object),
-            "o": np.full(sample_count, o_val, dtype=object),
-            "r": np.full(sample_count, r_val, dtype=object),
-            "s": np.full(sample_count, s_val, dtype=object),
-            "output_mode": np.full(sample_count, output_mode, dtype=object),
-            "mode": np.full(sample_count, mode, dtype=object),
-            "calculation_mode": np.full(sample_count, calculation_mode, dtype=object),
+            "a": np.full(sample_count_new, a_val, dtype=object),
+            "c": np.full(sample_count_new, c_val, dtype=object),
+            "n": np.full(sample_count_new, n_val, dtype=object),
+            "o": np.full(sample_count_new, o_val, dtype=object),
+            "r": np.full(sample_count_new, r_val, dtype=object),
+            "s": np.full(sample_count_new, s_val, dtype=object),
+            "output_mode": np.full(sample_count_new, output_mode, dtype=object),
+            "mode": np.full(sample_count_new, mode, dtype=object),
+            "calculation_mode": np.full(sample_count_new, calculation_mode, dtype=object),
         }
     )
 
-    df.write_csv(output_path, compression=csv_compression, compression_level=csv_compression_level)
-    print(f"Wrote {sample_count} samples to {output_path} using Polars")
+    write_mode = "ab" if args.resume and os.path.exists(output_path) else "wb"
+    with open(output_path, write_mode) as handle:
+        df.write_csv(handle, include_header=write_mode == "wb", compression=csv_compression, compression_level=csv_compression_level)
+    total_rows = existing_rows + sample_count_new
+    print(f"Wrote {sample_count_new} samples to {output_path} using Polars (total rows now {total_rows})")
 
     if zarr_path:
         store_dir = os.path.dirname(os.path.abspath(zarr_path))
@@ -193,15 +207,31 @@ def main() -> None:
             compressor = Blosc(cname=cname, clevel=clevel, shuffle=Blosc.BITSHUFFLE if shuffle else Blosc.NOSHUFFLE)
 
         strings_codec = VLenUTF8()
-        root = zarr.group(store=zarr.DirectoryStore(zarr_path), overwrite=True)
-        for column in df.columns:
-            series = df[column]
-            if series.dtype == pl.Utf8:
-                root.array(column, series.to_list(), dtype=object, object_codec=strings_codec, compressor=compressor, chunks=zarr_chunks)
-            else:
-                root.array(column, series.to_numpy(), compressor=compressor, chunks=zarr_chunks)
+        store = zarr.DirectoryStore(zarr_path)
 
-        print(f"Wrote Zarr store to {zarr_path} with chunk size {zarr_chunks}")
+        if args.resume and os.path.exists(zarr_path):
+            root = zarr.open_group(store=store, mode="a")
+            if not root.arrays():
+                raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
+            existing_len = len(next(iter(root.arrays()))[1])
+            new_len = existing_len + sample_count_new
+            for column in df.columns:
+                arr = root[column]
+                if arr.shape[0] != existing_len:
+                    raise ValueError(f"Zarr column {column} has inconsistent length {arr.shape[0]} vs expected {existing_len}")
+                data = df[column].to_list() if df[column].dtype == pl.Utf8 else df[column].to_numpy()
+                arr.resize(new_len, axis=0)
+                arr[existing_len:new_len] = data
+            print(f"Appended {sample_count_new} samples to Zarr store at {zarr_path} (total rows now {new_len})")
+        else:
+            root = zarr.group(store=store, overwrite=True)
+            for column in df.columns:
+                series = df[column]
+                if series.dtype == pl.Utf8:
+                    root.array(column, series.to_list(), dtype=object, object_codec=strings_codec, compressor=compressor, chunks=zarr_chunks)
+                else:
+                    root.array(column, series.to_numpy(), compressor=compressor, chunks=zarr_chunks)
+            print(f"Wrote Zarr store to {zarr_path} with chunk size {zarr_chunks}")
 
 
 if __name__ == "__main__":
