@@ -89,6 +89,18 @@ def parse_args() -> argparse.Namespace:
         help="Timeout for individual file downloads in seconds (default: %(default)s).",
     )
     parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="Path to a progress file (JSONL). Defaults to <output-dir>/download_progress.jsonl.",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="Optional log file to mirror console output.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -127,6 +139,45 @@ def download_url(url: str, destination: Path, timeout: float) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with urlopen(url, timeout=timeout) as response, destination.open("wb") as fh:
         shutil.copyfileobj(response, fh)
+
+
+def load_state(state_file: Path) -> set[str]:
+    """Load previously processed filenames from a JSONL progress file."""
+    processed: set[str] = set()
+    if not state_file.exists():
+        return processed
+
+    try:
+        import json
+
+        with state_file.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                name = entry.get("name")
+                if name:
+                    processed.add(name)
+    except Exception:
+        logging.warning("Failed to load state file %s; continuing without it.", state_file, exc_info=True)
+    return processed
+
+
+def append_state(state_file: Path, **fields: object) -> None:
+    """Append a JSON record to the progress file."""
+    try:
+        import json
+
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with state_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(fields, sort_keys=True))
+            fh.write("\n")
+    except Exception:
+        logging.warning("Could not write to state file %s", state_file, exc_info=True)
 
 
 def fetch_chunk(
@@ -170,11 +221,17 @@ def fetch_chunk(
 
 def main() -> int:
     args = parse_args()
+    log_handlers = [logging.StreamHandler(sys.stdout)]
+    if args.log_file:
+        args.log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        handlers=log_handlers,
     )
     output_dir: Path = args.output_dir
+    state_file: Path = args.state_file or output_dir / "download_progress.jsonl"
 
     service = pyvo.ssa.SSAService(args.service_url)
     logging.info(
@@ -184,9 +241,13 @@ def main() -> int:
         args.format_,
     )
 
+    processed = load_state(state_file)
+    if processed:
+        logging.info("Loaded %d previously processed entries from %s", len(processed), state_file)
+
     downloaded = 0
     skipped = 0
-    seen: set[str] = set()
+    seen: set[str] = set(processed)
 
     for teff_min, teff_max in frange(args.teff_min, args.teff_max, args.teff_interval):
         for logg_min, logg_max in frange(args.logg_min, args.logg_max, args.logg_interval):
@@ -212,11 +273,27 @@ def main() -> int:
                     logg_min,
                     logg_max,
                     exc,
+                    exc_info=True,
+                )
+                append_state(
+                    state_file,
+                    event="chunk_error",
+                    teff_range=[teff_min, teff_max],
+                    logg_range=[logg_min, logg_max],
+                    error=str(exc),
+                    timestamp=time.time(),
                 )
                 continue
 
             if len(results) == 0:
                 logging.debug("No spectra in this chunk.")
+                append_state(
+                    state_file,
+                    event="chunk_empty",
+                    teff_range=[teff_min, teff_max],
+                    logg_range=[logg_min, logg_max],
+                    timestamp=time.time(),
+                )
                 continue
 
             logging.info("Chunk returned %d spectrum files.", len(results))
@@ -235,21 +312,58 @@ def main() -> int:
                 destination = output_dir / name
                 if destination.exists() and not args.overwrite:
                     skipped += 1
+                    append_state(
+                        state_file,
+                        event="exists",
+                        name=name,
+                        url=record.getdataurl(),
+                        teff_range=[teff_min, teff_max],
+                        logg_range=[logg_min, logg_max],
+                        timestamp=time.time(),
+                    )
                     continue
 
                 if args.dry_run:
                     logging.info("[dry-run] Would download %s -> %s", record.getdataurl(), destination)
                     downloaded += 1
+                    append_state(
+                        state_file,
+                        event="dry_run",
+                        name=name,
+                        url=record.getdataurl(),
+                        teff_range=[teff_min, teff_max],
+                        logg_range=[logg_min, logg_max],
+                        timestamp=time.time(),
+                    )
                     continue
 
                 try:
                     download_url(record.getdataurl(), destination, timeout=args.timeout)
                 except Exception as exc:  # noqa: BLE001
-                    logging.error("Failed to download %s: %s", name, exc)
+                    logging.error("Failed to download %s: %s", name, exc, exc_info=True)
+                    append_state(
+                        state_file,
+                        event="error",
+                        name=name,
+                        url=record.getdataurl(),
+                        teff_range=[teff_min, teff_max],
+                        logg_range=[logg_min, logg_max],
+                        error=str(exc),
+                        timestamp=time.time(),
+                    )
                     continue
 
                 downloaded += 1
                 logging.debug("Saved %s", destination)
+                append_state(
+                    state_file,
+                    event="downloaded",
+                    name=name,
+                    url=record.getdataurl(),
+                    teff_range=[teff_min, teff_max],
+                    logg_range=[logg_min, logg_max],
+                    timestamp=time.time(),
+                )
 
     logging.info("Download complete. New files: %d, skipped: %d", downloaded, skipped)
     return 0
