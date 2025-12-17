@@ -3,9 +3,9 @@
 
 This helper reads a JSON configuration (defaults to ``config_ml_sampling.json``
 at the repository root), samples stellar parameters within specified bounds,
-and writes both CSV and Zarr outputs that match the grid format expected by
-the synthesis scripts. The Polars + Zarr pipeline keeps I/O efficient for HPC
-environments and downstream ML ingestion.
+and writes the results to a Zarr (v3) store that matches the grid format
+expected by the synthesis scripts. The Polars + Zarr pipeline keeps I/O
+efficient for HPC environments and downstream ML ingestion.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from numcodecs import Blosc, VLenUTF8
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config_ml_sampling.json"))
-DEFAULT_OUTPUT_PATH = os.path.join(SCRIPT_DIR, "ml_parameter_grid.csv")
+DEFAULT_ZARR_PATH = os.path.join(SCRIPT_DIR, "ml_parameter_grid.zarr")
 
 
 def _ensure_polars_zarr_available() -> None:
@@ -104,7 +104,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to JSON config with sampling bounds and defaults")
-    parser.add_argument("--output", default=None, help="Where to write the sampled CSV (defaults to config or scripts/ml_parameter_grid.csv)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Deprecated alias for --zarr-output. CSV export is no longer supported; data are written to Zarr only.",
+    )
     parser.add_argument("--zarr-output", default=None, help="Optional override for Zarr output path")
     parser.add_argument("--resume", action="store_true", help="Append new samples up to num_samples if outputs already exist")
     parser.add_argument("--samples", type=int, default=None, help="Override the number of samples without editing the config")
@@ -138,27 +142,29 @@ def main() -> None:
     turbvel_cfg = config.get("turbvel", "01")
     t_value_options = config.get("t_value_options", ["01"])
 
-    output_path = args.output or config.get("output_csv") or DEFAULT_OUTPUT_PATH
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-
     zarr_cfg = config.get("zarr", {})
-    zarr_path = args.zarr_output or zarr_cfg.get("path")
+    zarr_path = args.zarr_output or args.output or zarr_cfg.get("path") or DEFAULT_ZARR_PATH
     zarr_chunks = int(zarr_cfg.get("chunks", 2048)) if zarr_cfg else 2048
     zarr_compressor_cfg = zarr_cfg.get("compressor", {}) if zarr_cfg else {}
-    csv_compression = config.get("csv_compression")
-    csv_compression_level = config.get("csv_compression_level")
 
-    def _write_csv(df: pl.DataFrame, path: str, append: bool) -> None:
-        if csv_compression or csv_compression_level:
-            print(
-                "CSV compression options are configured but not applied because Polars append mode "
-                "does not support compression in this environment; writing uncompressed instead."
-            )
-        df.write_csv(path, include_header=not append, append=append)
+    if not zarr_path:
+        raise ValueError("Zarr output path must be provided via config, --zarr-output, or --output (deprecated alias).")
+    os.makedirs(os.path.dirname(os.path.abspath(zarr_path)), exist_ok=True)
 
     existing_rows = 0
-    if args.resume and os.path.exists(output_path):
-        existing_rows = int(pl.scan_csv(output_path).select(pl.count()).collect().item())
+    if args.resume and os.path.exists(zarr_path):
+        store = zarr.DirectoryStore(zarr_path)
+        root = zarr.open_group(store=store, mode="a", zarr_format=3)
+        array_keys = list(root.keys())
+        if not array_keys:
+            raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
+        existing_rows = root[array_keys[0]].shape[0]
+        for name in array_keys[1:]:
+            arr = root[name]
+            if arr.shape[0] != existing_rows:
+                raise ValueError(
+                    f"Zarr column {name} has inconsistent length {arr.shape[0]} vs expected {existing_rows}"
+                )
         if existing_rows >= sample_count:
             print(f"Resume requested, but output already has {existing_rows} rows (>= target {sample_count}). Nothing to do.")
             return
@@ -196,49 +202,47 @@ def main() -> None:
         }
     )
 
-    append_mode = args.resume and os.path.exists(output_path)
-    _write_csv(df, output_path, append=append_mode)
-    total_rows = existing_rows + sample_count_new
-    print(f"Wrote {sample_count_new} samples to {output_path} using Polars (total rows now {total_rows})")
+    compressor = None
+    if zarr_compressor_cfg:
+        cname = zarr_compressor_cfg.get("cname", "zstd")
+        clevel = int(zarr_compressor_cfg.get("clevel", 5))
+        shuffle = zarr_compressor_cfg.get("shuffle", True)
+        compressor = Blosc(cname=cname, clevel=clevel, shuffle=Blosc.BITSHUFFLE if shuffle else Blosc.NOSHUFFLE)
 
-    if zarr_path:
-        store_dir = os.path.dirname(os.path.abspath(zarr_path))
-        if store_dir:
-            os.makedirs(store_dir, exist_ok=True)
+    strings_codec = VLenUTF8()
+    store = zarr.DirectoryStore(zarr_path)
 
-        compressor = None
-        if zarr_compressor_cfg:
-            cname = zarr_compressor_cfg.get("cname", "zstd")
-            clevel = int(zarr_compressor_cfg.get("clevel", 5))
-            shuffle = zarr_compressor_cfg.get("shuffle", True)
-            compressor = Blosc(cname=cname, clevel=clevel, shuffle=Blosc.BITSHUFFLE if shuffle else Blosc.NOSHUFFLE)
-
-        strings_codec = VLenUTF8()
-        store = zarr.DirectoryStore(zarr_path)
-
-        if args.resume and os.path.exists(zarr_path):
-            root = zarr.open_group(store=store, mode="a", zarr_format=3)
-            if not root.arrays():
-                raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
-            existing_len = len(next(iter(root.arrays()))[1])
-            new_len = existing_len + sample_count_new
-            for column in df.columns:
-                arr = root[column]
-                if arr.shape[0] != existing_len:
-                    raise ValueError(f"Zarr column {column} has inconsistent length {arr.shape[0]} vs expected {existing_len}")
-                data = df[column].to_list() if df[column].dtype == pl.Utf8 else df[column].to_numpy()
-                arr.resize(new_len, axis=0)
-                arr[existing_len:new_len] = data
-            print(f"Appended {sample_count_new} samples to Zarr store at {zarr_path} (total rows now {new_len})")
-        else:
-            root = zarr.group(store=store, overwrite=True, zarr_format=3)
-            for column in df.columns:
-                series = df[column]
-                if series.dtype == pl.Utf8:
-                    root.array(column, series.to_list(), dtype=object, object_codec=strings_codec, compressor=compressor, chunks=zarr_chunks)
-                else:
-                    root.array(column, series.to_numpy(), compressor=compressor, chunks=zarr_chunks)
-            print(f"Wrote Zarr store to {zarr_path} with chunk size {zarr_chunks}")
+    if args.resume and os.path.exists(zarr_path):
+        root = zarr.open_group(store=store, mode="a", zarr_format=3)
+        array_keys = list(root.keys())
+        if not array_keys:
+            raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
+        existing_len = root[array_keys[0]].shape[0]
+        new_len = existing_len + sample_count_new
+        for column in df.columns:
+            arr = root[column]
+            if arr.shape[0] != existing_len:
+                raise ValueError(f"Zarr column {column} has inconsistent length {arr.shape[0]} vs expected {existing_len}")
+            data = df[column].to_list() if df[column].dtype == pl.Utf8 else df[column].to_numpy()
+            arr.resize(new_len, axis=0)
+            arr[existing_len:new_len] = data
+        print(f"Appended {sample_count_new} samples to Zarr store at {zarr_path} (total rows now {new_len})")
+    else:
+        root = zarr.group(store=store, overwrite=True, zarr_format=3)
+        for column in df.columns:
+            series = df[column]
+            if series.dtype == pl.Utf8:
+                root.array(
+                    column,
+                    series.to_list(),
+                    dtype=object,
+                    object_codec=strings_codec,
+                    compressor=compressor,
+                    chunks=zarr_chunks,
+                )
+            else:
+                root.array(column, series.to_numpy(), compressor=compressor, chunks=zarr_chunks)
+        print(f"Wrote Zarr store to {zarr_path} with chunk size {zarr_chunks}")
 
 
 if __name__ == "__main__":
