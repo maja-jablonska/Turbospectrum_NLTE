@@ -17,6 +17,96 @@ from datetime import datetime
 # CONFIGURATION
 # =============================================================================
 
+def _strip_private_keys(obj):
+    """Recursively remove JSON keys starting with '_' (e.g. _comment, _note)."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_private_keys(v)
+            for k, v in obj.items()
+            if not (isinstance(k, str) and k.startswith("_"))
+        }
+    if isinstance(obj, list):
+        return [_strip_private_keys(v) for v in obj]
+    return obj
+
+
+def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
+    """
+    Normalize config JSON to the flat schema expected by TurbospectrumConfig.
+
+    Supports both:
+    - legacy flat configs (already matching TurbospectrumConfig fields)
+    - comprehensive nested configs (config_sample_comprehensive.json)
+    """
+    cfg_data = _strip_private_keys(cfg_data or {})
+
+    has_nested_sections = any(
+        key in cfg_data for key in ("paths", "executables", "synthesis_parameters", "nlte")
+    )
+    if not has_nested_sections:
+        if "project_root" not in cfg_data:
+            cfg_data["project_root"] = default_project_root
+        return cfg_data
+
+    flat: dict = {}
+    flat["project_root"] = cfg_data.get("project_root", default_project_root)
+    flat["compiler"] = cfg_data.get("compiler", "gf")
+    flat["force"] = cfg_data.get("force", False)
+    flat["max_workers"] = cfg_data.get("max_workers", None)
+
+    executables = cfg_data.get("executables", {}) or {}
+    flat["babsma_exec"] = executables.get("babsma_exec", "babsma_lu")
+    flat["bsyn_exec"] = executables.get("bsyn_exec", "bsyn_lu")
+    flat["interpol_exec"] = executables.get("interpol_exec", "interpol_modeles")
+
+    paths = cfg_data.get("paths", {}) or {}
+    flat["model_atmosphere_path"] = paths.get("model_atmosphere_path", "")
+    flat["linelist_path"] = paths.get("linelist_path", "")
+    flat["linelist_files"] = paths.get("linelist_files", None)
+    flat["output_dir"] = paths.get("output_dir", "")
+    flat["log_dir"] = paths.get("log_dir", "")
+    flat["tmp_dir"] = paths.get("tmp_dir", "")
+    flat["model_opac_dir"] = paths.get("model_opac_dir", "COM/contopac")
+
+    synthesis = cfg_data.get("synthesis_parameters", {}) or {}
+    flat["lambda_min"] = synthesis.get("lambda_min", 4000.0)
+    flat["lambda_max"] = synthesis.get("lambda_max", 8000.0)
+    flat["lambda_step"] = synthesis.get("lambda_step", 0.1)
+    flat["calculate_intensity"] = synthesis.get("calculate_intensity", False)
+    flat["mu_angles"] = synthesis.get("mu_angles", []) or []
+
+    nlte_cfg = cfg_data.get("nlte", {}) or {}
+    flat["nlte"] = nlte_cfg.get("enabled", False)
+    flat["nlte_info_file"] = nlte_cfg.get("nlte_info_file", "")
+
+    # Grid points: accept either legacy [[teff, logg, feh, turb_str], ...]
+    # or comprehensive objects [{teff, logg, feh, microturb_str}, ...]
+    grid_points = cfg_data.get("grid_points", []) or []
+    normalized_points: List[Tuple] = []
+    for point in grid_points:
+        if isinstance(point, (list, tuple)) and len(point) >= 4:
+            try:
+                normalized_points.append((int(point[0]), float(point[1]), float(point[2]), str(point[3]).strip()))
+            except Exception:
+                continue
+        elif isinstance(point, dict):
+            if "teff" not in point or "logg" not in point or "feh" not in point:
+                continue
+            try:
+                teff = int(point["teff"])
+                logg = float(point["logg"])
+                feh = float(point["feh"])
+            except Exception:
+                continue
+            turb_str = point.get("microturb_str") or point.get("t_value") or point.get("turb") or "01"
+            normalized_points.append((teff, logg, feh, str(turb_str).strip()))
+
+    flat["grid_points"] = normalized_points
+    flat["grid_points_file"] = cfg_data.get("grid_points_file", "")
+
+    return flat
+
+
 @dataclass
 class TurbospectrumConfig:
     # Paths
@@ -69,7 +159,14 @@ class TurbospectrumConfig:
     def __post_init__(self):
         # Set derived paths if not provided
         if not self.model_atmosphere_path:
-            self.model_atmosphere_path = os.path.join(self.project_root, "input_files", "model_atmospheres", "1D", "marcs_standard_comp", "marcs_standard_comp")
+            # Prefer the common layout:
+            #   input_files/model_atmospheres/1D/marcs_standard_comp/*.mod
+            # but support older layouts with an extra nested marcs_standard_comp/
+            candidate = os.path.join(
+                self.project_root, "input_files", "model_atmospheres", "1D", "marcs_standard_comp"
+            )
+            nested = os.path.join(candidate, "marcs_standard_comp")
+            self.model_atmosphere_path = nested if os.path.isdir(nested) else candidate
         if not self.linelist_path:
             self.linelist_path = os.path.join(self.project_root, "input_files", "linelists")
         if self.linelist_files is None:
@@ -327,6 +424,39 @@ class ModelInterpolator:
                     'filename': basename
                 })
 
+    def find_nearest_model(self, target_teff, target_logg, target_feh, target_turb):
+        """
+        Nearest-neighbor selection in (Teff, logg, [Fe/H]) space.
+
+        Preference:
+        - Use only models with matching turbulence if any exist.
+        - Otherwise, fall back to any turbulence.
+        """
+        if not self.available_models:
+            return None, f"No models found in {self.config.model_atmosphere_path}"
+
+        same_turb = [m for m in self.available_models if m["turb"] == str(target_turb)]
+        candidates = same_turb if same_turb else list(self.available_models)
+        turb_note = "" if same_turb else f" (no models with t={target_turb}; turbulence not matched)"
+
+        # Scale factors roughly matching common MARCS grid spacings
+        teff_scale = 250.0
+        logg_scale = 0.5
+        feh_scale = 0.5
+
+        def dist2(m):
+            dt = (m["teff"] - target_teff) / teff_scale
+            dg = (m["logg"] - target_logg) / logg_scale
+            dz = (m["feh"] - target_feh) / feh_scale
+            return dt * dt + dg * dg + dz * dz
+
+        best = min(candidates, key=dist2)
+        msg = (
+            f"Nearest neighbor selected{turb_note}: {best['filename']} "
+            f"(Teff={best['teff']}, logg={best['logg']}, FeH={best['feh']}, t={best['turb']})"
+        )
+        return best, msg
+
     def find_bracketing_models(self, target_teff, target_logg, target_feh, target_turb):
         """Finds the 8 bracketing models for interpolation."""
         # Filter by turbulence (must match)
@@ -474,23 +604,19 @@ def run_single_synthesis(args):
         if all_exist:
             return build_result("skipped", "Output already exists")
     
-    # Check if model exists, if not try to interpolate
+    # If exact model doesn't exist, pick a nearest-neighbor MARCS atmosphere (no interpolation).
+    model_input_path = model_path
     if not os.path.exists(model_path):
-        # Initialize interpolator (this might be expensive to do every time, but safe for multiprocessing)
-        # Alternatively, pass an initialized interpolator if it was picklable (files list might be large?)
-        # Scanning directory is fast enough.
-        interpolator = ModelInterpolator(config)
-        success, message = interpolator.interpolate(teff, logg, feh, turb_str, model_path)
-        if not success:
-            return build_result("error", f"Model missing and interpolation failed: {message}")
-        else:
-            # Log interpolation success?
-            pass
+        model_lib = ModelInterpolator(config)
+        nearest, message = model_lib.find_nearest_model(teff, logg, feh, turb_str)
+        if not nearest:
+            return build_result("error", f"Model missing and nearest-neighbor selection failed: {message}")
+        model_input_path = nearest["path"]
 
     # Check if model is a standard MARCS model or interpolated
     is_marcs = True
     try:
-        with open(model_path, 'r') as f:
+        with open(model_input_path, 'r') as f:
             first_line = f.readline()
             if "INTERPOL" in first_line:
                 is_marcs = False
@@ -508,7 +634,7 @@ def run_single_synthesis(args):
         babsma_input = f"""'LAMBDA_MIN:'  '{config.lambda_min}'
 'LAMBDA_MAX:'  '{config.lambda_max}'
 'LAMBDA_STEP:' '{config.lambda_step}'
-'MODELINPUT:' '{model_path}'
+'MODELINPUT:' '{model_input_path}'
 'MARCS-FILE:' '{marcs_flag}'
 'MODELOPAC:' '{opac_path}'
 'ABUND_SOURCE:' 'magg'
@@ -687,6 +813,9 @@ def main():
         config_path = args[0]
         with open(config_path, 'r') as f:
             cfg_data = json.load(f)
+        cfg_data = _normalize_config_dict(cfg_data, default_project_root=project_root)
+        accepted_fields = {fld.name for fld in dataclasses.fields(TurbospectrumConfig)}
+        cfg_data = {k: v for k, v in cfg_data.items() if k in accepted_fields}
         if 'project_root' not in cfg_data:
             cfg_data['project_root'] = project_root
         config = TurbospectrumConfig(**cfg_data)
