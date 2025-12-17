@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import logging
+import time
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
@@ -25,6 +27,99 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config_ml_sampling.json"))
 DEFAULT_ZARR_PATH = os.path.join(SCRIPT_DIR, "ml_parameter_grid.zarr")
 ALLOWED_TURBVEL = {"01", "02", "03", "04", "05"}
+
+
+def _configure_logging(log_level: str, log_file: str | None) -> logging.Logger:
+    logger = logging.getLogger("ml_grid_sampler")
+    # Avoid duplicate handlers if re-imported/re-run in notebooks.
+    if logger.handlers:
+        return logger
+
+    level = getattr(logging, (log_level or "INFO").upper(), logging.INFO)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    sh = logging.StreamHandler()
+    sh.setLevel(level)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    if log_file:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(level)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+
+    return logger
+
+
+def _progress(iterable, total: int | None, desc: str, enabled: bool):
+    """Progress wrapper: uses tqdm when installed, otherwise passthrough."""
+    if not enabled:
+        return iterable
+    try:
+        from tqdm import tqdm  # type: ignore
+
+        return tqdm(iterable, total=total, desc=desc)
+    except Exception:
+        return iterable
+
+
+def _zarr_store(path: str):
+    """
+    Return a filesystem-backed Zarr store for both zarr v2 and v3 APIs.
+
+    - zarr v2: zarr.DirectoryStore
+    - zarr v3: zarr.storage.LocalStore (or DirectoryStore if present)
+    """
+    if hasattr(zarr, "DirectoryStore"):
+        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
+    from zarr import storage as zstorage  # type: ignore
+    if hasattr(zstorage, "DirectoryStore"):
+        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
+    if hasattr(zstorage, "LocalStore"):
+        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
+    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+
+
+def _zarr_compression_kwargs(zarr_compressor_cfg: Dict):
+    """
+    Build compression kwargs for Zarr v2 and v3.
+
+    - Zarr v3 expects `compressors=[BytesBytesCodec, ...]` (e.g. zarr.codecs.BloscCodec)
+    - Zarr v2 expects `compressor=numcodecs.Codec` (e.g. numcodecs.Blosc)
+    """
+    if not zarr_compressor_cfg:
+        return {}
+
+    cname = zarr_compressor_cfg.get("cname", "zstd")
+    clevel = int(zarr_compressor_cfg.get("clevel", 5))
+    shuffle_enabled = bool(zarr_compressor_cfg.get("shuffle", True))
+
+    # Prefer v3 codecs when available.
+    try:
+        import zarr.codecs as zc  # type: ignore
+
+        if hasattr(zc, "BloscCodec") and hasattr(zc, "BloscShuffle"):
+            shuffle = zc.BloscShuffle.bitshuffle if shuffle_enabled else None
+            return {"compressors": [zc.BloscCodec(cname=cname, clevel=clevel, shuffle=shuffle)]}
+    except Exception:
+        pass
+
+    # Fallback: v2 numcodecs
+    return {
+        "compressor": Blosc(
+            cname=cname,
+            clevel=clevel,
+            shuffle=Blosc.BITSHUFFLE if shuffle_enabled else Blosc.NOSHUFFLE,
+        )
+    }
 
 
 def _ensure_polars_zarr_available() -> None:
@@ -157,14 +252,29 @@ def main() -> None:
     parser.add_argument("--zarr-output", default=None, help="Optional override for Zarr output path")
     parser.add_argument("--resume", action="store_true", help="Append new samples up to num_samples if outputs already exist")
     parser.add_argument("--samples", type=int, default=None, help="Override the number of samples without editing the config")
+    parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
+    parser.add_argument("--log-file", default=None, help="Optional log file path")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress bars")
     args = parser.parse_args()
+
+    logger = _configure_logging(args.log_level, args.log_file)
+    t0 = time.perf_counter()
 
     config = _load_config(args.config)
     sample_count = args.samples or int(config.get("num_samples", 50))
     seed = config.get("seed")
     rng = np.random.default_rng(seed)
 
+    logger.info("Loaded config: %s", os.path.abspath(args.config))
+    logger.info("Sampling: target_rows=%d seed=%s resume=%s", sample_count, seed, args.resume)
+    logger.info("Versions: polars=%s zarr=%s numpy=%s", getattr(pl, "__version__", "?"), getattr(zarr, "__version__", "?"), getattr(np, "__version__", "?"))
+
     bounds, sampled_abundances, fixed_abundances, sampled_turbvel_options = _resolve_sampling_dimensions(config)
+    logger.info(
+        "Sampling dims: teff/logg/feh + sampled_abundances=%s + sample_turbvel=%s",
+        sampled_abundances,
+        bool(sampled_turbvel_options),
+    )
     lhs = _latin_hypercube(bounds, sample_count, rng)
 
     synthesis_cfg = config.get("synthesis", {})
@@ -189,10 +299,11 @@ def main() -> None:
     if not zarr_path:
         raise ValueError("Zarr output path must be provided via config, --zarr-output, or --output (deprecated alias).")
     os.makedirs(os.path.dirname(os.path.abspath(zarr_path)), exist_ok=True)
+    logger.info("Zarr output: %s (chunks=%s)", os.path.abspath(zarr_path), zarr_chunks)
 
     existing_rows = 0
     if args.resume and os.path.exists(zarr_path):
-        store = zarr.DirectoryStore(zarr_path)
+        store = _zarr_store(zarr_path)
         root = zarr.open_group(store=store, mode="a", zarr_format=3)
         array_keys = list(root.keys())
         if not array_keys:
@@ -205,11 +316,17 @@ def main() -> None:
                     f"Zarr column {name} has inconsistent length {arr.shape[0]} vs expected {existing_rows}"
                 )
         if existing_rows >= sample_count:
-            print(f"Resume requested, but output already has {existing_rows} rows (>= target {sample_count}). Nothing to do.")
+            logger.info(
+                "Resume requested, but output already has %d rows (>= target %d). Nothing to do.",
+                existing_rows,
+                sample_count,
+            )
             return
+        logger.info("Resuming: existing_rows=%d adding=%d", existing_rows, sample_count - existing_rows)
 
     lhs = lhs[existing_rows:]
     sample_count_new = lhs.shape[0]
+    logger.info("Generating %d new rows", sample_count_new)
 
     column_idx = 0
     int_teff = np.rint(lhs[:, column_idx]).astype(int)
@@ -258,15 +375,9 @@ def main() -> None:
         }
     )
 
-    compressor = None
-    if zarr_compressor_cfg:
-        cname = zarr_compressor_cfg.get("cname", "zstd")
-        clevel = int(zarr_compressor_cfg.get("clevel", 5))
-        shuffle = zarr_compressor_cfg.get("shuffle", True)
-        compressor = Blosc(cname=cname, clevel=clevel, shuffle=Blosc.BITSHUFFLE if shuffle else Blosc.NOSHUFFLE)
-
+    compression_kwargs = _zarr_compression_kwargs(zarr_compressor_cfg)
     strings_codec = VLenUTF8()
-    store = zarr.DirectoryStore(zarr_path)
+    store = _zarr_store(zarr_path)
 
     if args.resume and os.path.exists(zarr_path):
         root = zarr.open_group(store=store, mode="a", zarr_format=3)
@@ -275,30 +386,55 @@ def main() -> None:
             raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
         existing_len = root[array_keys[0]].shape[0]
         new_len = existing_len + sample_count_new
-        for column in df.columns:
+        for column in _progress(df.columns, total=len(df.columns), desc="Appending columns", enabled=not args.no_progress):
             arr = root[column]
             if arr.shape[0] != existing_len:
                 raise ValueError(f"Zarr column {column} has inconsistent length {arr.shape[0]} vs expected {existing_len}")
-            data = df[column].to_list() if df[column].dtype == pl.Utf8 else df[column].to_numpy()
+            if df[column].dtype == pl.Utf8:
+                data = df[column].to_list()
+            else:
+                data = df[column].to_numpy()
             arr.resize(new_len, axis=0)
             arr[existing_len:new_len] = data
-        print(f"Appended {sample_count_new} samples to Zarr store at {zarr_path} (total rows now {new_len})")
+        logger.info("Appended %d rows (total now %d)", sample_count_new, new_len)
     else:
         root = zarr.group(store=store, overwrite=True, zarr_format=3)
-        for column in df.columns:
+        for column in _progress(df.columns, total=len(df.columns), desc="Writing columns", enabled=not args.no_progress):
             series = df[column]
             if series.dtype == pl.Utf8:
-                root.array(
-                    column,
-                    series.to_list(),
-                    dtype=object,
-                    object_codec=strings_codec,
-                    compressor=compressor,
-                    chunks=zarr_chunks,
-                )
+                values = series.to_list()
+                if hasattr(root, "create_array"):
+                    # Zarr v3: use variable-length UTF8 dtype + v3 serializer
+                    import zarr.codecs as zc  # type: ignore
+                    from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
+
+                    arr = root.create_array(
+                        column,
+                        shape=(len(values),),
+                        dtype=VariableLengthUTF8(),
+                        serializer=zc.VLenUTF8Codec(),
+                        chunks=zarr_chunks,
+                        **compression_kwargs,
+                    )
+                    arr[:] = values
+                else:
+                    # Zarr v2: object codec supported
+                    root.array(
+                        column,
+                        values,
+                        dtype=object,
+                        object_codec=strings_codec,
+                        chunks=zarr_chunks,
+                        **compression_kwargs,
+                    )
             else:
-                root.array(column, series.to_numpy(), compressor=compressor, chunks=zarr_chunks)
-        print(f"Wrote Zarr store to {zarr_path} with chunk size {zarr_chunks}")
+                if hasattr(root, "create_array"):
+                    root.create_array(column, data=series.to_numpy(), chunks=zarr_chunks, **compression_kwargs)
+                else:
+                    root.array(column, series.to_numpy(), chunks=zarr_chunks, **compression_kwargs)
+        logger.info("Wrote Zarr store to %s (chunk size %s)", zarr_path, zarr_chunks)
+
+    logger.info("Done in %.2fs", time.perf_counter() - t0)
 
 
 if __name__ == "__main__":
