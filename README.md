@@ -99,7 +99,7 @@ If you just need a compact, Latin-Hypercube-sampled grid for ML experiments, edi
 python3 scripts/sample_machine_learning_grid.py  # add --resume to append up to num_samples
 ```
 
-The helper writes a CSV at `scripts/ml_parameter_grid.csv` (override with `--output`) and a compressed Zarr store at `scripts/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput CSV output and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. The layout matches the existing synthesis scripts, so you can plug it directly into `scripts/synthesize_spectra.sh` after copying or renaming it as needed.
+The helper writes a compressed Zarr store at `scripts/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. The layout matches the existing synthesis scripts, so you can plug it directly into `scripts/synthesize_spectra.sh` after copying or renaming it as needed. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the HPC batch runners.
 
 ### 3. Interpolate Model Atmospheres
 

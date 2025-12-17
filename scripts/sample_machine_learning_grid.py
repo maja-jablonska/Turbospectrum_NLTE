@@ -24,6 +24,7 @@ from numcodecs import Blosc, VLenUTF8
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config_ml_sampling.json"))
 DEFAULT_ZARR_PATH = os.path.join(SCRIPT_DIR, "ml_parameter_grid.zarr")
+ALLOWED_TURBVEL = {"01", "02", "03", "04", "05"}
 
 
 def _ensure_polars_zarr_available() -> None:
@@ -87,6 +88,23 @@ def _abundance_value(raw_value) -> str:
     return f"{float(raw_value):+0.2f}" if isinstance(raw_value, (int, float, np.floating)) else str(raw_value)
 
 
+def _validate_turbvel_options(raw_options) -> List[str]:
+    if raw_options is None:
+        return sorted(ALLOWED_TURBVEL)
+    if isinstance(raw_options, (str, bytes)):
+        raw_options = [raw_options]
+    options = []
+    for entry in raw_options:
+        value = f"{int(entry):02d}" if isinstance(entry, (int, float, np.integer, np.floating)) else str(entry)
+        if value not in ALLOWED_TURBVEL:
+            raise ValueError(f"Turbvel option '{value}' is invalid. Allowed options: {sorted(ALLOWED_TURBVEL)}")
+        if value not in options:
+            options.append(value)
+    if not options:
+        raise ValueError("At least one turbvel option must be provided when sampling turbvel")
+    return options
+
+
 def _resolve_bounds(config: Dict) -> List[Tuple[float, float]]:
     bounds_cfg = config.get("bounds") or {}
     ordered_names = ["teff", "logg", "feh"]
@@ -97,6 +115,33 @@ def _resolve_bounds(config: Dict) -> List[Tuple[float, float]]:
             raise ValueError(f"Bounds for '{name}' must include 'min' and 'max'")
         bounds.append((float(spec["min"]), float(spec["max"])))
     return bounds
+
+
+def _resolve_sampling_dimensions(config: Dict) -> Tuple[List[Tuple[float, float]], List[str], Dict[str, str], List[str] | None]:
+    bounds = _resolve_bounds(config)
+
+    abundances_cfg = config.get("abundances", {})
+    sampled_abundances: List[str] = []
+    fixed_abundances: Dict[str, str] = {}
+    for element in ["a", "c", "n", "o", "r", "s"]:
+        raw_val = abundances_cfg.get(element)
+        if isinstance(raw_val, dict):
+            if "min" not in raw_val or "max" not in raw_val:
+                raise ValueError(f"Abundance bounds for '{element}' must include 'min' and 'max'")
+            bounds.append((float(raw_val["min"]), float(raw_val["max"])))
+            sampled_abundances.append(element)
+        else:
+            fixed_abundances[element] = _abundance_value(raw_val)
+
+    turbvel_cfg = config.get("turbvel", "01")
+    sample_turbvel = bool(config.get("sample_turbvel", False))
+    turbvel_options = None
+    if sample_turbvel:
+        options_raw = config.get("turbvel_options", turbvel_cfg if isinstance(turbvel_cfg, Sequence) and not isinstance(turbvel_cfg, (str, bytes)) else None)
+        turbvel_options = _validate_turbvel_options(options_raw)
+        bounds.append((0, float(len(turbvel_options))))
+
+    return bounds, sampled_abundances, fixed_abundances, turbvel_options
 
 
 def main() -> None:
@@ -119,7 +164,7 @@ def main() -> None:
     seed = config.get("seed")
     rng = np.random.default_rng(seed)
 
-    bounds = _resolve_bounds(config)
+    bounds, sampled_abundances, fixed_abundances, sampled_turbvel_options = _resolve_sampling_dimensions(config)
     lhs = _latin_hypercube(bounds, sample_count, rng)
 
     synthesis_cfg = config.get("synthesis", {})
@@ -129,12 +174,6 @@ def main() -> None:
     output_mode = synthesis_cfg.get("output_mode", "Flux")
 
     abundances = config.get("abundances", {})
-    a_val = _abundance_value(abundances.get("a"))
-    c_val = _abundance_value(abundances.get("c"))
-    n_val = _abundance_value(abundances.get("n"))
-    o_val = _abundance_value(abundances.get("o"))
-    r_val = _abundance_value(abundances.get("r"))
-    s_val = _abundance_value(abundances.get("s"))
 
     grid_version = config.get("grid_version", "ml-sample")
     mode = config.get("mode", "1D")
@@ -172,11 +211,28 @@ def main() -> None:
     lhs = lhs[existing_rows:]
     sample_count_new = lhs.shape[0]
 
-    int_teff = np.rint(lhs[:, 0]).astype(int)
-    logg_vals = np.round(lhs[:, 1], 3)
-    feh_vals = np.round(lhs[:, 2], 3)
+    column_idx = 0
+    int_teff = np.rint(lhs[:, column_idx]).astype(int)
+    column_idx += 1
+    logg_vals = np.round(lhs[:, column_idx], 3)
+    column_idx += 1
+    feh_vals = np.round(lhs[:, column_idx], 3)
+    column_idx += 1
 
-    turbvel_series = _choose_series(turbvel_cfg, rng, sample_count_new, "turbvel")
+    abundance_samples: Dict[str, np.ndarray] = {}
+    for element in sampled_abundances:
+        abundance_values = np.round(lhs[:, column_idx], 2)
+        abundance_samples[element] = np.array([f"{val:+0.2f}" for val in abundance_values], dtype=object)
+        column_idx += 1
+
+    if sampled_turbvel_options:
+        turbvel_indices = np.floor(lhs[:, column_idx]).astype(int)
+        turbvel_indices = np.clip(turbvel_indices, 0, len(sampled_turbvel_options) - 1)
+        turbvel_series = np.asarray([sampled_turbvel_options[idx] for idx in turbvel_indices], dtype=object)
+        column_idx += 1
+    else:
+        turbvel_series = _choose_series(turbvel_cfg, rng, sample_count_new, "turbvel")
+
     t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
 
     df = pl.DataFrame(
@@ -190,12 +246,12 @@ def main() -> None:
             "lam_step": np.full(sample_count_new, lam_step, dtype=float),
             "turbvel": turbvel_series,
             "t_value": t_value_series,
-            "a": np.full(sample_count_new, a_val, dtype=object),
-            "c": np.full(sample_count_new, c_val, dtype=object),
-            "n": np.full(sample_count_new, n_val, dtype=object),
-            "o": np.full(sample_count_new, o_val, dtype=object),
-            "r": np.full(sample_count_new, r_val, dtype=object),
-            "s": np.full(sample_count_new, s_val, dtype=object),
+            "a": abundance_samples.get("a", np.full(sample_count_new, fixed_abundances.get("a", "+0.00"), dtype=object)),
+            "c": abundance_samples.get("c", np.full(sample_count_new, fixed_abundances.get("c", "+0.00"), dtype=object)),
+            "n": abundance_samples.get("n", np.full(sample_count_new, fixed_abundances.get("n", "+0.00"), dtype=object)),
+            "o": abundance_samples.get("o", np.full(sample_count_new, fixed_abundances.get("o", "+0.00"), dtype=object)),
+            "r": abundance_samples.get("r", np.full(sample_count_new, fixed_abundances.get("r", "+0.00"), dtype=object)),
+            "s": abundance_samples.get("s", np.full(sample_count_new, fixed_abundances.get("s", "+0.00"), dtype=object)),
             "output_mode": np.full(sample_count_new, output_mode, dtype=object),
             "mode": np.full(sample_count_new, mode, dtype=object),
             "calculation_mode": np.full(sample_count_new, calculation_mode, dtype=object),
