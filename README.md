@@ -101,6 +101,30 @@ python3 scripts/sample_machine_learning_grid.py  # add --resume to append up to 
 
 The helper writes a compressed Zarr store at `scripts/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. The layout matches the existing synthesis scripts, so you can plug it directly into `scripts/synthesize_spectra.sh` after copying or renaming it as needed. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the HPC batch runners.
 
+### One-config pipeline (recommended)
+
+To avoid keeping a separate grid config and Turbospectrum config in sync, you can use a single pipeline config file that includes both sections. Start from `config_pipeline.example.json` and run:
+
+```bash
+python3 scripts/pipeline_from_config.py --config config_pipeline.json
+```
+
+This will:
+- generate the grid outputs (CSV + Zarr)
+- synthesize spectra into a single output Zarr using multiprocessing
+
+If you need to run multiple independent “shards” (e.g. separate PBS jobs without arrays), use:
+
+```bash
+python3 scripts/pipeline_from_config.py --config config_pipeline.json --synthesis-mode sharded --shard-index 0 --shard-count 10
+```
+
+After all shards finish, merge them into one consolidated store:
+
+```bash
+python3 scripts/merge_spectra_shards.py --shard-dir synth_shards --output-zarr synthesized_spectra.zarr
+```
+
 ### 3. Interpolate Model Atmospheres
 
 With the parameter grid generated, the next step is to ensure that a model atmosphere exists for each point in the grid. The `interpolate_models.sh` script handles this by interpolating new models from the existing grid as needed.
