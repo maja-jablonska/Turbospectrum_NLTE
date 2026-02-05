@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -N ts-synth
+#PBS -l select=1:ncpus=32:mem=64gb
+#PBS -l walltime=12:00:00
+#
+# Array size: set BOTH the -J range and N_SHARDS below to match.
+# Example: for 100 shards -> #PBS -J 0-99 and N_SHARDS=100
+#PBS -J 0-99
+#
+#PBS -o logs/pbs/ts-synth.${PBS_JOBID}.out
+#PBS -e logs/pbs/ts-synth.${PBS_JOBID}.err
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+# ---- user settings ----
+N_SHARDS=100
+GRID_ZARR="scripts/intensity_grid.zarr"          # input parameter grid
+TS_CONFIG="config_sample_comprehensive.json"     # Turbospectrum runtime config
+OUT_DIR="synth_shards"                           # per-shard Zarr outputs go here
+
+# Optional: node-local scratch. Many PBS systems set $TMPDIR automatically.
+SCRATCH_BASE="${TMPDIR:-/tmp/${USER}/pbs_${PBS_JOBID}}"
+
+# -----------------------
+mkdir -p "${OUT_DIR}" "logs/pbs" "${SCRATCH_BASE}"
+
+# Prevent oversubscription if linked BLAS/OpenMP libs are present.
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+SHARD_INDEX="${PBS_ARRAY_INDEX:-0}"
+SHARD_OUT="${OUT_DIR}/spectra_shard_${SHARD_INDEX}.zarr"
+SCRATCH="${SCRATCH_BASE}/shard_${SHARD_INDEX}"
+mkdir -p "${SCRATCH}"
+
+echo "Job: ${PBS_JOBID} shard ${SHARD_INDEX}/${N_SHARDS}"
+echo "Grid: ${GRID_ZARR}"
+echo "Config: ${TS_CONFIG}"
+echo "Output: ${SHARD_OUT}"
+echo "Scratch: ${SCRATCH}"
+echo "CPUs: ${PBS_NP:-unknown}"
+
+python scripts/synthesize_spectra_from_zarr_sharded.py \
+  --grid-zarr "${GRID_ZARR}" \
+  --config "${TS_CONFIG}" \
+  --output-zarr "${SHARD_OUT}" \
+  --shard-index "${SHARD_INDEX}" \
+  --shard-count "${N_SHARDS}" \
+  --shard-mode block \
+  --workers "${PBS_NP:-32}" \
+  --scratch "${SCRATCH}" \
+  --log-level INFO
+
