@@ -1,0 +1,271 @@
+#!/bin/bash
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -N turbospec
+#PBS -l ncpus=32
+#PBS -l mem=64GB
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -M maja.jablonska@anu.edu.au
+#PBS -m bae
+#PBS -l storage=scratch/mk27+scratch/y89
+
+set -euo pipefail
+
+cd $PBS_O_WORKDIR
+
+############################################
+# Thread safety (CRITICAL)
+############################################
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+############################################
+# Paths
+############################################
+
+PROJECT=mk27
+USER_ID=$(whoami)
+
+BASE=/scratch/${PROJECT}/${USER_ID}/turbospec
+REPO=/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE
+PIPELINE_CONFIG_SRC=${REPO}/config_pipeline.json
+PIPELINE_CONFIG_JOB=${BASE}/config_pipeline.${PBS_JOBID}.json
+
+GRID_DIR=${BASE}/grid
+GRID_ZARR=${GRID_DIR}/parameter_grid.zarr
+
+SHARDS_DIR=${BASE}/shards
+MERGED_ZARR=${BASE}/synthesized_spectra.zarr
+
+TASK_FILE=${BASE}/tasks.txt
+LOCK_FILE=${BASE}/tasks.lock
+DONE_FILE=${BASE}/done.txt
+PYTHON=/scratch/y89/mj8805/miniforge/envs/astro/bin/python
+N_SHARDS=100
+
+# Mode:
+# - full: generate grid + synthesize a single output Zarr using multiprocessing
+# - sharded: generate grid + run many shard jobs concurrently (no PBS arrays required),
+#   then optionally merge shards
+MODE=sharded
+
+mkdir -p ${BASE}
+mkdir -p ${GRID_DIR}
+mkdir -p ${SHARDS_DIR}
+mkdir -p ${BASE}/logs
+
+############################################
+# Validate pipeline config
+############################################
+
+if [[ ! -f "${PIPELINE_CONFIG_SRC}" ]]; then
+  echo "ERROR: Missing ${PIPELINE_CONFIG_SRC}"
+  echo "Create it by copying ${REPO}/config_pipeline.example.json -> ${REPO}/config_pipeline.json and editing paths/outputs."
+  exit 1
+fi
+
+############################################
+# Create a job-specific pipeline config
+# - Keeps ALL outputs under ${BASE}
+# - Uses ${REPO} as project_root for Turbospectrum
+############################################
+
+# Export for the Python snippet (uses os.environ).
+export REPO PIPELINE_CONFIG_SRC PIPELINE_CONFIG_JOB GRID_ZARR SHARDS_DIR MERGED_ZARR
+
+${PYTHON} - <<'PY'
+import json, os
+
+repo = os.environ["REPO"]
+src = os.environ["PIPELINE_CONFIG_SRC"]
+dst = os.environ["PIPELINE_CONFIG_JOB"]
+grid_zarr = os.environ["GRID_ZARR"]
+shards_dir = os.environ["SHARDS_DIR"]
+merged = os.environ["MERGED_ZARR"]
+
+with open(src, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+cfg.setdefault("turbospectrum", {})
+cfg["turbospectrum"]["project_root"] = repo
+
+cfg.setdefault("outputs", {})
+cfg["outputs"]["grid_zarr"] = grid_zarr
+cfg["outputs"].setdefault("grid_csv", os.path.join(os.path.dirname(grid_zarr), "parameter_grid.csv"))
+cfg["outputs"]["spectra_zarr"] = merged
+cfg["outputs"]["spectra_shard_template"] = os.path.join(shards_dir, "spectra_shard_{shard_index}.zarr")
+
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2, sort_keys=True)
+
+print("Wrote job pipeline config:", dst)
+PY
+
+if [[ ! -f "${PIPELINE_CONFIG_JOB}" ]]; then
+  echo "ERROR: Failed to create job pipeline config at ${PIPELINE_CONFIG_JOB}"
+  exit 1
+fi
+
+############################################
+# Ensure grid exists (generate once)
+############################################
+
+if [[ ! -d "${GRID_ZARR}" ]]; then
+  echo "Generating grid Zarr at ${GRID_ZARR}"
+  ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
+    --config "${PIPELINE_CONFIG_JOB}" \
+    --skip-synthesis
+fi
+
+############################################
+# FULL mode: one job, multiprocessing, single output
+############################################
+
+if [[ "${MODE}" == "full" ]]; then
+  echo "Running FULL synthesis to ${MERGED_ZARR}"
+  ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
+    --config "${PIPELINE_CONFIG_JOB}" \
+    --skip-grid \
+    --synthesis-mode full \
+    --workers "${PBS_NCPUS:-32}" \
+    --scratch "${PBS_JOBFS:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}"
+  exit 0
+fi
+
+############################################
+# SHARDED mode: manual work queue (no PBS arrays)
+############################################
+
+# We run many shards concurrently. To avoid oversubscription, each shard is run
+# with workers=1. Increase SHARD_WORKERS only if you also reduce WORKER_PROCS.
+SHARD_WORKERS=1
+WORKER_PROCS=${PBS_NCPUS:-32}
+
+############################################
+# Create tasks once
+############################################
+
+if [[ ! -f $TASK_FILE ]]; then
+    echo "Generating task list..."
+    seq 0 $((N_SHARDS - 1)) > "$TASK_FILE"
+fi
+
+############################################
+# Walltime guard
+############################################
+
+WALLTIME_SECONDS=$((12*3600))
+START_TIME=$(date +%s)
+SAFETY_BUFFER=600   # stop 10 minutes early
+
+time_left () {
+    now=$(date +%s)
+    echo $((WALLTIME_SECONDS - (now - START_TIME)))
+}
+
+############################################
+# Worker
+############################################
+
+worker() {
+
+    JOBFS_DIR=${PBS_JOBFS}/worker_$RANDOM
+    mkdir -p $JOBFS_DIR
+
+    while true; do
+
+        if (( $(time_left) < SAFETY_BUFFER )); then
+            echo "Stopping safely before walltime."
+            break
+        fi
+
+        #################################
+        # Atomic task grab
+        #################################
+
+        exec 9<>$LOCK_FILE
+        flock -x 9
+
+        shard=$(head -n 1 $TASK_FILE)
+        sed -i '1d' $TASK_FILE
+
+        flock -u 9
+        exec 9>&-
+
+        [[ -z "$shard" ]] && break
+
+        OUT=${SHARDS_DIR}/spectra_shard_${shard}.zarr
+
+        if [[ -f "$OUT" ]]; then
+            continue
+        fi
+
+        #################################
+        # Retry loop
+        #################################
+
+        for attempt in {1..3}; do
+
+            $PYTHON ${REPO}/scripts/pipeline_from_config.py \
+              --config "${PIPELINE_CONFIG_JOB}" \
+              --skip-grid \
+              --synthesis-mode sharded \
+              --shard-index "$shard" \
+              --shard-count "$N_SHARDS" \
+              --workers "$SHARD_WORKERS" \
+              --scratch "$JOBFS_DIR" \
+              > "${BASE}/logs/shard_${shard}.log" 2>&1 && break
+
+            echo "Retry $attempt for shard $shard"
+            sleep 5
+        done
+
+        echo $shard >> $DONE_FILE
+    done
+}
+
+export -f worker
+export BASE TASK_FILE LOCK_FILE DONE_FILE START_TIME WALLTIME_SECONDS SAFETY_BUFFER
+
+############################################
+# Launch workers
+############################################
+
+echo "Launching ${WORKER_PROCS} workers (each shard workers=${SHARD_WORKERS})..."
+
+for ((i=0;i<WORKER_PROCS;i++)); do
+    worker &
+done
+
+wait
+
+############################################
+# Progress summary
+############################################
+
+TOTAL=$(wc -l < $TASK_FILE 2>/dev/null || echo 0)
+DONE=$(wc -l < $DONE_FILE 2>/dev/null || echo 0)
+
+echo "Completed shards: $DONE"
+echo "Remaining shards: $TOTAL"
+
+############################################
+# Merge shards
+############################################
+
+if [[ "$DONE" -gt 0 ]]; then
+  echo "Merging shards into ${MERGED_ZARR}"
+  ${PYTHON} ${REPO}/scripts/merge_spectra_shards.py \
+    --shard-dir "${SHARDS_DIR}" \
+    --grid-zarr "${GRID_ZARR}" \
+    --output-zarr "${MERGED_ZARR}" \
+    > "${BASE}/logs/merge.log" 2>&1 || true
+  echo "Merge log: ${BASE}/logs/merge.log"
+fi
+
