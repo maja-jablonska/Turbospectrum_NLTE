@@ -95,12 +95,17 @@ def _synthesis_task(batch):
         cfg.lambda_max = float(row_values["lam_max"])
         cfg.lambda_step = float(row_values["lam_step"])
 
-        cfg.calculate_intensity = (
-            row_values.get("output_mode", "Flux").lower() == "intensity"
-        )
-        cfg.nlte = (
-            row_values.get("calculation_mode", "LTE").lower() == "nlte"
-        )
+        # If the grid provides per-row mode flags, honor them; otherwise, fall back
+        # to whatever the Turbospectrum config requested.
+        output_mode = row_values.get("output_mode")
+        if output_mode is None:
+            output_mode = "Intensity" if cfg.calculate_intensity else "Flux"
+        calculation_mode = row_values.get("calculation_mode")
+        if calculation_mode is None:
+            calculation_mode = "NLTE" if cfg.nlte else "LTE"
+
+        cfg.calculate_intensity = str(output_mode).lower() == "intensity"
+        cfg.nlte = str(calculation_mode).lower() == "nlte"
 
         base_name = get_model_filename(teff, logg, feh, turb)
 
@@ -231,10 +236,24 @@ def main():
     with open(args.config) as f:
         cfg_data = json.load(f)
 
-    cfg_data = _normalize_config_dict(cfg_data, project_root)
+    # Guardrail: users sometimes accidentally pass the ML sampling config here.
+    if isinstance(cfg_data, dict) and any(k in cfg_data for k in ("bounds", "num_samples", "output_csv")):
+        raise ValueError(
+            "The provided --config looks like an ML sampling config (e.g. config_ml_sampling.json), "
+            "not a Turbospectrum synthesis config. Use config_sample_comprehensive.json (or another "
+            "Turbospectrum config with paths/executables/synthesis_parameters)."
+        )
+
+    cfg_data = _normalize_config_dict(cfg_data, default_project_root=project_root)
 
     accepted = {fld.name for fld in dataclasses.fields(TurbospectrumConfig)}
     cfg_data = {k: v for k, v in cfg_data.items() if k in accepted}
+
+    # Ensure project_root is usable on the current machine.
+    cfg_project_root = cfg_data.get("project_root")
+    if not cfg_project_root or not os.path.isdir(str(cfg_project_root)):
+        logger.warning("Config project_root=%r is not a directory; using detected project_root=%s", cfg_project_root, project_root)
+        cfg_data["project_root"] = project_root
 
     config = TurbospectrumConfig(**cfg_data)
 

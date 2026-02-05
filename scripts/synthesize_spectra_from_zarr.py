@@ -182,8 +182,16 @@ def _synthesis_task(args) -> Dict:
     lam_min = float(row_values["lam_min"])
     lam_max = float(row_values["lam_max"])
     lam_step = float(row_values["lam_step"])
-    output_mode = str(row_values.get("output_mode", "Flux"))
-    calculation_mode = str(row_values.get("calculation_mode", "LTE"))
+    # If the grid provides per-row mode flags, honor them; otherwise fall back
+    # to whatever the Turbospectrum config requested.
+    output_mode = row_values.get("output_mode")
+    if output_mode is None:
+        output_mode = "Intensity" if base_config.calculate_intensity else "Flux"
+    calculation_mode = row_values.get("calculation_mode")
+    if calculation_mode is None:
+        calculation_mode = "NLTE" if base_config.nlte else "LTE"
+    output_mode = str(output_mode)
+    calculation_mode = str(calculation_mode)
 
     cfg = base_config
     cfg.lambda_min = lam_min
