@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 import time
+import copy
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -40,6 +41,21 @@ from run_turbospectrum import (  # noqa: E402
 
 DEFAULT_CONFIG_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config_sample_comprehensive.json"))
 DEFAULT_OUTPUT_PATH = os.path.join(SCRIPT_DIR, "synthesized_spectra.zarr")
+
+_WORKER_CONFIG: TurbospectrumConfig | None = None
+
+
+def _init_worker(config: TurbospectrumConfig) -> None:
+    """Initialize worker-local config and constrain thread oversubscription."""
+    global _WORKER_CONFIG
+    _WORKER_CONFIG = config
+
+    # Prevent BLAS/OpenMP oversubscription inside each worker process.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
 def _configure_logging(log_level: str, log_file: str | None) -> logging.Logger:
@@ -174,7 +190,10 @@ def _expected_wavelengths(column_data: Mapping[str, np.ndarray]) -> Tuple[np.nda
 
 
 def _synthesis_task(args) -> Dict:
-    index, row_values, base_config = args
+    index, row_values = args
+    if _WORKER_CONFIG is None:
+        raise RuntimeError("Worker config not initialized")
+    cfg = copy.deepcopy(_WORKER_CONFIG)
     teff = int(row_values["teff"])
     logg = float(row_values["logg"])
     feh = float(row_values["feh"])
@@ -186,14 +205,13 @@ def _synthesis_task(args) -> Dict:
     # to whatever the Turbospectrum config requested.
     output_mode = row_values.get("output_mode")
     if output_mode is None:
-        output_mode = "Intensity" if base_config.calculate_intensity else "Flux"
+        output_mode = "Intensity" if cfg.calculate_intensity else "Flux"
     calculation_mode = row_values.get("calculation_mode")
     if calculation_mode is None:
-        calculation_mode = "NLTE" if base_config.nlte else "LTE"
+        calculation_mode = "NLTE" if cfg.nlte else "LTE"
     output_mode = str(output_mode)
     calculation_mode = str(calculation_mode)
 
-    cfg = base_config
     cfg.lambda_min = lam_min
     cfg.lambda_max = lam_max
     cfg.lambda_step = lam_step
@@ -307,7 +325,7 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
         for optional_key in ("output_mode", "calculation_mode"):
             if optional_key in column_data:
                 row_values[optional_key] = column_data[optional_key][idx]
-        tasks.append((idx, row_values, base_config))
+        tasks.append((idx, row_values))
     return tasks
 
 
@@ -316,6 +334,8 @@ def main() -> None:
     parser.add_argument("--grid-zarr", required=True, help="Input Zarr grid path")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to Turbospectrum JSON config")
     parser.add_argument("--output-zarr", default=DEFAULT_OUTPUT_PATH, help="Output Zarr path for synthesized spectra")
+    parser.add_argument("--scratch", default=None, help="Optional node-local scratch dir to reduce shared FS I/O")
+    parser.add_argument("--workers", type=int, default=None, help="Override worker process count")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     parser.add_argument("--log-file", default=None, help="Optional log file path")
     parser.add_argument("--chunk-rows", type=int, default=32, help="Zarr chunking along the sample dimension")
@@ -328,6 +348,14 @@ def main() -> None:
     project_root = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
     config = _load_config(args.config, project_root=project_root)
+    if args.scratch:
+        scratch = os.path.abspath(args.scratch)
+        os.makedirs(scratch, exist_ok=True)
+        # Redirect I/O-heavy directories to scratch to reduce shared FS contention.
+        config.tmp_dir = os.path.join(scratch, "tmp")
+        config.log_dir = os.path.join(scratch, "logs")
+        config.output_dir = os.path.join(scratch, "spectra")
+        config.model_opac_dir = os.path.join(scratch, "opac")
     ensure_directories(config)
     config.linelist_file_path = create_linelist_file(config)
 
@@ -349,7 +377,7 @@ def main() -> None:
     messages: List[str] = [""] * row_count
 
     tasks = _build_tasks(row_count, column_data, config)
-    worker_count = determine_worker_count(config)
+    worker_count = int(args.workers) if args.workers and args.workers > 0 else determine_worker_count(config)
 
     compressor_cfg: Dict[str, object] = {}
     if args.compressor:
@@ -358,7 +386,7 @@ def main() -> None:
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid compressor JSON: {exc}") from exc
 
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+    with ProcessPoolExecutor(max_workers=worker_count, initializer=_init_worker, initargs=(config,)) as executor:
         futures = {executor.submit(_synthesis_task, task): task[0] for task in tasks}
         for future in as_completed(futures):
             idx = futures[future]
