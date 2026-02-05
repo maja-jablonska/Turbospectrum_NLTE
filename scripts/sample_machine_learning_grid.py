@@ -261,6 +261,7 @@ def main() -> None:
     t0 = time.perf_counter()
 
     config = _load_config(args.config)
+    logger.debug("Config contents:\n%s", json.dumps(config, indent=2, sort_keys=True))
     sample_count = args.samples or int(config.get("num_samples", 50))
     seed = config.get("seed")
     rng = np.random.default_rng(seed)
@@ -269,13 +270,21 @@ def main() -> None:
     logger.info("Sampling: target_rows=%d seed=%s resume=%s", sample_count, seed, args.resume)
     logger.info("Versions: polars=%s zarr=%s numpy=%s", getattr(pl, "__version__", "?"), getattr(zarr, "__version__", "?"), getattr(np, "__version__", "?"))
 
+    t_step = time.perf_counter()
     bounds, sampled_abundances, fixed_abundances, sampled_turbvel_options = _resolve_sampling_dimensions(config)
+    logger.debug("Fixed abundances: %s", fixed_abundances)
+    logger.debug("turbvel sampled options: %s", sampled_turbvel_options)
+    logger.debug("t_value_options: %s", config.get("t_value_options", ["01"]))
     logger.info(
         "Sampling dims: teff/logg/feh + sampled_abundances=%s + sample_turbvel=%s",
         sampled_abundances,
         bool(sampled_turbvel_options),
     )
+    logger.info("Prepared sampling dimensions in %.2fs", time.perf_counter() - t_step)
+
+    t_step = time.perf_counter()
     lhs = _latin_hypercube(bounds, sample_count, rng)
+    logger.info("Generated Latin hypercube in %.2fs", time.perf_counter() - t_step)
 
     synthesis_cfg = config.get("synthesis", {})
     lam_min = synthesis_cfg.get("lam_min", 6000)
@@ -303,6 +312,7 @@ def main() -> None:
 
     existing_rows = 0
     if args.resume and os.path.exists(zarr_path):
+        t_step = time.perf_counter()
         store = _zarr_store(zarr_path)
         root = zarr.open_group(store=store, mode="a", zarr_format=3)
         array_keys = list(root.keys())
@@ -323,6 +333,7 @@ def main() -> None:
             )
             return
         logger.info("Resuming: existing_rows=%d adding=%d", existing_rows, sample_count - existing_rows)
+        logger.info("Resume preflight in %.2fs", time.perf_counter() - t_step)
 
     lhs = lhs[existing_rows:]
     sample_count_new = lhs.shape[0]
@@ -352,6 +363,7 @@ def main() -> None:
 
     t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
 
+    t_step = time.perf_counter()
     df = pl.DataFrame(
         {
             "grid_version": np.full(sample_count_new, grid_version, dtype=object),
@@ -374,12 +386,15 @@ def main() -> None:
             "calculation_mode": np.full(sample_count_new, calculation_mode, dtype=object),
         }
     )
+    logger.info("Built Polars DataFrame (%d rows, %d cols) in %.2fs", df.height, len(df.columns), time.perf_counter() - t_step)
 
     compression_kwargs = _zarr_compression_kwargs(zarr_compressor_cfg)
+    logger.debug("Zarr compression kwargs: %s", compression_kwargs)
     strings_codec = VLenUTF8()
     store = _zarr_store(zarr_path)
 
     if args.resume and os.path.exists(zarr_path):
+        t_step = time.perf_counter()
         root = zarr.open_group(store=store, mode="a", zarr_format=3)
         array_keys = list(root.keys())
         if not array_keys:
@@ -397,7 +412,9 @@ def main() -> None:
             arr.resize(new_len, axis=0)
             arr[existing_len:new_len] = data
         logger.info("Appended %d rows (total now %d)", sample_count_new, new_len)
+        logger.info("Zarr append finished in %.2fs", time.perf_counter() - t_step)
     else:
+        t_step = time.perf_counter()
         root = zarr.group(store=store, overwrite=True, zarr_format=3)
         for column in _progress(df.columns, total=len(df.columns), desc="Writing columns", enabled=not args.no_progress):
             series = df[column]
@@ -433,6 +450,7 @@ def main() -> None:
                 else:
                     root.array(column, series.to_numpy(), chunks=zarr_chunks, **compression_kwargs)
         logger.info("Wrote Zarr store to %s (chunk size %s)", zarr_path, zarr_chunks)
+        logger.info("Zarr write finished in %.2fs", time.perf_counter() - t_step)
 
     logger.info("Done in %.2fs", time.perf_counter() - t0)
 
