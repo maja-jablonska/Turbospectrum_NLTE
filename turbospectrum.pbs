@@ -48,6 +48,9 @@ DONE_FILE=${BASE}/done.txt
 PYTHON=/scratch/y89/mj8805/miniforge/envs/astro/bin/python
 N_SHARDS=100
 
+# Node-local scratch base (PBS sets PBS_JOBFS on many systems).
+JOBFS_BASE=${PBS_JOBFS:-${TMPDIR:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}}
+
 # Mode:
 # - full: generate grid + synthesize a single output Zarr using multiprocessing
 # - sharded: generate grid + run many shard jobs concurrently (no PBS arrays required),
@@ -134,7 +137,7 @@ if [[ "${MODE}" == "full" ]]; then
     --skip-grid \
     --synthesis-mode full \
     --workers "${PBS_NCPUS:-32}" \
-    --scratch "${PBS_JOBFS:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}"
+    --scratch "${JOBFS_BASE}"
   exit 0
 fi
 
@@ -175,7 +178,7 @@ time_left () {
 
 worker() {
 
-    JOBFS_DIR=${PBS_JOBFS}/worker_$RANDOM
+    JOBFS_DIR=${JOBFS_BASE}/worker_$RANDOM
     mkdir -p $JOBFS_DIR
 
     while true; do
