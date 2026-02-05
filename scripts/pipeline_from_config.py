@@ -201,9 +201,11 @@ def main() -> None:
     out_zarr = _abs_from(cfg_dir, str(template).format(shard_index=shard_index))
     _ensure_parent(out_zarr)
 
+    # Use the existing shard runner (available on HPC deployments).
+    # Note: run_turbospectrum_shard.py uses strided sharding (index::count).
     cmd = [
         sys.executable,
-        os.path.join(SCRIPT_DIR, "synthesize_spectra_from_zarr_sharded.py"),
+        os.path.join(SCRIPT_DIR, "run_turbospectrum_shard.py"),
         "--grid-zarr",
         grid_zarr,
         "--config",
@@ -214,10 +216,6 @@ def main() -> None:
         str(shard_index),
         "--shard-count",
         str(shard_count),
-        "--shard-mode",
-        "block",
-        "--chunk-rows",
-        str(chunk_rows),
     ]
     if workers:
         cmd += ["--workers", str(workers)]
