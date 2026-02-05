@@ -328,6 +328,12 @@ def main() -> None:
     row_count, column_data = _validate_grid(grid_root)
     wavelengths, expected_points = _expected_wavelengths(column_data)
     logger.info("Grid rows=%d wavelength_points=%d", row_count, expected_points)
+    if "output_mode" in column_data:
+        unique_modes = sorted({str(x) for x in np.unique(column_data["output_mode"])})
+        logger.info("Grid output_mode values: %s", unique_modes)
+    if "calculation_mode" in column_data:
+        unique_calc = sorted({str(x) for x in np.unique(column_data["calculation_mode"])})
+        logger.info("Grid calculation_mode values: %s", unique_calc)
 
     fluxes = np.full((row_count, expected_points), np.nan, dtype=np.float32)
     continua = np.full_like(fluxes, np.nan)
