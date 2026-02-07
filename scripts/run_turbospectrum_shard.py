@@ -36,6 +36,18 @@ from run_turbospectrum import (  # noqa: E402
 _WORKER_CONFIG = None
 
 
+def _zarr_store(path: str):
+    """Filesystem-backed Zarr store compatible with zarr v2/v3."""
+    if hasattr(zarr, "DirectoryStore"):
+        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
+    from zarr import storage as zstorage  # type: ignore
+    if hasattr(zstorage, "DirectoryStore"):
+        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
+    if hasattr(zstorage, "LocalStore"):
+        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
+    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+
+
 def _init_worker(config):
     global _WORKER_CONFIG
     _WORKER_CONFIG = config
@@ -288,6 +300,38 @@ def main():
         len(indices),
     )
 
+    # If the shard is empty (common when shard_count > row_count), write an empty
+    # but valid shard store and exit cleanly.
+    if len(indices) == 0:
+        logger.warning("Shard has 0 rows; writing empty shard and exiting.")
+
+        wavelengths = np.asarray([], dtype=np.float64)
+        if row_count > 0 and all(k in grid for k in ("lam_min", "lam_max", "lam_step")):
+            lam_min0 = float(np.asarray(grid["lam_min"][0]))
+            lam_max0 = float(np.asarray(grid["lam_max"][0]))
+            lam_step0 = float(np.asarray(grid["lam_step"][0]))
+            if lam_step0 > 0:
+                npts = int(round((lam_max0 - lam_min0) / lam_step0)) + 1
+                wavelengths = lam_min0 + lam_step0 * np.arange(npts, dtype=np.float64)
+
+        store = _zarr_store(args.output_zarr)
+        root = zarr.open_group(store=store, mode="w", zarr_format=3)
+        root.create_dataset("wavelength", data=wavelengths)
+        root.create_dataset("global_index", data=np.asarray([], dtype=np.int64))
+        root.create_dataset("flux", data=np.full((0, wavelengths.size), np.nan, np.float32))
+        root.create_dataset("continuum", data=np.full((0, wavelengths.size), np.nan, np.float32))
+        root.create_dataset("status", data=np.asarray([], dtype="U32"))
+        root.create_dataset("message", data=np.asarray([], dtype="U256"))
+
+        root.attrs.update({
+            "shard_index": args.shard_index,
+            "shard_count": args.shard_count,
+            "grid": os.path.abspath(args.grid_zarr),
+            "note": "empty shard (no rows assigned)",
+        })
+        logger.info("Empty shard written to %s", args.output_zarr)
+        return
+
     ############################################
     # Columns
     ############################################
@@ -317,12 +361,13 @@ def main():
     ############################################
 
     tasks = []
+    global_to_local = {int(g): i for i, g in enumerate(indices.tolist())}
 
     for batch_indices in _build_batches(indices, args.batch_size):
         batch = []
 
         for global_i in batch_indices:
-            local_i = np.where(indices == global_i)[0][0]
+            local_i = global_to_local[int(global_i)]
 
             row_values = {k: columns[k][local_i] for k in columns}
 
@@ -368,7 +413,7 @@ def main():
             batch_results = future.result()
 
             for result in batch_results:
-                idx = np.where(indices == result["global_index"])[0][0]
+                idx = global_to_local[int(result["global_index"])]
 
                 statuses[idx] = result["status"]
                 messages[idx] = result["message"]
@@ -391,12 +436,30 @@ def main():
     # Write shard
     ############################################
 
-    root = zarr.open_group(args.output_zarr, mode="w")
+    store = _zarr_store(args.output_zarr)
+    root = zarr.open_group(store=store, mode="w", zarr_format=3)
 
     root.create_dataset("wavelength", data=wavelengths)
+    root.create_dataset("global_index", data=indices.astype(np.int64))
     root.create_dataset("flux", data=fluxes)
     root.create_dataset("continuum", data=continua)
     root.create_dataset("status", data=np.array(statuses, dtype="U32"))
+    root.create_dataset("message", data=np.array(messages, dtype="U256"))
+
+    # Write per-row metadata columns for later merging/QA (best-effort).
+    for name, values in columns.items():
+        if name in {"lam_min", "lam_max", "lam_step"}:
+            continue
+        try:
+            root.create_dataset(name, data=np.asarray(values))
+        except Exception:
+            pass
+    for name in ("lam_min", "lam_max", "lam_step"):
+        if name in columns:
+            try:
+                root.create_dataset(name, data=np.asarray(columns[name]))
+            except Exception:
+                pass
 
     root.attrs.update({
         "shard_index": args.shard_index,

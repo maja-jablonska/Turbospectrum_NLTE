@@ -126,6 +126,24 @@ if [[ ! -d "${GRID_ZARR}" ]]; then
     --skip-synthesis
 fi
 
+# Validate grid row count and clamp shard count to avoid empty shards.
+ROW_COUNT=$(${PYTHON} - <<'PY'
+import os, zarr
+path = os.environ["GRID_ZARR"]
+root = zarr.open_group(path, mode="r")
+print(int(root["teff"].shape[0]))
+PY
+)
+echo "Grid row_count=${ROW_COUNT}"
+if [[ "${ROW_COUNT}" -le 0 ]]; then
+  echo "ERROR: Grid has 0 rows at ${GRID_ZARR}. Delete it and re-run."
+  exit 1
+fi
+if [[ "${N_SHARDS}" -gt "${ROW_COUNT}" ]]; then
+  echo "Clamping N_SHARDS=${N_SHARDS} -> ${ROW_COUNT} (cannot have more shards than rows)"
+  N_SHARDS=${ROW_COUNT}
+fi
+
 ############################################
 # FULL mode: one job, multiprocessing, single output
 ############################################
@@ -205,7 +223,8 @@ worker() {
 
         OUT=${SHARDS_DIR}/spectra_shard_${shard}.zarr
 
-        if [[ -f "$OUT" ]]; then
+        # Zarr outputs are directories.
+        if [[ -d "$OUT" ]]; then
             continue
         fi
 
