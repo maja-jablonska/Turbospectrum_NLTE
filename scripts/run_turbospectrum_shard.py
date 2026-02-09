@@ -452,15 +452,26 @@ def main():
         initargs=(config,),
     ) as executor:
 
-        futures = {
-            executor.submit(_synthesis_task, task): task
-            for task in tasks
-        }
+        futures = {executor.submit(_synthesis_task, task): task for task in tasks}
 
         done = 0
 
         for future in as_completed(futures):
-            batch_results = future.result()
+            task_batch = futures[future]
+            try:
+                batch_results = future.result()
+            except Exception as exc:  # noqa: BLE001
+                # If a worker crashes, don't abort the whole shard. Mark those rows
+                # so the output shard isn't "empty" and we have diagnostics.
+                err_msg = f"Worker crashed: {exc}"
+                logger.exception(err_msg)
+                for global_i, _row_values in task_batch:
+                    idx = global_to_local.get(int(global_i))
+                    if idx is None:
+                        continue
+                    statuses[idx] = "exception"
+                    messages[idx] = err_msg
+                continue
 
             for result in batch_results:
                 idx = global_to_local[int(result["global_index"])]
@@ -486,6 +497,12 @@ def main():
     # Write shard
     ############################################
 
+    logger.info(
+        "Writing shard output: %s (rows=%d wl=%d)",
+        args.output_zarr,
+        len(indices),
+        len(wavelengths),
+    )
     root = _open_root_for_write(args.output_zarr)
 
     root.create_dataset("wavelength", data=wavelengths)
