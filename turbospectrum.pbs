@@ -57,6 +57,9 @@ JOBFS_BASE=${PBS_JOBFS:-${TMPDIR:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}}
 #   then optionally merge shards
 MODE=sharded
 
+# If true, rebuild the shard task list at job start (recommended).
+RESET_TASKS=1
+
 mkdir -p ${BASE}
 mkdir -p ${GRID_DIR}
 mkdir -p ${SHARDS_DIR}
@@ -166,15 +169,29 @@ fi
 # We run many shards concurrently. To avoid oversubscription, each shard is run
 # with workers=1. Increase SHARD_WORKERS only if you also reduce WORKER_PROCS.
 SHARD_WORKERS=1
-WORKER_PROCS=${PBS_NCPUS:-32}
+WORKER_PROCS=${PBS_NCPUS:-${PBS_NP:-32}}
 
 ############################################
-# Create tasks once
+# Create tasks
 ############################################
 
-if [[ ! -f $TASK_FILE ]]; then
-    echo "Generating task list..."
+if [[ "${RESET_TASKS}" == "1" ]]; then
+  echo "Resetting task list for N_SHARDS=${N_SHARDS}"
+  rm -f "$TASK_FILE" "$DONE_FILE"
+fi
+
+if [[ ! -f "$TASK_FILE" ]]; then
+  echo "Generating task list..."
+  seq 0 $((N_SHARDS - 1)) > "$TASK_FILE"
+else
+  # If an old task list exists with out-of-range shards, regenerate it.
+  if awk -v max=$((N_SHARDS - 1)) '($1+0)>max{exit 42}' "$TASK_FILE"; then
+    :
+  else
+    echo "Task list contains shards >= N_SHARDS; regenerating."
+    rm -f "$TASK_FILE" "$DONE_FILE"
     seq 0 $((N_SHARDS - 1)) > "$TASK_FILE"
+  fi
 fi
 
 ############################################
@@ -223,8 +240,15 @@ worker() {
 
         OUT=${SHARDS_DIR}/spectra_shard_${shard}.zarr
 
-        # Zarr outputs are directories.
-        if [[ -d "$OUT" ]]; then
+        # Skip if shard looks valid (supports zarr v2/v3 layouts).
+        if ${PYTHON} - <<PY >/dev/null 2>&1
+import zarr, os, numpy as np
+root = zarr.open_group(r"${OUT}", mode="r")
+assert "flux" in root and "wavelength" in root
+flux = root["flux"]
+assert flux.ndim == 2 and flux.shape[0] > 0 and flux.shape[1] == root["wavelength"].shape[0]
+PY
+        then
             continue
         fi
 
@@ -242,13 +266,39 @@ worker() {
               --shard-count "$N_SHARDS" \
               --workers "$SHARD_WORKERS" \
               --scratch "$JOBFS_DIR" \
-              > "${BASE}/logs/shard_${shard}.log" 2>&1 && break
+              > "${BASE}/logs/shard_${shard}.log" 2>&1
+
+            # Validate shard output (must contain flux metadata).
+            if ${PYTHON} - <<PY >/dev/null 2>&1
+import zarr, os, numpy as np
+root = zarr.open_group(r"${OUT}", mode="r")
+assert "flux" in root and "wavelength" in root and "status" in root
+flux = root["flux"]
+assert flux.ndim == 2 and flux.shape[0] > 0 and flux.shape[1] == root["wavelength"].shape[0]
+PY
+            then
+              break
+            fi
+
+            echo "Shard $shard produced incomplete output; removing and retrying." >> "${BASE}/logs/shard_${shard}.log"
+            rm -rf "$OUT"
 
             echo "Retry $attempt for shard $shard"
             sleep 5
         done
 
-        echo $shard >> $DONE_FILE
+        if ${PYTHON} - <<PY >/dev/null 2>&1
+import zarr, os, numpy as np
+root = zarr.open_group(r"${OUT}", mode="r")
+assert "flux" in root and "wavelength" in root and "status" in root
+flux = root["flux"]
+assert flux.ndim == 2 and flux.shape[0] > 0 and flux.shape[1] == root["wavelength"].shape[0]
+PY
+        then
+          echo $shard >> $DONE_FILE
+        else
+          echo "FAILED shard $shard (see ${BASE}/logs/shard_${shard}.log)" >> "${BASE}/logs/failures.log"
+        fi
     done
 }
 
