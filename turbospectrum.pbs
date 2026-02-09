@@ -45,6 +45,7 @@ MERGED_ZARR=${BASE}/synthesized_spectra.zarr
 TASK_FILE=${BASE}/tasks.txt
 LOCK_FILE=${BASE}/tasks.lock
 DONE_FILE=${BASE}/done.txt
+DONE_LOCK_FILE=${BASE}/done.lock
 PYTHON=/scratch/y89/mj8805/miniforge/envs/astro/bin/python
 N_SHARDS=100
 
@@ -64,6 +65,10 @@ mkdir -p ${BASE}
 mkdir -p ${GRID_DIR}
 mkdir -p ${SHARDS_DIR}
 mkdir -p ${BASE}/logs
+
+# Create tracking files early (prevents shard completion writes failing if the
+# directory isn't visible yet on the compute node).
+touch "${LOCK_FILE}" "${DONE_LOCK_FILE}" "${DONE_FILE}"
 
 ############################################
 # Validate pipeline config
@@ -178,6 +183,7 @@ WORKER_PROCS=${PBS_NCPUS:-${PBS_NP:-32}}
 if [[ "${RESET_TASKS}" == "1" ]]; then
   echo "Resetting task list for N_SHARDS=${N_SHARDS}"
   rm -f "$TASK_FILE" "$DONE_FILE"
+  touch "${DONE_FILE}"
 fi
 
 if [[ ! -f "$TASK_FILE" ]]; then
@@ -227,11 +233,11 @@ worker() {
         # Atomic task grab
         #################################
 
-        exec 9<>$LOCK_FILE
+        exec 9<>"$LOCK_FILE"
         flock -x 9
 
-        shard=$(head -n 1 $TASK_FILE)
-        sed -i '1d' $TASK_FILE
+        shard=$(head -n 1 "$TASK_FILE" || true)
+        sed -i '1d' "$TASK_FILE" || true
 
         flock -u 9
         exec 9>&-
@@ -295,7 +301,13 @@ flux = root["flux"]
 assert flux.ndim == 2 and flux.shape[0] > 0 and flux.shape[1] == root["wavelength"].shape[0]
 PY
         then
-          echo $shard >> $DONE_FILE
+          # Record completion under a dedicated lock (Lustre/NFS append races).
+          mkdir -p "$(dirname "$DONE_FILE")"
+          exec 8<>"$DONE_LOCK_FILE"
+          flock -x 8
+          echo "$shard" >> "$DONE_FILE"
+          flock -u 8
+          exec 8>&-
         else
           echo "FAILED shard $shard (see ${BASE}/logs/shard_${shard}.log)" >> "${BASE}/logs/failures.log"
         fi
@@ -303,7 +315,7 @@ PY
 }
 
 export -f worker
-export BASE TASK_FILE LOCK_FILE DONE_FILE START_TIME WALLTIME_SECONDS SAFETY_BUFFER
+export BASE TASK_FILE LOCK_FILE DONE_FILE DONE_LOCK_FILE START_TIME WALLTIME_SECONDS SAFETY_BUFFER
 
 ############################################
 # Launch workers
