@@ -48,6 +48,42 @@ def _zarr_store(path: str):
     raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
 
 
+def _open_root_for_write(path: str):
+    """Create/overwrite a Zarr group (v2 or v3)."""
+    store = _zarr_store(path)
+    if hasattr(zarr, "group"):
+        # zarr v3
+        return zarr.group(store=store, overwrite=True, zarr_format=3)
+    # zarr v2
+    return zarr.open_group(store=store, mode="w")  # type: ignore[arg-type]
+
+
+def _write_string_1d(root, name: str, values, chunks: int = 128):
+    """Write 1D string array compatibly for zarr v2/v3."""
+    vals = ["" if v is None else str(v) for v in values]
+    if hasattr(root, "create_array"):
+        import zarr.codecs as zc  # type: ignore
+        from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
+
+        arr = root.create_array(
+            name,
+            shape=(len(vals),),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+            chunks=min(int(chunks), len(vals)) if len(vals) else 1,
+        )
+        arr[:] = vals
+        return
+
+    # zarr v2
+    try:
+        from numcodecs import VLenUTF8  # type: ignore
+
+        root.array(name, vals, dtype=object, object_codec=VLenUTF8(), chunks=min(int(chunks), len(vals)) if len(vals) else 1)
+    except Exception:
+        root.create_dataset(name, data=np.asarray(vals, dtype="U256"))
+
+
 def _init_worker(config):
     global _WORKER_CONFIG
     _WORKER_CONFIG = config
@@ -148,8 +184,22 @@ def _synthesis_task(batch):
             except Exception as exc:
                 results.append({
                     "global_index": global_index,
+                    "base_name": base_name,
                     "status": "error",
                     "message": str(exc),
+                    "duration": duration,
+                    "spectrum": None,
+                })
+                continue
+        else:
+            # If Turbospectrum reported success but did not produce the expected file,
+            # promote this to an error so empty/NaN shards are diagnosable.
+            if str(result.get("status", "")).lower() == "success":
+                results.append({
+                    "global_index": global_index,
+                    "base_name": base_name,
+                    "status": "error",
+                    "message": f"Missing spectrum output: {spec_path}",
                     "duration": duration,
                     "spectrum": None,
                 })
@@ -157,6 +207,7 @@ def _synthesis_task(batch):
 
         results.append({
             "global_index": global_index,
+            "base_name": base_name,
             "status": result["status"],
             "message": result["message"],
             "duration": duration,
@@ -314,14 +365,13 @@ def main():
                 npts = int(round((lam_max0 - lam_min0) / lam_step0)) + 1
                 wavelengths = lam_min0 + lam_step0 * np.arange(npts, dtype=np.float64)
 
-        store = _zarr_store(args.output_zarr)
-        root = zarr.open_group(store=store, mode="w", zarr_format=3)
+        root = _open_root_for_write(args.output_zarr)
         root.create_dataset("wavelength", data=wavelengths)
         root.create_dataset("global_index", data=np.asarray([], dtype=np.int64))
         root.create_dataset("flux", data=np.full((0, wavelengths.size), np.nan, np.float32))
         root.create_dataset("continuum", data=np.full((0, wavelengths.size), np.nan, np.float32))
-        root.create_dataset("status", data=np.asarray([], dtype="U32"))
-        root.create_dataset("message", data=np.asarray([], dtype="U256"))
+        _write_string_1d(root, "status", [], chunks=1)
+        _write_string_1d(root, "message", [], chunks=1)
 
         root.attrs.update({
             "shard_index": args.shard_index,
@@ -436,15 +486,21 @@ def main():
     # Write shard
     ############################################
 
-    store = _zarr_store(args.output_zarr)
-    root = zarr.open_group(store=store, mode="w", zarr_format=3)
+    root = _open_root_for_write(args.output_zarr)
 
     root.create_dataset("wavelength", data=wavelengths)
     root.create_dataset("global_index", data=indices.astype(np.int64))
     root.create_dataset("flux", data=fluxes)
     root.create_dataset("continuum", data=continua)
-    root.create_dataset("status", data=np.array(statuses, dtype="U32"))
-    root.create_dataset("message", data=np.array(messages, dtype="U256"))
+    _write_string_1d(root, "status", statuses, chunks=max(1, min(256, len(statuses))))
+    _write_string_1d(root, "message", messages, chunks=max(1, min(256, len(messages))))
+    # Optional: base model filenames for debugging/traceability.
+    if any(isinstance(m, str) and m for m in messages):
+        try:
+            base_names = np.asarray([str(get_model_filename(int(columns["teff"][i]), float(columns["logg"][i]), float(columns["feh"][i]), str(columns["turb"][i]))) for i in range(len(indices))], dtype="U256")
+            _write_string_1d(root, "base_name", base_names.tolist(), chunks=max(1, min(256, len(base_names))))
+        except Exception:
+            pass
 
     # Write per-row metadata columns for later merging/QA (best-effort).
     for name, values in columns.items():
