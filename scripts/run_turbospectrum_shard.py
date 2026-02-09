@@ -58,6 +58,52 @@ def _open_root_for_write(path: str):
     return zarr.open_group(store=store, mode="w")  # type: ignore[arg-type]
 
 
+def _normalize_chunks(shape: tuple[int, ...], chunks: int | tuple[int, ...] | None) -> tuple[int, ...] | None:
+    """Return a Zarr-friendly chunk tuple for a given shape."""
+    if chunks is None:
+        return None
+
+    if isinstance(chunks, int):
+        chunks_t = (int(chunks),) * len(shape)
+    else:
+        chunks_t = tuple(int(c) for c in chunks)
+        if len(chunks_t) != len(shape):
+            raise ValueError(f"chunks rank {len(chunks_t)} != shape rank {len(shape)}")
+
+    out: list[int] = []
+    for dim, ch in zip(shape, chunks_t, strict=True):
+        ch = max(1, int(ch))
+        if int(dim) > 0:
+            ch = min(ch, int(dim))
+        out.append(ch)
+    return tuple(out)
+
+
+def _write_array(root, name: str, data: Any, *, chunks: int | tuple[int, ...] | None = None) -> None:
+    """Write a numeric/bytes array compatibly for Zarr v2/v3.
+
+    Zarr v3's `create_dataset(..., data=...)` no longer infers shape, so we use
+    `create_array(shape=..., dtype=...)` then assign when available.
+    """
+    arr = np.asarray(data)
+    norm_chunks = _normalize_chunks(tuple(int(d) for d in arr.shape), chunks)
+
+    if hasattr(root, "create_array"):
+        # Provide a sensible default chunking if none is supplied (avoids one huge chunk).
+        if norm_chunks is None:
+            default = tuple(min(65536, max(1, int(d))) for d in arr.shape) if arr.ndim else ()
+            norm_chunks = _normalize_chunks(tuple(int(d) for d in arr.shape), default if default else 1)
+        za = root.create_array(name, shape=arr.shape, dtype=arr.dtype, chunks=norm_chunks)
+        za[...] = arr
+        return
+
+    # zarr v2
+    if norm_chunks is None:
+        root.create_dataset(name, data=arr)
+    else:
+        root.create_dataset(name, data=arr, chunks=norm_chunks)
+
+
 def _write_string_1d(root, name: str, values, chunks: int = 128):
     """Write 1D string array compatibly for zarr v2/v3."""
     vals = ["" if v is None else str(v) for v in values]
@@ -81,7 +127,11 @@ def _write_string_1d(root, name: str, values, chunks: int = 128):
 
         root.array(name, vals, dtype=object, object_codec=VLenUTF8(), chunks=min(int(chunks), len(vals)) if len(vals) else 1)
     except Exception:
-        root.create_dataset(name, data=np.asarray(vals, dtype="U256"))
+        arr = np.asarray(vals, dtype="U256")
+        try:
+            root.create_dataset(name, data=arr)
+        except TypeError:
+            root.create_dataset(name, shape=arr.shape, dtype=arr.dtype, data=arr)
 
 
 def _init_worker(config):
@@ -366,10 +416,20 @@ def main():
                 wavelengths = lam_min0 + lam_step0 * np.arange(npts, dtype=np.float64)
 
         root = _open_root_for_write(args.output_zarr)
-        root.create_dataset("wavelength", data=wavelengths)
-        root.create_dataset("global_index", data=np.asarray([], dtype=np.int64))
-        root.create_dataset("flux", data=np.full((0, wavelengths.size), np.nan, np.float32))
-        root.create_dataset("continuum", data=np.full((0, wavelengths.size), np.nan, np.float32))
+        _write_array(root, "wavelength", wavelengths, chunks=min(65536, max(1, wavelengths.size)))
+        _write_array(root, "global_index", np.asarray([], dtype=np.int64), chunks=1)
+        _write_array(
+            root,
+            "flux",
+            np.full((0, wavelengths.size), np.nan, np.float32),
+            chunks=(1, min(65536, max(1, wavelengths.size))),
+        )
+        _write_array(
+            root,
+            "continuum",
+            np.full((0, wavelengths.size), np.nan, np.float32),
+            chunks=(1, min(65536, max(1, wavelengths.size))),
+        )
         _write_string_1d(root, "status", [], chunks=1)
         _write_string_1d(root, "message", [], chunks=1)
 
@@ -505,10 +565,10 @@ def main():
     )
     root = _open_root_for_write(args.output_zarr)
 
-    root.create_dataset("wavelength", data=wavelengths)
-    root.create_dataset("global_index", data=indices.astype(np.int64))
-    root.create_dataset("flux", data=fluxes)
-    root.create_dataset("continuum", data=continua)
+    _write_array(root, "wavelength", wavelengths, chunks=min(65536, max(1, wavelengths.size)))
+    _write_array(root, "global_index", indices.astype(np.int64), chunks=max(1, min(2048, len(indices))))
+    _write_array(root, "flux", fluxes, chunks=(1, min(65536, max(1, wavelengths.size))))
+    _write_array(root, "continuum", continua, chunks=(1, min(65536, max(1, wavelengths.size))))
     _write_string_1d(root, "status", statuses, chunks=max(1, min(256, len(statuses))))
     _write_string_1d(root, "message", messages, chunks=max(1, min(256, len(messages))))
     # Optional: base model filenames for debugging/traceability.
@@ -524,13 +584,13 @@ def main():
         if name in {"lam_min", "lam_max", "lam_step"}:
             continue
         try:
-            root.create_dataset(name, data=np.asarray(values))
+            _write_array(root, name, np.asarray(values), chunks=max(1, min(2048, len(values))))
         except Exception:
             pass
     for name in ("lam_min", "lam_max", "lam_step"):
         if name in columns:
             try:
-                root.create_dataset(name, data=np.asarray(columns[name]))
+                _write_array(root, name, np.asarray(columns[name]), chunks=max(1, min(2048, len(columns[name]))))
             except Exception:
                 pass
 
