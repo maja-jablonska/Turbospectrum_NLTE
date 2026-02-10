@@ -42,15 +42,26 @@ def _read_mu_points(spec_path: str) -> np.ndarray:
                 if not line.lstrip().startswith("#"):
                     # stop at first data line
                     break
-                if "mu-points" in line:
+                if "mu-points" in line.lower():
                     header = line
         if not header:
             return np.asarray([], dtype=np.float32)
-        parts = header.replace("#", " ").split()
+        parts_raw = header.replace("#", " ").split()
+        parts = [p.lower() for p in parts_raw]
         if "mu-points" not in parts:
             return np.asarray([], dtype=np.float32)
         idx = parts.index("mu-points")
-        mu = [float(x) for x in parts[idx + 1 :] if x.strip()]
+        mu: list[float] = []
+        for tok in parts_raw[idx + 1 :]:
+            t = tok.strip()
+            if not t:
+                continue
+            # Fortran sometimes uses D exponent.
+            t = t.replace("D", "E").replace("d", "e")
+            try:
+                mu.append(float(t))
+            except ValueError:
+                continue
         return np.asarray(mu, dtype=np.float32)
     except Exception:
         return np.asarray([], dtype=np.float32)
@@ -291,6 +302,20 @@ def _synthesis_task(batch):
                     mu_points = _read_mu_points(spec_path)
                     chosen_idx, mu_selected = _choose_mu_indices(mu_points, global_index=int(global_index), cfg=cfg)
                     reduce_mode = str(getattr(cfg, "mu_sampling", {}).get("reduce", "first")).lower()
+                    if chosen_idx.size == 0 and str(getattr(cfg, "mu_sampling", {}).get("mode", "none")).lower() == "random":
+                        # Fallback: if header parsing failed, infer mu column count from file columns.
+                        # Column layout: wl, flux_norm, flux_abs, (Iabs, Inorm)*n_mu
+                        n_mu = max(0, int((data.shape[1] - 3) // 2))
+                        if n_mu > 0:
+                            seed = getattr(cfg, "mu_sampling", {}).get("seed")
+                            base_seed = 0 if seed in (None, "") else int(seed)
+                            rng = np.random.default_rng((base_seed + int(global_index)) % (2**32))
+                            count = int(getattr(cfg, "mu_sampling", {}).get("count", 1) or 1)
+                            replace = bool(count > n_mu)
+                            chosen_idx = np.asarray(rng.choice(np.arange(n_mu), size=count, replace=replace), dtype=np.int64)
+                            # mu values unknown without header.
+                            mu_selected = float("nan")
+
                     if chosen_idx.size > 0:
                         abs_cols = [int(3 + 2 * i) for i in chosen_idx.tolist()]
                         norm_cols = [int(4 + 2 * i) for i in chosen_idx.tolist()]
