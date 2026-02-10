@@ -29,6 +29,68 @@ from run_turbospectrum import (  # noqa: E402
     run_single_synthesis,
 )
 
+
+def _read_mu_points(spec_path: str) -> np.ndarray:
+    """Parse '# mu-points ...' header from an Intensity .spec file (best-effort)."""
+    try:
+        header = None
+        with open(spec_path, "r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(50):
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.lstrip().startswith("#"):
+                    # stop at first data line
+                    break
+                if "mu-points" in line:
+                    header = line
+        if not header:
+            return np.asarray([], dtype=np.float32)
+        parts = header.replace("#", " ").split()
+        if "mu-points" not in parts:
+            return np.asarray([], dtype=np.float32)
+        idx = parts.index("mu-points")
+        mu = [float(x) for x in parts[idx + 1 :] if x.strip()]
+        return np.asarray(mu, dtype=np.float32)
+    except Exception:
+        return np.asarray([], dtype=np.float32)
+
+
+def _choose_mu_indices(
+    mu_points: np.ndarray,
+    *,
+    global_index: int,
+    cfg: TurbospectrumConfig,
+) -> tuple[np.ndarray, float]:
+    """Choose mu indices for one spectrum row, deterministically if seeded.
+
+    Returns (indices, mu_summary) where mu_summary is the selected mu (count==1)
+    or mean(mu_selected) otherwise.
+    """
+    ms = getattr(cfg, "mu_sampling", {}) or {}
+    mode = str(ms.get("mode", "none")).lower()
+    if mode != "random" or mu_points.size == 0:
+        return np.asarray([], dtype=np.int64), float("nan")
+
+    count = int(ms.get("count", 1) or 1)
+    mu_min = float(ms.get("min", 0.0))
+    mu_max = float(ms.get("max", 1.0))
+    seed = ms.get("seed")
+    base_seed = 0 if seed in (None, "") else int(seed)
+
+    candidates = np.where((mu_points >= mu_min) & (mu_points <= mu_max))[0]
+    if candidates.size == 0:
+        candidates = np.arange(mu_points.size, dtype=np.int64)
+
+    # Deterministic per-row RNG: independent of multiprocessing ordering.
+    rng = np.random.default_rng((base_seed + int(global_index)) % (2**32))
+    replace = bool(count > candidates.size)
+    chosen = rng.choice(candidates, size=count, replace=replace)
+    chosen = np.asarray(chosen, dtype=np.int64)
+    mu_sel = mu_points[chosen]
+    mu_summary = float(mu_sel[0]) if mu_sel.size == 1 else float(np.mean(mu_sel))
+    return chosen, mu_summary
+
 ############################################
 # Worker-global config
 ############################################
@@ -218,16 +280,48 @@ def _synthesis_task(batch):
         )
 
         spectrum = None
+        mu_selected = float("nan")
         if os.path.exists(spec_path):
             try:
                 data = np.loadtxt(spec_path)
 
-                flux = data[:, 1].astype(np.float32)
-                cont = (
-                    data[:, 2].astype(np.float32)
-                    if data.shape[1] > 2
-                    else np.full_like(flux, np.nan)
-                )
+                if cfg.calculate_intensity:
+                    # Optional: pick random mu points from the Intensity file and use
+                    # their I_abs/I_norm as the stored spectrum.
+                    mu_points = _read_mu_points(spec_path)
+                    chosen_idx, mu_selected = _choose_mu_indices(mu_points, global_index=int(global_index), cfg=cfg)
+                    reduce_mode = str(getattr(cfg, "mu_sampling", {}).get("reduce", "first")).lower()
+                    if chosen_idx.size > 0:
+                        abs_cols = [int(3 + 2 * i) for i in chosen_idx.tolist()]
+                        norm_cols = [int(4 + 2 * i) for i in chosen_idx.tolist()]
+                        if data.shape[1] <= max(abs_cols + norm_cols):
+                            raise ValueError(f"Intensity spectrum has too few columns: {data.shape}")
+                        i_abs = data[:, abs_cols].astype(np.float32)
+                        i_norm = data[:, norm_cols].astype(np.float32)
+                        if i_abs.ndim == 1:
+                            i_abs = i_abs[:, None]
+                            i_norm = i_norm[:, None]
+                        if reduce_mode == "mean" and i_abs.shape[1] > 1:
+                            flux = i_abs.mean(axis=1)
+                            cont = i_norm.mean(axis=1)
+                        else:
+                            flux = i_abs[:, 0]
+                            cont = i_norm[:, 0]
+                    else:
+                        # Back-compat: store the flux columns.
+                        flux = data[:, 1].astype(np.float32)
+                        cont = (
+                            data[:, 2].astype(np.float32)
+                            if data.shape[1] > 2
+                            else np.full_like(flux, np.nan)
+                        )
+                else:
+                    flux = data[:, 1].astype(np.float32)
+                    cont = (
+                        data[:, 2].astype(np.float32)
+                        if data.shape[1] > 2
+                        else np.full_like(flux, np.nan)
+                    )
 
                 spectrum = (flux, cont)
 
@@ -239,6 +333,7 @@ def _synthesis_task(batch):
                     "message": str(exc),
                     "duration": duration,
                     "spectrum": None,
+                    "mu_selected": float("nan"),
                 })
                 continue
         else:
@@ -262,6 +357,7 @@ def _synthesis_task(batch):
             "message": result["message"],
             "duration": duration,
             "spectrum": spectrum,
+            "mu_selected": float(mu_selected),
         })
 
     return results
@@ -430,6 +526,7 @@ def main():
             np.full((0, wavelengths.size), np.nan, np.float32),
             chunks=(1, min(65536, max(1, wavelengths.size))),
         )
+        _write_array(root, "mu_selected", np.asarray([], dtype=np.float32), chunks=1)
         _write_string_1d(root, "status", [], chunks=1)
         _write_string_1d(root, "message", [], chunks=1)
 
@@ -503,6 +600,7 @@ def main():
 
     statuses = ["pending"] * len(indices)
     messages = [""] * len(indices)
+    mu_selected = np.full(len(indices), np.nan, dtype=np.float32)
 
     logger.info("Starting synthesis with %d workers", worker_count)
 
@@ -538,6 +636,10 @@ def main():
 
                 statuses[idx] = result["status"]
                 messages[idx] = result["message"]
+                try:
+                    mu_selected[idx] = float(result.get("mu_selected", np.nan))
+                except Exception:
+                    mu_selected[idx] = np.nan
 
                 if result["spectrum"]:
                     fluxes[idx], continua[idx] = result["spectrum"]
@@ -569,6 +671,7 @@ def main():
     _write_array(root, "global_index", indices.astype(np.int64), chunks=max(1, min(2048, len(indices))))
     _write_array(root, "flux", fluxes, chunks=(1, min(65536, max(1, wavelengths.size))))
     _write_array(root, "continuum", continua, chunks=(1, min(65536, max(1, wavelengths.size))))
+    _write_array(root, "mu_selected", mu_selected, chunks=max(1, min(2048, len(mu_selected))))
     _write_string_1d(root, "status", statuses, chunks=max(1, min(256, len(statuses))))
     _write_string_1d(root, "message", messages, chunks=max(1, min(256, len(messages))))
     # Optional: base model filenames for debugging/traceability.

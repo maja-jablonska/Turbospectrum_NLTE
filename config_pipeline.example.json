@@ -1,0 +1,112 @@
+{
+  "_comment": "Single-source pipeline config: grid generation + Turbospectrum synthesis.",
+  "_note": "Copy to config_pipeline.json and edit paths/outputs for your environment.",
+
+  "grid": {
+    "grid_version": "intensity-demo",
+    "num_samples": 100,
+    "seed": 1329397429,
+
+    "bounds": {
+      "teff": { "min": 4000, "max": 7000 },
+      "logg": { "min": 0.0, "max": 5.0 },
+      "feh": { "min": -2.5, "max": 0.5 }
+    },
+
+    "sample_turbvel": true,
+    "turbvel_options": ["01", "02", "03", "04", "05"],
+    "t_value_options": ["00", "01", "02", "05"],
+
+    "abundances": {
+      "a": { "min": -0.15, "max": 0.15 },
+      "c": "+0.00",
+      "n": { "min": -0.10, "max": 0.25 },
+      "o": "+0.00",
+      "r": "+0.00",
+      "s": { "min": -0.05, "max": 0.20 }
+    },
+
+    "synthesis": {
+      "lam_min": 4000,
+      "lam_max": 8000,
+      "lam_step": 0.01,
+      "output_mode": "Intensity"
+    },
+
+    "mode": "1D",
+    "calculation_mode": "LTE",
+
+    "csv_compression": "zstd",
+    "csv_compression_level": 5,
+
+    "zarr": {
+      "chunks": 2048,
+      "compressor": { "cname": "zstd", "clevel": 5, "shuffle": true }
+    }
+  },
+
+  "turbospectrum": {
+    "_note": "This is the same schema as config_sample_comprehensive.json (nested sections).",
+    "project_root": "",
+    "compiler": "gf",
+    "force": false,
+    "max_workers": null,
+
+    "executables": {
+      "babsma_exec": "babsma_lu",
+      "bsyn_exec": "bsyn_lu",
+      "interpol_exec": "interpol_modeles"
+    },
+
+    "paths": {
+      "model_atmosphere_path": "",
+      "linelist_path": "",
+      "linelist_files": ["nlte_ges_linelist_jmg6may2025_I_II"],
+      "output_dir": "",
+      "log_dir": "",
+      "tmp_dir": "",
+      "model_opac_dir": "COM/contopac"
+    },
+
+    "synthesis_parameters": {
+      "lambda_min": 4000.0,
+      "lambda_max": 8000.0,
+      "lambda_step": 0.1,
+      "calculate_intensity": false,
+      "mu_angles": [],
+      "mu_sampling": {
+        "_note": "Only used when output_mode='Intensity'. mode='random' selects random mu columns from the Turbospectrum intensity output.",
+        "mode": "none",
+        "count": 1,
+        "seed": 0,
+        "min": 0.0,
+        "max": 1.0,
+        "reduce": "first"
+      }
+    },
+
+    "nlte": {
+      "enabled": false,
+      "nlte_info_file": ""
+    }
+  },
+
+  "outputs": {
+    "_note": "Paths are resolved relative to this config file unless absolute.",
+    "grid_csv": "scripts/intensity_grid.csv",
+    "grid_zarr": "scripts/intensity_grid.zarr",
+
+    "spectra_zarr": "synthesized_spectra.zarr",
+
+    "_sharded_note": "If using sharded mode, write one output per shard.",
+    "spectra_shard_template": "synth_shards/spectra_shard_{shard_index}.zarr"
+  },
+
+  "runtime": {
+    "_note": "Optional runtime knobs for HPC; may be overridden by CLI flags.",
+    "workers": null,
+    "scratch": null,
+    "chunk_rows": 32
+  }
+}
+

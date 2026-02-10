@@ -8,7 +8,7 @@ import re
 import dataclasses
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict, Iterator
+from typing import Any, List, Tuple, Optional, Dict, Iterator
 import json
 import csv
 from datetime import datetime
@@ -74,6 +74,9 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["lambda_step"] = synthesis.get("lambda_step", 0.1)
     flat["calculate_intensity"] = synthesis.get("calculate_intensity", False)
     flat["mu_angles"] = synthesis.get("mu_angles", []) or []
+    # Optional: choose a subset of mu points from an Intensity spectrum.
+    # This is used by the Zarr-grid synthesis scripts when reading Turbospectrum outputs.
+    flat["mu_sampling"] = synthesis.get("mu_sampling", {}) or {}
 
     nlte_cfg = cfg_data.get("nlte", {}) or {}
     flat["nlte"] = nlte_cfg.get("enabled", False)
@@ -135,6 +138,10 @@ class TurbospectrumConfig:
     # Intensity Calculation
     calculate_intensity: bool = False
     mu_angles: List[float] = field(default_factory=list)
+    # Optional post-processing configuration for intensity outputs.
+    # Expected shape (all keys optional):
+    #   {"mode": "random", "count": 1, "seed": 123, "min": 0.0, "max": 1.0, "reduce": "first"}
+    mu_sampling: Dict[str, Any] = field(default_factory=dict)
 
     # Synthesis Parameters
     lambda_min: float = 4000
