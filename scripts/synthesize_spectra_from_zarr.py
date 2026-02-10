@@ -363,6 +363,7 @@ def _write_zarr_output(
     continua: np.ndarray,
     mu_selected: np.ndarray,
     mu_selected_index: np.ndarray,
+    mu_sampling_json: str,
     column_data: Mapping[str, np.ndarray],
     statuses: Sequence[str],
     messages: Sequence[str],
@@ -413,6 +414,7 @@ def _write_zarr_output(
     root.attrs["creation_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     root.attrs["wavelength_count"] = wavelengths.size
     root.attrs["chunk_rows"] = chunk_rows
+    root.attrs["mu_sampling"] = mu_sampling_json
     logger.info("Wrote spectra to %s (shape=%s)", os.path.abspath(output_path), fluxes.shape)
 
 
@@ -454,6 +456,7 @@ def main() -> None:
     project_root = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
     config = _load_config(args.config, project_root=project_root)
+    logger.info("mu_sampling=%s", json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True))
     if args.scratch:
         scratch = os.path.abspath(args.scratch)
         os.makedirs(scratch, exist_ok=True)
@@ -536,6 +539,7 @@ def main() -> None:
         continua=continua,
         mu_selected=mu_selected,
         mu_selected_index=mu_selected_index,
+        mu_sampling_json=json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
         column_data=column_data,
         statuses=statuses,
         messages=messages,
