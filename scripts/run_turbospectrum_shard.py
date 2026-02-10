@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import copy
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -46,23 +47,22 @@ def _read_mu_points(spec_path: str) -> np.ndarray:
                     header = line
         if not header:
             return np.asarray([], dtype=np.float32)
-        parts_raw = header.replace("#", " ").split()
-        parts = [p.lower() for p in parts_raw]
-        if "mu-points" not in parts:
+        # Be permissive: header can be e.g. "mu-points:" or have odd spacing.
+        m = re.search(r"mu\s*-\s*points|mu\s*points|mu-points", header, flags=re.IGNORECASE)
+        if not m:
             return np.asarray([], dtype=np.float32)
-        idx = parts.index("mu-points")
-        mu: list[float] = []
-        for tok in parts_raw[idx + 1 :]:
-            t = tok.strip()
-            if not t:
-                continue
-            # Fortran sometimes uses D exponent.
-            t = t.replace("D", "E").replace("d", "e")
+        tail = header[m.end() :]
+        num_re = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?"
+        toks = re.findall(num_re, tail)
+        if not toks:
+            return np.asarray([], dtype=np.float32)
+        vals: list[float] = []
+        for t in toks:
             try:
-                mu.append(float(t))
+                vals.append(float(t.replace("D", "E").replace("d", "e")))
             except ValueError:
                 continue
-        return np.asarray(mu, dtype=np.float32)
+        return np.asarray(vals, dtype=np.float32)
     except Exception:
         return np.asarray([], dtype=np.float32)
 
@@ -292,6 +292,7 @@ def _synthesis_task(batch):
 
         spectrum = None
         mu_selected = float("nan")
+        mu_selected_index = -1
         if os.path.exists(spec_path):
             try:
                 data = np.loadtxt(spec_path)
@@ -317,6 +318,7 @@ def _synthesis_task(batch):
                             mu_selected = float("nan")
 
                     if chosen_idx.size > 0:
+                        mu_selected_index = int(chosen_idx[0])
                         abs_cols = [int(3 + 2 * i) for i in chosen_idx.tolist()]
                         norm_cols = [int(4 + 2 * i) for i in chosen_idx.tolist()]
                         if data.shape[1] <= max(abs_cols + norm_cols):
@@ -359,6 +361,7 @@ def _synthesis_task(batch):
                     "duration": duration,
                     "spectrum": None,
                     "mu_selected": float("nan"),
+                    "mu_selected_index": -1,
                 })
                 continue
         else:
@@ -383,6 +386,7 @@ def _synthesis_task(batch):
             "duration": duration,
             "spectrum": spectrum,
             "mu_selected": float(mu_selected),
+            "mu_selected_index": int(mu_selected_index),
         })
 
     return results
@@ -552,6 +556,7 @@ def main():
             chunks=(1, min(65536, max(1, wavelengths.size))),
         )
         _write_array(root, "mu_selected", np.asarray([], dtype=np.float32), chunks=1)
+        _write_array(root, "mu_selected_index", np.asarray([], dtype=np.int16), chunks=1)
         _write_string_1d(root, "status", [], chunks=1)
         _write_string_1d(root, "message", [], chunks=1)
 
@@ -626,6 +631,7 @@ def main():
     statuses = ["pending"] * len(indices)
     messages = [""] * len(indices)
     mu_selected = np.full(len(indices), np.nan, dtype=np.float32)
+    mu_selected_index = np.full(len(indices), -1, dtype=np.int16)
 
     logger.info("Starting synthesis with %d workers", worker_count)
 
@@ -665,6 +671,10 @@ def main():
                     mu_selected[idx] = float(result.get("mu_selected", np.nan))
                 except Exception:
                     mu_selected[idx] = np.nan
+                try:
+                    mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
+                except Exception:
+                    mu_selected_index[idx] = -1
 
                 if result["spectrum"]:
                     fluxes[idx], continua[idx] = result["spectrum"]
@@ -697,6 +707,7 @@ def main():
     _write_array(root, "flux", fluxes, chunks=(1, min(65536, max(1, wavelengths.size))))
     _write_array(root, "continuum", continua, chunks=(1, min(65536, max(1, wavelengths.size))))
     _write_array(root, "mu_selected", mu_selected, chunks=max(1, min(2048, len(mu_selected))))
+    _write_array(root, "mu_selected_index", mu_selected_index, chunks=max(1, min(2048, len(mu_selected_index))))
     _write_string_1d(root, "status", statuses, chunks=max(1, min(256, len(statuses))))
     _write_string_1d(root, "message", messages, chunks=max(1, min(256, len(messages))))
     # Optional: base model filenames for debugging/traceability.

@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import copy
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -54,22 +55,21 @@ def _read_mu_points(spec_path: str) -> np.ndarray:
                     header = line
         if not header:
             return np.asarray([], dtype=np.float32)
-        parts_raw = header.replace("#", " ").split()
-        parts = [p.lower() for p in parts_raw]
-        if "mu-points" not in parts:
+        m = re.search(r"mu\s*-\s*points|mu\s*points|mu-points", header, flags=re.IGNORECASE)
+        if not m:
             return np.asarray([], dtype=np.float32)
-        idx = parts.index("mu-points")
-        mu: list[float] = []
-        for tok in parts_raw[idx + 1 :]:
-            t = tok.strip()
-            if not t:
-                continue
-            t = t.replace("D", "E").replace("d", "e")
+        tail = header[m.end() :]
+        num_re = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?"
+        toks = re.findall(num_re, tail)
+        if not toks:
+            return np.asarray([], dtype=np.float32)
+        vals: list[float] = []
+        for t in toks:
             try:
-                mu.append(float(t))
+                vals.append(float(t.replace("D", "E").replace("d", "e")))
             except ValueError:
                 continue
-        return np.asarray(mu, dtype=np.float32)
+        return np.asarray(vals, dtype=np.float32)
     except Exception:
         return np.asarray([], dtype=np.float32)
 
@@ -287,6 +287,7 @@ def _synthesis_task(args) -> Dict:
     spec_path = os.path.join(cfg.output_dir, f"{os.path.splitext(base_name)[0]}{suffix}")
     spectrum = None
     mu_selected = float("nan")
+    mu_selected_index = -1
     if os.path.exists(spec_path):
         try:
             data = np.loadtxt(spec_path)
@@ -308,6 +309,7 @@ def _synthesis_task(args) -> Dict:
                         mu_selected = float("nan")
 
                 if chosen_idx.size > 0:
+                    mu_selected_index = int(chosen_idx[0])
                     abs_cols = [int(3 + 2 * i) for i in chosen_idx.tolist()]
                     norm_cols = [int(4 + 2 * i) for i in chosen_idx.tolist()]
                     if data.shape[1] <= max(abs_cols + norm_cols):
@@ -339,6 +341,7 @@ def _synthesis_task(args) -> Dict:
                 "duration": duration,
                 "spectrum": None,
                 "mu_selected": float("nan"),
+                "mu_selected_index": -1,
             }
 
     return {
@@ -349,6 +352,7 @@ def _synthesis_task(args) -> Dict:
         "duration": duration,
         "spectrum": spectrum,
         "mu_selected": float(mu_selected),
+        "mu_selected_index": int(mu_selected_index),
     }
 
 
@@ -358,6 +362,7 @@ def _write_zarr_output(
     fluxes: np.ndarray,
     continua: np.ndarray,
     mu_selected: np.ndarray,
+    mu_selected_index: np.ndarray,
     column_data: Mapping[str, np.ndarray],
     statuses: Sequence[str],
     messages: Sequence[str],
@@ -378,6 +383,7 @@ def _write_zarr_output(
     root.create_array("flux", data=fluxes, chunks=chunk_shape, **compression_kwargs)
     root.create_array("continuum", data=continua, chunks=chunk_shape, **compression_kwargs)
     root.create_array("mu_selected", data=mu_selected, chunks=min(chunk_rows, len(mu_selected)), **compression_kwargs)
+    root.create_array("mu_selected_index", data=mu_selected_index, chunks=min(chunk_rows, len(mu_selected_index)), **compression_kwargs)
 
     for name, values in column_data.items():
         if values.dtype.kind in {"U", "S", "O"}:
@@ -476,6 +482,7 @@ def main() -> None:
     statuses: List[str] = ["pending"] * row_count
     messages: List[str] = [""] * row_count
     mu_selected = np.full(row_count, np.nan, dtype=np.float32)
+    mu_selected_index = np.full(row_count, -1, dtype=np.int16)
 
     tasks = _build_tasks(row_count, column_data, config)
     worker_count = int(args.workers) if args.workers and args.workers > 0 else determine_worker_count(config)
@@ -505,6 +512,10 @@ def main() -> None:
                 mu_selected[idx] = float(result.get("mu_selected", np.nan))
             except Exception:
                 mu_selected[idx] = np.nan
+            try:
+                mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
+            except Exception:
+                mu_selected_index[idx] = -1
 
             if result.get("spectrum"):
                 fluxes[idx], continua[idx] = result["spectrum"]
@@ -524,6 +535,7 @@ def main() -> None:
         fluxes=fluxes,
         continua=continua,
         mu_selected=mu_selected,
+        mu_selected_index=mu_selected_index,
         column_data=column_data,
         statuses=statuses,
         messages=messages,
