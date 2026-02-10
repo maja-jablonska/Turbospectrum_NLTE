@@ -494,6 +494,10 @@ def main():
         cfg_data["project_root"] = project_root
 
     config = TurbospectrumConfig(**cfg_data)
+    logger.info(
+        "mu_sampling=%s",
+        json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
+    )
 
     if args.scratch:
         scratch = os.path.abspath(args.scratch)
@@ -737,6 +741,7 @@ def main():
         "shard_index": args.shard_index,
         "shard_count": args.shard_count,
         "grid": os.path.abspath(args.grid_zarr),
+        "mu_sampling": json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
     })
 
     logger.info("Shard written to %s", args.output_zarr)
