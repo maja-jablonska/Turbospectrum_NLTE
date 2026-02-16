@@ -75,23 +75,86 @@ echo "[turbospec] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 # Paths
 ############################################
 
-PROJECT=mk27
-USER_ID=$(whoami)
+PROJECT="${PROJECT:-mk27}"
+USER_ID="${USER_ID:-$(whoami)}"
+RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/turbospec}"
+REPO="${REPO:-${PBS_O_WORKDIR}}"
+CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
+WORKERS="${WORKERS:-16}"
 
-BASE=/scratch/${PROJECT}/${USER_ID}/turbospec
-REPO=/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE
+if [[ "${REPO}" != /* ]]; then
+    REPO="${PBS_O_WORKDIR}/${REPO}"
+fi
+REPO=$(cd "${REPO}" >/dev/null 2>&1 && pwd)
 
-GRID_DIR=${BASE}/grid
-GRID_ZARR=${GRID_DIR}/parameter_grid.zarr
+if [[ "${CONFIG_PATH}" != /* ]]; then
+    CONFIG_PATH="${REPO}/${CONFIG_PATH}"
+fi
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+    echo "[turbospec] ERROR: config not found: ${CONFIG_PATH}" >&2
+    exit 1
+fi
 
-SHARDS_DIR=${BASE}/shards
-MERGED_ZARR=${BASE}/synthesized_spectra.zarr
+CONFIG_OUTPUTS=$(
+    "${PYTHON}" - <<PY
+import json
+import os
 
-NEXT_SHARD=${BASE}/next_shard.txt
-LOCK_FILE=${BASE}/counter.lock
+cfg_path = os.path.abspath(r"${CONFIG_PATH}")
+cfg_dir = os.path.dirname(cfg_path)
+with open(cfg_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+outs = cfg.get("outputs", {}) or {}
 
-LOG_DIR=${BASE}/logs
-mkdir -p ${LOG_DIR}
+def _abs(p):
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.abspath(os.path.join(cfg_dir, p))
+
+grid = _abs(outs.get("grid_zarr"))
+shard_tmpl = _abs(outs.get("spectra_shard_template"))
+merged = _abs(outs.get("spectra_zarr"))
+shards_dir = os.path.dirname(shard_tmpl) if shard_tmpl else ""
+
+print(grid)
+print(shards_dir)
+print(merged)
+PY
+)
+mapfile -t _cfg_lines <<< "${CONFIG_OUTPUTS}"
+CFG_GRID_ZARR="${_cfg_lines[0]:-}"
+CFG_SHARDS_DIR="${_cfg_lines[1]:-}"
+CFG_MERGED_ZARR="${_cfg_lines[2]:-}"
+
+GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR:-${RUN_ROOT}/grid/parameter_grid.zarr}}"
+SHARDS_DIR="${SHARDS_DIR:-${CFG_SHARDS_DIR:-${RUN_ROOT}/shards}}"
+MERGED_ZARR="${MERGED_ZARR:-${CFG_MERGED_ZARR:-${RUN_ROOT}/synthesized_spectra.zarr}}"
+
+if [[ "${GRID_ZARR}" != /* ]]; then
+    GRID_ZARR="${REPO}/${GRID_ZARR}"
+fi
+if [[ "${SHARDS_DIR}" != /* ]]; then
+    SHARDS_DIR="${REPO}/${SHARDS_DIR}"
+fi
+if [[ "${MERGED_ZARR}" != /* ]]; then
+    MERGED_ZARR="${REPO}/${MERGED_ZARR}"
+fi
+
+NEXT_SHARD="${NEXT_SHARD:-${RUN_ROOT}/next_shard.txt}"
+LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
+LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
+mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_SHARD}")" "$(dirname "${LOCK_FILE}")"
+
+echo "[turbospec] Repo: ${REPO}"
+echo "[turbospec] Config: ${CONFIG_PATH}"
+echo "[turbospec] Grid: ${GRID_ZARR}"
+echo "[turbospec] Shards: ${SHARDS_DIR}"
+echo "[turbospec] Merged: ${MERGED_ZARR}"
+
+if [[ ! -d "${GRID_ZARR}" ]]; then
+    echo "[turbospec] ERROR: grid zarr not found: ${GRID_ZARR}" >&2
+    exit 1
+fi
 
 ############################################
 # Node-local scratch
@@ -103,9 +166,9 @@ JOBFS_BASE=${PBS_JOBFS:-${TMPDIR:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}}
 # Grid sanity check
 ############################################
 
-ROW_COUNT=$(${PYTHON} - <<'PY'
-import os, zarr
-root = zarr.open_group(os.environ["GRID_ZARR"], mode="r")
+ROW_COUNT=$(${PYTHON} - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
 print(int(root["teff"].shape[0]))
 PY
 )
@@ -128,8 +191,8 @@ fi
 WALLTIME_SECONDS=$((12*3600))
 START_TIME=$(date +%s)
 
-SAFETY_BUFFER=900      # stop 15 minutes early
-EST_RUNTIME=600       # expected shard runtime (tune later)
+SAFETY_BUFFER="${SAFETY_BUFFER:-900}"  # stop 15 minutes early
+EST_RUNTIME="${EST_RUNTIME:-600}"      # expected shard runtime (tune later)
 
 time_left () {
     echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
@@ -210,7 +273,7 @@ PY
             START=$(date +%s)
 
             ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
-              --config "${BASE}/config_pipeline.${PBS_JOBID}.json" \
+              --config "${CONFIG_PATH}" \
               --skip-grid \
               --synthesis-mode sharded \
               --shard-index "$shard" \
@@ -243,13 +306,11 @@ PY
 }
 
 export -f worker
-export BASE NEXT_SHARD LOCK_FILE ROW_COUNT LOG_DIR REPO PYTHON PBS_JOBID JOBFS_BASE
+export NEXT_SHARD LOCK_FILE ROW_COUNT LOG_DIR REPO PYTHON PBS_JOBID JOBFS_BASE CONFIG_PATH
 
 ############################################
 # Launch workers (start conservative!)
 ############################################
-
-WORKERS=16   # start lower; increase after pilot
 
 echo "Launching ${WORKERS} workers..."
 
@@ -267,11 +328,16 @@ CURRENT=$(cat ${NEXT_SHARD})
 
 if (( CURRENT < ROW_COUNT )); then
     echo "Shards remaining ($CURRENT / $ROW_COUNT). Resubmitting..."
-
-    qsub $0
+    qsub -v "PYTHON_BIN=${PYTHON_BIN},MAMBA_ENV_NAME=${MAMBA_ENV_NAME},PROJECT=${PROJECT},USER_ID=${USER_ID},RUN_ROOT=${RUN_ROOT},REPO=${REPO},CONFIG_PATH=${CONFIG_PATH},GRID_ZARR=${GRID_ZARR},SHARDS_DIR=${SHARDS_DIR},MERGED_ZARR=${MERGED_ZARR},NEXT_SHARD=${NEXT_SHARD},LOCK_FILE=${LOCK_FILE},LOG_DIR=${LOG_DIR},WORKERS=${WORKERS},SAFETY_BUFFER=${SAFETY_BUFFER},EST_RUNTIME=${EST_RUNTIME}" "$0"
 
 else
     echo "All shards completed."
+
+    echo "Validating shard completeness before merge..."
+    ${PYTHON} ${REPO}/scripts/validate_dataset.py \
+        --shard-dir "${SHARDS_DIR}" \
+        --expected-shards "${ROW_COUNT}" \
+        | tee "${LOG_DIR}/validate.log"
 
     echo "Merging shards..."
 
@@ -279,5 +345,5 @@ else
         --shard-dir "${SHARDS_DIR}" \
         --grid-zarr "${GRID_ZARR}" \
         --output-zarr "${MERGED_ZARR}" \
-        > "${LOG_DIR}/merge.log" 2>&1 || true
+        > "${LOG_DIR}/merge.log" 2>&1
 fi
