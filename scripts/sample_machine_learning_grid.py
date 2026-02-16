@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate machine-learning-friendly parameter samples via Latin Hypercube.
 
-This helper reads a JSON configuration (defaults to ``config_ml_sampling.json``
-at the repository root), samples stellar parameters within specified bounds,
+This helper reads a JSON configuration (defaults to
+``configs/sampling/config_ml_sampling.json``), samples stellar parameters within specified bounds,
 and writes the results to a Zarr (v3) store that matches the grid format
 expected by the synthesis scripts. The Polars + Zarr pipeline keeps I/O
 efficient for HPC environments and downstream ML ingestion.
@@ -24,8 +24,9 @@ from numcodecs import Blosc, VLenUTF8
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CONFIG_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config_ml_sampling.json"))
-DEFAULT_ZARR_PATH = os.path.join(SCRIPT_DIR, "ml_parameter_grid.zarr")
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+DEFAULT_CONFIG_PATH = os.path.join(REPO_ROOT, "configs", "sampling", "config_ml_sampling.json")
+DEFAULT_ZARR_PATH = os.path.join(REPO_ROOT, "runs", "local-dev", "outputs", "grids", "ml_parameter_grid.zarr")
 ALLOWED_TURBVEL = {"01", "02", "03", "04", "05"}
 
 

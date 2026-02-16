@@ -1,5 +1,5 @@
 {
-  "_comment": "PIPELINE CONFIG (TEMPLATE) — single source of truth for: grid sampling + Turbospectrum synthesis.",
+  "_comment": "PIPELINE CONFIG (ACTIVE) — single source of truth for: grid sampling + Turbospectrum synthesis.",
   "_howto": [
     "Edit this file, then run via scripts/pipeline_from_config.py or turbospectrum.pbs.",
     "For sharded runs (no PBS arrays), submit multiple jobs or use the manual shard queue in turbospectrum.pbs.",
@@ -9,7 +9,7 @@
   "grid": {
     "_note": "Sampling + defaults that become columns in the grid Zarr (output_mode/calculation_mode/mode).",
 
-    "grid_version": "sharded-demo",
+    "grid_version": "mu-sampling",
     "num_samples": 1000,
     "seed": 1329397429,
 
@@ -55,7 +55,7 @@
   },
 
   "turbospectrum": {
-    "_note": "Turbospectrum config (nested schema, like config_sample_comprehensive.json).",
+    "_note": "Turbospectrum config (nested schema, like configs/synthesis/config_sample_comprehensive.json).",
 
     "project_root": "",
     "compiler": "gf",
@@ -87,11 +87,21 @@
         "These are Turbospectrum defaults used ONLY when the grid does not include per-row values.",
         "In the Zarr-grid workflow, lam_min/max/step/output_mode typically come from the grid."
       ],
-      "lambda_min": 4000.0,
-      "lambda_max": 8000.0,
-      "lambda_step": 0.1,
       "calculate_intensity": true,
-      "mu_angles": []
+      "mu_angles": [],
+      "mu_sampling": {
+        "_note": [
+          "Only used when output_mode='Intensity'.",
+          "If mode='random', pick mu columns from the Turbospectrum intensity .spec file and store them in the Zarr outputs.",
+          "reduce='first' stores one randomly selected mu; reduce='mean' averages over the sampled mus."
+        ],
+        "mode": "none",
+        "count": 1,
+        "seed": 0,
+        "min": 0.0,
+        "max": 1.0,
+        "reduce": "first"
+      }
     },
 
     "nlte": {
@@ -103,12 +113,12 @@
   "outputs": {
     "_note": "These are sensible local defaults. turbospectrum.pbs will override these to write under $BASE.",
 
-    "grid_csv": "scripts/parameter_grid.csv",
-    "grid_zarr": "scripts/parameter_grid.zarr",
+    "grid_csv": "../../runs/local-dev/outputs/grids/parameter_grid.csv",
+    "grid_zarr": "../../runs/local-dev/outputs/grids/parameter_grid.zarr",
 
-    "spectra_zarr": "synthesized_spectra.zarr",
+    "spectra_zarr": "../../runs/local-dev/outputs/zarr/synthesized_spectra.zarr",
 
-    "spectra_shard_template": "synth_shards/spectra_shard_{shard_index}.zarr"
+    "spectra_shard_template": "../../runs/local-dev/outputs/shards/spectra_shard_{shard_index}.zarr"
   },
 
   "runtime": {
@@ -118,4 +128,3 @@
     "chunk_rows": 32
   }
 }
-

@@ -36,7 +36,7 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
 
     Supports both:
     - legacy flat configs (already matching TurbospectrumConfig fields)
-    - comprehensive nested configs (config_sample_comprehensive.json)
+    - comprehensive nested configs (configs/synthesis/config_sample_comprehensive.json)
     """
     cfg_data = _strip_private_keys(cfg_data or {})
 
@@ -182,12 +182,13 @@ class TurbospectrumConfig:
         # Ensure NLTE info file has a default if NLTE is enabled
         if self.nlte and not self.nlte_info_file:
             self.nlte_info_file = os.path.join(self.project_root, "DATA", "SPECIES_LTE_NLTE.dat")
+        default_run_root = os.path.join(self.project_root, "runs", "local-dev")
         if not self.output_dir:
-            self.output_dir = os.path.join(self.project_root, "spectra")
+            self.output_dir = os.path.join(default_run_root, "outputs", "spectra")
         if not self.log_dir:
-            self.log_dir = os.path.join(self.project_root, "logs")
+            self.log_dir = os.path.join(default_run_root, "logs", "shards")
         if not self.tmp_dir:
-            self.tmp_dir = os.path.join(self.project_root, "tmp")
+            self.tmp_dir = os.path.join(default_run_root, "tmp")
             
         # Set executable paths
         exec_dir = os.path.join(self.project_root, f"exec-{self.compiler}")

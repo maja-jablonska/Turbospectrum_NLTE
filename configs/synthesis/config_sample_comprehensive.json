@@ -4,7 +4,7 @@
     "_key_feature": "ABUNDANCES AND ISOTOPES CAN VARY PER GRID POINT - see 'grid_points' section for examples",
     "_abundance_override": "Each grid point can override: abund_source, metallicity, alpha_fe, helium, r_process, s_process, individual_abundances, isotopes, and turbvel",
     
-    "project_root": "/Users/mjablons/Documents/Turbospectrum_NLTE",
+    "project_root": "",
     
     "compiler": "gf",
     "_compiler_options": ["gf", "intel"],
@@ -31,13 +31,13 @@
         "_linelist_files_note": "List of linelist filenames (relative to linelist_path) or absolute paths",
         
         "output_dir": "",
-        "_output_dir_note": "Output directory for spectra. If empty, defaults to project_root/spectra",
+        "_output_dir_note": "Output directory for spectra. If empty, defaults to project_root/runs/local-dev/outputs/spectra",
         
         "log_dir": "",
-        "_log_dir_note": "Directory for log files. If empty, defaults to project_root/logs",
+        "_log_dir_note": "Directory for log files. If empty, defaults to project_root/runs/local-dev/logs/shards",
         
         "tmp_dir": "",
-        "_tmp_dir_note": "Temporary directory. If empty, defaults to project_root/tmp",
+        "_tmp_dir_note": "Temporary directory. If empty, defaults to project_root/runs/local-dev/tmp",
         
         "model_opac_dir": "COM/contopac",
         "_model_opac_dir_note": "Directory for continuous opacity files (relative to project_root)"

@@ -1,6 +1,6 @@
 {
   "_comment": "Single-source pipeline config: grid generation + Turbospectrum synthesis.",
-  "_note": "Copy to config_pipeline.json and edit paths/outputs for your environment.",
+    "_note": "Copy to configs/pipeline/config_pipeline.json and edit paths/outputs for your environment.",
 
   "grid": {
     "grid_version": "intensity-demo",
@@ -46,7 +46,7 @@
   },
 
   "turbospectrum": {
-    "_note": "This is the same schema as config_sample_comprehensive.json (nested sections).",
+    "_note": "This is the same schema as configs/synthesis/config_sample_comprehensive.json (nested sections).",
     "project_root": "",
     "compiler": "gf",
     "force": false,
@@ -69,9 +69,6 @@
     },
 
     "synthesis_parameters": {
-      "lambda_min": 4000.0,
-      "lambda_max": 8000.0,
-      "lambda_step": 0.1,
       "calculate_intensity": false,
       "mu_angles": [],
       "mu_sampling": {
@@ -93,13 +90,13 @@
 
   "outputs": {
     "_note": "Paths are resolved relative to this config file unless absolute.",
-    "grid_csv": "scripts/intensity_grid.csv",
-    "grid_zarr": "scripts/intensity_grid.zarr",
+    "grid_csv": "../../runs/local-dev/outputs/grids/intensity_grid.csv",
+    "grid_zarr": "../../runs/local-dev/outputs/grids/intensity_grid.zarr",
 
-    "spectra_zarr": "synthesized_spectra.zarr",
+    "spectra_zarr": "../../runs/local-dev/outputs/zarr/synthesized_spectra.zarr",
 
     "_sharded_note": "If using sharded mode, write one output per shard.",
-    "spectra_shard_template": "synth_shards/spectra_shard_{shard_index}.zarr"
+    "spectra_shard_template": "../../runs/local-dev/outputs/shards/spectra_shard_{shard_index}.zarr"
   },
 
   "runtime": {
@@ -109,4 +106,3 @@
     "chunk_rows": 32
   }
 }
-

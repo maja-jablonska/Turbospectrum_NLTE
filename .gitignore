@@ -42,6 +42,21 @@ spectra/
 tmp/
 logs/
 scripts/*.pyc
+runs/*
+!runs/README.md
+synth_shards/
+reports/
+
+# Python cache artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Dataset/runtime stores
+*.zarr/
+*.zarr
+*.csv.zst
+.ipynb_checkpoints/
 
 COM/contopac/*
 input_files/*

@@ -22,6 +22,17 @@ mkdir -p "$MODEL_PATH"
 mkdir -p "$OPAC_PATH"
 mkdir -p "$SPECTRA_PATH"
 
+DEFAULT_GRID_CSV="runs/local-dev/outputs/grids/parameter_grid.csv"
+LEGACY_GRID_CSV="scripts/parameter_grid.csv"
+PARAMETER_GRID_CSV="${PARAMETER_GRID_CSV:-$DEFAULT_GRID_CSV}"
+if [ ! -f "$PARAMETER_GRID_CSV" ] && [ -f "$LEGACY_GRID_CSV" ]; then
+    PARAMETER_GRID_CSV="$LEGACY_GRID_CSV"
+fi
+if [ ! -f "$PARAMETER_GRID_CSV" ]; then
+    echo "ERROR: Parameter grid CSV not found at '$PARAMETER_GRID_CSV' (also checked '$LEGACY_GRID_CSV')."
+    exit 1
+fi
+
 # Function to get CPU count for Linux and macOS
 get_cpu_count() {
     if [[ "$(uname)" == "Darwin" ]]; then
@@ -122,8 +133,26 @@ CPU_COUNT=$(get_cpu_count)
 echo "INFO: Starting pipeline with up to $CPU_COUNT parallel processes."
 
 # Read the parameter grid (skip header), then process each line in parallel
-tail -n +2 "scripts/parameter_grid.csv" | while IFS=, read -r teff logg feh lam_min lam_max lam_step turbvel
+tail -n +2 "$PARAMETER_GRID_CSV" | while IFS=, read -r c1 c2 c3 c4 c5 c6 c7 c8 _
 do
+    if [[ "$c1" =~ ^[0-9]+$ ]]; then
+        teff="$c1"
+        logg="$c2"
+        feh="$c3"
+        lam_min="$c4"
+        lam_max="$c5"
+        lam_step="$c6"
+        turbvel="$c7"
+    else
+        teff="$c2"
+        logg="$c3"
+        feh="$c4"
+        lam_min="$c5"
+        lam_max="$c6"
+        lam_step="$c7"
+        turbvel="$c8"
+    fi
+
     run_instance "$teff" "$logg" "$feh" "$lam_min" "$lam_max" "$lam_step" "$turbvel" &
 
     # Limit the number of concurrent jobs

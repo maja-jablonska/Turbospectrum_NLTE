@@ -4,7 +4,7 @@
 This script is intentionally simple glue around:
 - `scripts/generate_grid.py` (grid generation)
 - `scripts/synthesize_spectra_from_zarr.py` (single-job multiprocessing synthesis)
-- `scripts/synthesize_spectra_from_zarr_sharded.py` (sharded multiprocessing synthesis)
+- `scripts/run_turbospectrum_shard.py` (sharded synthesis)
 
 It exists to avoid managing separate config files for grid sampling vs synthesis.
 """
@@ -120,7 +120,11 @@ def _run(cmd: list[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="Path to pipeline JSON config (see config_pipeline.example.json)")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to pipeline JSON config (see configs/pipeline/config_pipeline.example.json)",
+    )
     parser.add_argument("--skip-grid", action="store_true", help="Skip grid generation step")
     parser.add_argument("--skip-synthesis", action="store_true", help="Skip synthesis step")
 
@@ -238,4 +242,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
