@@ -69,7 +69,8 @@ For more information, you can view the help message:
 
 ## Workflow
 
-This section outlines the typical workflow for generating a grid of synthetic spectra.
+The default workflow is now a single pipeline config and a single pipeline command.  
+The older split flow (manual grid/interpolation/synthesis scripts) is still available, but it is now optional legacy tooling.
 
 ### Rules-Aligned Repository Layout
 
@@ -97,25 +98,18 @@ runs/
 
 This mirrors the operational guidance in `OPERATIONS.md` and keeps outputs immutable and easy to resume.
 
-### 1. Configure the Parameter Grid
+### 1. Edit One Pipeline Config
 
-The first step is to define the grid of stellar parameters for which you want to compute spectra. This is done by editing `configs/sampling/grid_config.yml`.
-
-This YAML file allows you to specify the minimum, maximum, and step size for `teff`, `logg`, and `feh`. You can also set the desired wavelength range and other synthesis parameters.
-
-### 2. Generate the Parameter CSV
-
-Once you have configured `grid_config.yml`, you can generate the `parameter_grid.csv` file by running the `generate_grid.py` script. This script requires the `PyYAML` and `numpy` packages to be installed so it can resolve lists, ranges, and sampled distributions.
+Start from the example and keep all run settings in one place:
 
 ```bash
-# Install dependencies if you haven't already
-pip install PyYAML numpy
-
-# Run the script to generate the grid
-python3 scripts/generate_grid.py
+cp configs/pipeline/config_pipeline.example.json configs/pipeline/config_pipeline.json
 ```
 
-This will create `runs/local-dev/outputs/grids/parameter_grid.csv`, which is used by subsequent scripts in the pipeline.
+Then edit:
+- `grid` (sampling bounds and wavelength settings)
+- `turbospectrum` (paths/executables and synthesis runtime settings)
+- `outputs` (grid/spectra output paths)
 
 #### Quick sampling for machine learning
 
@@ -125,63 +119,52 @@ If you just need a compact, Latin-Hypercube-sampled grid for ML experiments, edi
 python3 scripts/sample_machine_learning_grid.py  # add --resume to append up to num_samples
 ```
 
-The helper writes a compressed Zarr store at `runs/local-dev/outputs/grids/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. The layout matches the existing synthesis scripts, so you can plug it directly into `scripts/synthesize_spectra.sh` after copying or renaming it as needed. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the HPC batch runners.
+The helper writes a compressed Zarr store at `runs/local-dev/outputs/grids/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the batch runners.
 
-### One-config pipeline (recommended)
+### 2. Run The Pipeline (Single Command)
 
-To avoid keeping a separate grid config and Turbospectrum config in sync, you can use a single pipeline config file that includes both sections. Start from `configs/pipeline/config_pipeline.example.json` and run:
+Run from one config:
 
 ```bash
 python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipeline.json
 ```
 
-This will:
+This command will:
 - generate the grid outputs (CSV + Zarr)
 - synthesize spectra into a single output Zarr using multiprocessing
 
-If you need to run multiple independent “shards” (e.g. separate PBS jobs without arrays), use:
+You can still split phases only when needed:
+
+```bash
+python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipeline.json --skip-synthesis
+python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipeline.json --skip-grid
+```
+
+### 3. Optional Sharded Runs + Merge
+
+If you need independent shard jobs (e.g. separate PBS submissions), use:
 
 ```bash
 python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipeline.json --synthesis-mode sharded --shard-index 0 --shard-count 10
 ```
 
-After all shards finish, merge them into one consolidated store:
+After all shards finish, merge to one consolidated store:
 
 ```bash
 python3 scripts/merge_spectra_shards.py \
   --shard-dir runs/local-dev/outputs/shards \
+  --grid-zarr runs/local-dev/outputs/grids/parameter_grid.zarr \
   --output-zarr runs/local-dev/outputs/zarr/synthesized_spectra.zarr
 ```
 
-### 3. Interpolate Model Atmospheres
+### Legacy split scripts (optional)
 
-With the parameter grid generated, the next step is to ensure that a model atmosphere exists for each point in the grid. The `interpolate_models.sh` script handles this by interpolating new models from the existing grid as needed.
+Manual split scripts are still present for backward compatibility:
+- `scripts/generate_grid.py`
+- `scripts/interpolate_models.sh`
+- `scripts/synthesize_spectra.sh`
 
-The script reads `runs/local-dev/outputs/grids/parameter_grid.csv` (or `PARAMETER_GRID_CSV` if set) and, for each entry, checks if the required model atmosphere exists. If not, it interpolates one.
-
-To run the script:
-```bash
-./scripts/interpolate_models.sh
-```
-
-This will populate the `input_files/model_atmospheres/` directory with any newly interpolated models.
-
-### 4. Synthesize a Grid of Spectra
-
-With atmospheres and a parameter grid in place, you can generate spectra for every sampled point using `scripts/synthesize_spectra.sh`. Make sure `scripts/env.sh` points to your local paths for model atmospheres, line lists, and Turbospectrum executables.
-
-```bash
-# Generate a reproducible grid with sampling controls
-python3 scripts/generate_grid.py
-
-# Ensure atmospheres exist for each grid point
-./scripts/interpolate_models.sh
-
-# Synthesize Flux/Intensity spectra in parallel across the grid
-./scripts/synthesize_spectra.sh
-```
-
-Each run reads `runs/local-dev/outputs/grids/parameter_grid.csv` by default (including `grid_version`, abundances, and sampling metadata), uses the corresponding model file, and writes logs under `runs/local-dev/logs/shards/` unless overridden in config. Synthetic spectra are written to the directory specified by `SPECTRA_PATH` in `scripts/env.sh`.
+Use them only if you explicitly need manual phase-by-phase execution.
 
 ## Pipeline Smoke Tests
 
@@ -215,9 +198,28 @@ qsub scripts/test_pipeline_gadi.pbs
 Optional overrides at submit time:
 
 ```bash
-qsub -v PROJECT=mk27,PYTHON_BIN=/path/to/python,CONFIG_PATH=configs/pipeline/config_pipeline.json scripts/test_pipeline_gadi.pbs
+qsub -v PROJECT=mk27,MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json scripts/test_pipeline_gadi.pbs
 ```
 
 The Gadi job wraps the local smoke script and keeps outputs under:
 
 `/scratch/<PROJECT>/<USER>/turbospec_smoke/<PBS_JOBID>/`
+
+## Main Gadi Synthesis (PBS)
+
+For long sharded production runs on Gadi, use:
+
+```bash
+qsub turbospectrum.pbs
+```
+
+Common overrides:
+
+```bash
+qsub -v MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json,RUN_ROOT=/scratch/mk27/$USER/turbospec,WORKERS=16 turbospectrum.pbs
+```
+
+Behavior summary:
+- uses the one-config pipeline (`pipeline_from_config.py --synthesis-mode sharded`) for shard generation
+- reads default grid/shard/merged output paths from `outputs` in the pipeline config
+- validates shard completeness with `scripts/validate_dataset.py` before merge
