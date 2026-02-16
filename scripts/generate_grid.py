@@ -180,7 +180,8 @@ def _choose_series(raw_value: Any, rng: np.random.Generator, length: int, name: 
 
 def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) -> Dict[str, np.ndarray]:
     """
-    Build ML-style sampled parameter columns from `config_ml_sampling.json`.
+    Build ML-style sampled parameter columns from
+    `configs/sampling/config_ml_sampling.json`.
 
     Returns a dict of column -> ndarray, matching the CSV/Zarr schema expected
     by the synthesis pipeline.
@@ -401,7 +402,10 @@ def _write_zarr_from_columns(columns: Mapping[str, np.ndarray], zarr_path: str, 
                 root.array(name, values, chunks=int(chunks), **kwargs)
 
 
-def generate_grid(config_path='scripts/grid_config.yml', output_path='scripts/parameter_grid.csv'):
+def generate_grid(
+    config_path='configs/sampling/grid_config.yml',
+    output_path='runs/local-dev/outputs/grids/parameter_grid.csv',
+):
     """
     Generates a CSV parameter grid based on a YAML configuration file.
 
@@ -442,6 +446,7 @@ def generate_grid(config_path='scripts/grid_config.yml', output_path='scripts/pa
     parameter_combinations = _sample_parameter_space(parameter_lists, sampling_cfg, rng)
 
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         with open(output_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow([
@@ -478,12 +483,21 @@ def generate_grid(config_path='scripts/grid_config.yml', output_path='scripts/pa
 if __name__ == '__main__':
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(script_dir, ".."))
-    default_json = os.path.join(repo_root, "config_ml_sampling.json")
-    default_yaml = os.path.join(script_dir, "grid_config.yml")
+    default_json = os.path.join(repo_root, "configs", "sampling", "config_ml_sampling.json")
+    default_yaml = os.path.join(repo_root, "configs", "sampling", "grid_config.yml")
+    legacy_json = os.path.join(repo_root, "config_ml_sampling.json")
+    legacy_yaml = os.path.join(script_dir, "grid_config.yml")
+    if not os.path.exists(default_json) and os.path.exists(legacy_json):
+        default_json = legacy_json
+    if not os.path.exists(default_yaml) and os.path.exists(legacy_yaml):
+        default_yaml = legacy_yaml
     default_config = default_json if os.path.exists(default_json) else default_yaml
 
     parser = argparse.ArgumentParser(
-        description="Generate a parameter grid CSV (and optionally Zarr). Supports legacy YAML and config_ml_sampling.json."
+        description=(
+            "Generate a parameter grid CSV (and optionally Zarr). "
+            "Supports legacy YAML and configs/sampling/config_ml_sampling.json."
+        )
     )
     parser.add_argument("--config", default=default_config, help="Path to YAML or JSON config file")
     parser.add_argument("--output", default=None, help="Optional override for CSV output path")
@@ -499,7 +513,12 @@ if __name__ == '__main__':
         with open(config_path, "r", encoding="utf-8") as handle:
             cfg = json.load(handle)
 
-        csv_out = args.csv_output or args.output or cfg.get("output_csv") or os.path.join(script_dir, "parameter_grid.csv")
+        csv_out = (
+            args.csv_output
+            or args.output
+            or cfg.get("output_csv")
+            or os.path.join(repo_root, "runs", "local-dev", "outputs", "grids", "parameter_grid.csv")
+        )
         csv_out_abs = _abs_from(config_dir, csv_out) or os.path.abspath(csv_out)
         zarr_cfg = cfg.get("zarr") or {}
         zarr_out = args.zarr_output or zarr_cfg.get("path")
@@ -525,5 +544,7 @@ if __name__ == '__main__':
             print(f"Successfully wrote Zarr store at {zarr_out_abs}")
     else:
         # Legacy YAML config path.
-        out = args.csv_output or args.output or "scripts/parameter_grid.csv"
+        out = args.csv_output or args.output or os.path.join(
+            repo_root, "runs", "local-dev", "outputs", "grids", "parameter_grid.csv"
+        )
         generate_grid(config_path=config_path, output_path=_abs_from(config_dir, out) or out)

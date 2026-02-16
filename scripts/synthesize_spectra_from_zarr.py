@@ -100,8 +100,12 @@ def _choose_mu_indices(mu_points: np.ndarray, *, row_index: int, cfg: Turbospect
     return chosen, mu_summary
 
 
-DEFAULT_CONFIG_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config_sample_comprehensive.json"))
-DEFAULT_OUTPUT_PATH = os.path.join(SCRIPT_DIR, "synthesized_spectra.zarr")
+DEFAULT_CONFIG_PATH = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "configs", "synthesis", "config_sample_comprehensive.json")
+)
+DEFAULT_OUTPUT_PATH = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "runs", "local-dev", "outputs", "zarr", "synthesized_spectra.zarr")
+)
 
 _WORKER_CONFIG: TurbospectrumConfig | None = None
 

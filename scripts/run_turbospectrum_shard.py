@@ -518,8 +518,8 @@ def main():
     # Guardrail: users sometimes accidentally pass the ML sampling config here.
     if isinstance(cfg_data, dict) and any(k in cfg_data for k in ("bounds", "num_samples", "output_csv")):
         raise ValueError(
-            "The provided --config looks like an ML sampling config (e.g. config_ml_sampling.json), "
-            "not a Turbospectrum synthesis config. Use config_sample_comprehensive.json (or another "
+            "The provided --config looks like an ML sampling config (e.g. configs/sampling/config_ml_sampling.json), "
+            "not a Turbospectrum synthesis config. Use configs/synthesis/config_sample_comprehensive.json (or another "
             "Turbospectrum config with paths/executables/synthesis_parameters)."
         )
 

@@ -1,0 +1,58 @@
+#!/bin/bash
+#PBS -N ts-pipeline-smoke
+#PBS -q normal
+#PBS -l ncpus=4
+#PBS -l mem=16GB
+#PBS -l walltime=00:30:00
+#PBS -l storage=scratch/mk27
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+############################################
+# Thread caps
+############################################
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+############################################
+# User-overridable knobs
+############################################
+
+PROJECT="${PROJECT:-mk27}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
+SMOKE_SAMPLES="${SMOKE_SAMPLES:-8}"
+SMOKE_WORKERS="${SMOKE_WORKERS:-1}"
+SMOKE_LAM_MIN="${SMOKE_LAM_MIN:-5000}"
+SMOKE_LAM_MAX="${SMOKE_LAM_MAX:-5005}"
+SMOKE_LAM_STEP="${SMOKE_LAM_STEP:-0.5}"
+
+RUN_ROOT="/scratch/${PROJECT}/${USER}/turbospec_smoke/${PBS_JOBID}"
+
+echo "[gadi-smoke] repo=${PBS_O_WORKDIR}"
+echo "[gadi-smoke] run_root=${RUN_ROOT}"
+echo "[gadi-smoke] python=${PYTHON_BIN}"
+echo "[gadi-smoke] config=${CONFIG_PATH}"
+
+mkdir -p "${RUN_ROOT}"
+
+bash scripts/test_pipeline_local.sh \
+  --python "${PYTHON_BIN}" \
+  --config "${CONFIG_PATH}" \
+  --run-root "${RUN_ROOT}" \
+  --num-samples "${SMOKE_SAMPLES}" \
+  --workers "${SMOKE_WORKERS}" \
+  --lam-min "${SMOKE_LAM_MIN}" \
+  --lam-max "${SMOKE_LAM_MAX}" \
+  --lam-step "${SMOKE_LAM_STEP}" \
+  --with-synthesis \
+  --keep
+
+echo "[gadi-smoke] SUCCESS"
+echo "[gadi-smoke] outputs/logs kept in: ${RUN_ROOT}"

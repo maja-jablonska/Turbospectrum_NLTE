@@ -21,6 +21,17 @@ mkdir -p "$TMP_PATH"
 mkdir -p "$OPAC_PATH"
 mkdir -p "$SPECTRA_PATH"
 
+DEFAULT_GRID_CSV="runs/local-dev/outputs/grids/parameter_grid.csv"
+LEGACY_GRID_CSV="scripts/parameter_grid.csv"
+PARAMETER_GRID_CSV="${PARAMETER_GRID_CSV:-$DEFAULT_GRID_CSV}"
+if [ ! -f "$PARAMETER_GRID_CSV" ] && [ -f "$LEGACY_GRID_CSV" ]; then
+    PARAMETER_GRID_CSV="$LEGACY_GRID_CSV"
+fi
+if [ ! -f "$PARAMETER_GRID_CSV" ]; then
+    echo "ERROR: Parameter grid CSV not found at '$PARAMETER_GRID_CSV' (also checked '$LEGACY_GRID_CSV')."
+    exit 1
+fi
+
 # Function to get CPU count for Linux and macOS
 get_cpu_count() {
     if [[ "$(uname)" == "Darwin" ]]; then
@@ -144,8 +155,48 @@ CPU_COUNT=$(get_cpu_count)
 echo "INFO: Starting spectra synthesis with up to $CPU_COUNT parallel processes."
 
 # Read the parameter grid (skip header), then process each line in parallel
-tail -n +2 "scripts/parameter_grid.csv" | while IFS=, read -r grid_version teff logg feh lam_min lam_max lam_step turbvel t_value a_val c_val n_val o_val r_val s_val output_mode mode calculation_mode
+tail -n +2 "$PARAMETER_GRID_CSV" | while IFS=, read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16 c17 c18
 do
+    if [[ "$c1" =~ ^[0-9]+$ ]]; then
+        grid_version="legacy"
+        teff="$c1"
+        logg="$c2"
+        feh="$c3"
+        lam_min="$c4"
+        lam_max="$c5"
+        lam_step="$c6"
+        turbvel="$c7"
+        t_value="$c8"
+        a_val="$c9"
+        c_val="$c10"
+        n_val="$c11"
+        o_val="$c12"
+        r_val="$c13"
+        s_val="$c14"
+        output_mode="$c15"
+        mode="$c16"
+        calculation_mode="$c17"
+    else
+        grid_version="$c1"
+        teff="$c2"
+        logg="$c3"
+        feh="$c4"
+        lam_min="$c5"
+        lam_max="$c6"
+        lam_step="$c7"
+        turbvel="$c8"
+        t_value="$c9"
+        a_val="$c10"
+        c_val="$c11"
+        n_val="$c12"
+        o_val="$c13"
+        r_val="$c14"
+        s_val="$c15"
+        output_mode="$c16"
+        mode="$c17"
+        calculation_mode="$c18"
+    fi
+
     # Remove carriage return characters from variables
     calculation_mode=$(echo "$calculation_mode" | tr -d '\r')
     mode=$(echo "$mode" | tr -d '\r')

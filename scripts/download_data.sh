@@ -3,6 +3,9 @@
 # Script to download default files for Turbospectrum
 # Based on the information in DOC/Turbospectrum_v20_Documentation_v6.pdf
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)
+
 # Function to display usage instructions
 usage() {
     echo "Usage: $0 [options]"
@@ -22,8 +25,8 @@ usage() {
 # --- Configuration ---
 
 # Source environment variables to get destination paths
-if [ -f "$(dirname "$0")/env.sh" ]; then
-    source "$(dirname "$0")/env.sh"
+if [ -f "${SCRIPT_DIR}/env.sh" ]; then
+    source "${SCRIPT_DIR}/env.sh"
 else
     echo "Error: env.sh not found in the scripts directory."
     exit 1
@@ -33,16 +36,16 @@ fi
 BASE_URL="https://keeper.mpdl.mpg.de/d/6eaecbf95b88448f98a4/files/?p="
 
 # Define paths for NLTE data, as they are not in env.sh
-NLTE_BASE_PATH="${NLTE_BASE_PATH:-/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/nlte_data}"
+NLTE_BASE_PATH="${NLTE_BASE_PATH:-${PROJECT_ROOT}/input_files/nlte_data}"
 NLTE_ATOM_PATH="${NLTE_ATOM_PATH:-$NLTE_BASE_PATH/model_atoms}"
 NLTE_GRID_PATH="${NLTE_GRID_PATH:-$NLTE_BASE_PATH/departure_grids}"
 
 # Allow overriding STAGGER path
-STAGGER_PATH="${STAGGER_PATH:-/Users/mjablons/Documents/Turbospectrum_NLTE/input_files/model_atmospheres/STAGGER_grid}"
+STAGGER_PATH="${STAGGER_PATH:-${PROJECT_ROOT}/input_files/model_atmospheres/STAGGER_grid}"
 
 # Optional gold sample download location (override via env)
 GOLD_SAMPLE_URL="${GOLD_SAMPLE_URL:-${BASE_URL}/gold_sample/}"
-GOLD_SAMPLE_PATH="${GOLD_SAMPLE_PATH:-$PWD/gold_sample}"
+GOLD_SAMPLE_PATH="${GOLD_SAMPLE_PATH:-${PROJECT_ROOT}/gold_sample}"
 
 # Whether to force re-download even if a previous run completed
 FORCE_DOWNLOAD=false

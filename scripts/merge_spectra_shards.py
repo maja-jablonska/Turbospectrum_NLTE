@@ -2,7 +2,7 @@
 """Merge sharded synthesized-spectra Zarr stores into one consolidated store.
 
 This is intended to merge outputs produced by:
-- `scripts/synthesize_spectra_from_zarr_sharded.py`
+- `scripts/run_turbospectrum_shard.py`
 
 Each shard must contain:
 - `wavelength` (1D)
@@ -269,4 +269,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
