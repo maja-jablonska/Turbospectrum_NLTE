@@ -20,6 +20,8 @@ import time
 import copy
 import re
 import warnings
+import hashlib
+import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -192,6 +194,144 @@ def _zarr_compression_kwargs(zarr_compressor_cfg: Mapping):
     }
 
 
+def _to_float32(values: np.ndarray) -> np.ndarray:
+    out = np.full(len(values), np.nan, dtype=np.float32)
+    for i, v in enumerate(values.tolist()):
+        try:
+            out[i] = np.float32(float(v))
+        except Exception:
+            s = str(v).strip().lower()
+            if s.startswith("t"):
+                s = s[1:]
+            try:
+                out[i] = np.float32(float(s))
+            except Exception:
+                out[i] = np.nan
+    return out
+
+
+def _build_params_matrix(column_data: Mapping[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    # Fixed ordering keeps schema stable across runs.
+    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
+    params_by_name: Dict[str, np.ndarray] = {}
+
+    for name in ("teff", "logg", "feh"):
+        if name in column_data:
+            params_by_name[name] = _to_float32(np.asarray(column_data[name]))
+
+    if "turb" in column_data:
+        params_by_name["vmicro"] = _to_float32(np.asarray(column_data["turb"]))
+    elif "turbvel" in column_data:
+        params_by_name["vmicro"] = _to_float32(np.asarray(column_data["turbvel"]))
+    elif "t_value" in column_data:
+        params_by_name["vmicro"] = _to_float32(np.asarray(column_data["t_value"]))
+
+    for name in ("a", "c", "n", "o", "r", "s"):
+        if name in column_data:
+            params_by_name[name] = _to_float32(np.asarray(column_data[name]))
+
+    param_names = [name for name in candidate_order if name in params_by_name]
+    if not param_names:
+        raise ValueError("Unable to build params matrix: no parameter columns available")
+
+    params = np.column_stack([params_by_name[name] for name in param_names]).astype(np.float32, copy=False)
+    return params, np.asarray(param_names, dtype=object)
+
+
+def _compute_model_ids(params: np.ndarray) -> np.ndarray:
+    ids = np.zeros(params.shape[0], dtype=np.uint64)
+    for i in range(params.shape[0]):
+        row = np.nan_to_num(params[i].astype(np.float32, copy=False), nan=9.96921e36, posinf=3.4e38, neginf=-3.4e38)
+        digest = hashlib.sha256(row.astype("<f4", copy=False).tobytes()).digest()
+        ids[i] = np.uint64(int.from_bytes(digest[:8], "big", signed=False))
+    return ids
+
+
+def _git_commit(project_root: str) -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_root, stderr=subprocess.DEVNULL, timeout=3)
+        return out.decode("utf-8").strip()
+    except Exception:
+        return "unknown"
+
+
+def _compute_physics_hash(config: TurbospectrumConfig, column_data: Mapping[str, np.ndarray]) -> str:
+    def _uniq(name: str) -> List[str]:
+        if name not in column_data:
+            return []
+        return sorted({str(x) for x in np.asarray(column_data[name]).tolist()})
+
+    payload = {
+        "compiler": str(config.compiler),
+        "nlte_default": bool(config.nlte),
+        "linelist_path": str(config.linelist_path),
+        "linelist_files": [str(x) for x in (config.linelist_files or [])],
+        "model_atmosphere_path": str(config.model_atmosphere_path),
+        "model_opac_dir": str(config.model_opac_dir),
+        "mu_sampling": getattr(config, "mu_sampling", {}) or {},
+        "wavelength": {
+            "lam_min": _uniq("lam_min"),
+            "lam_max": _uniq("lam_max"),
+            "lam_step": _uniq("lam_step"),
+        },
+        "output_mode": _uniq("output_mode"),
+        "calculation_mode": _uniq("calculation_mode"),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _write_string_scalar(root, name: str, value: str, compression_kwargs: Mapping[str, Any]) -> None:
+    import zarr.codecs as zc  # type: ignore
+    from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
+
+    try:
+        arr = root.create_array(
+            name,
+            shape=(),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+            **compression_kwargs,
+        )
+        arr[...] = str(value)
+    except Exception:
+        arr = root.create_array(
+            name,
+            shape=(1,),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+            chunks=1,
+            **compression_kwargs,
+        )
+        arr[0] = str(value)
+
+
+def _write_fixed_string_scalar(root, name: str, value: str, min_width: int, compression_kwargs: Mapping[str, Any]) -> None:
+    sval = str(value)
+    width = max(int(min_width), len(sval), 1)
+    try:
+        arr = root.create_array(
+            name,
+            shape=(),
+            dtype=f"<U{width}",
+            **compression_kwargs,
+        )
+        arr[...] = sval
+    except Exception:
+        _write_string_scalar(root, name, sval, compression_kwargs=compression_kwargs)
+
+
+def _to_u32_param_names(values: Sequence[str]) -> np.ndarray:
+    names = [str(v) for v in values]
+    too_long = [n for n in names if len(n) > 32]
+    if too_long:
+        raise ValueError(
+            "param_names entries must be <= 32 characters for DATA_SCHEMA.md U32 storage; "
+            f"offending values: {too_long[:3]}"
+        )
+    return np.asarray(names, dtype="<U32")
+
+
 def _load_config(config_path: str, project_root: str) -> TurbospectrumConfig:
     with open(config_path, "r", encoding="utf-8") as handle:
         cfg_data = json.load(handle)
@@ -219,7 +359,7 @@ def _validate_grid(grid_root) -> Tuple[int, Dict[str, np.ndarray]]:
         raise KeyError("Grid Zarr must include either 'turbvel' or 't_value' for microturbulence selection")
     column_data["turb"] = np.array(grid_root[turb_column][:])
 
-    optional_columns = ["output_mode", "calculation_mode", "grid_version"]
+    optional_columns = ["output_mode", "calculation_mode", "grid_version", "a", "c", "n", "o", "r", "s"]
     for name in optional_columns:
         if name in available:
             column_data[name] = np.array(grid_root[name][:])
@@ -381,13 +521,18 @@ def _write_zarr_output(
     output_path: str,
     wavelengths: np.ndarray,
     fluxes: np.ndarray,
-    continua: np.ndarray,
-    mu_selected: np.ndarray,
-    mu_selected_index: np.ndarray,
-    mu_sampling_json: str,
-    column_data: Mapping[str, np.ndarray],
-    statuses: Sequence[str],
-    messages: Sequence[str],
+    params: np.ndarray,
+    param_names: np.ndarray,
+    model_id: np.ndarray,
+    physics_hash: str,
+    schema_version: str,
+    created_utc: str,
+    git_commit: str,
+    contact: str,
+    generator: str,
+    flux_definition: str,
+    provenance_payload: Mapping[str, str],
+    status_counts: Mapping[str, int],
     compression_cfg: Mapping,
     chunk_rows: int,
     logger: logging.Logger,
@@ -397,45 +542,67 @@ def _write_zarr_output(
     root = zarr.group(store=store, overwrite=True, zarr_format=3)
 
     compression_kwargs = _zarr_compression_kwargs(compression_cfg)
-    import zarr.codecs as zc  # type: ignore
-    from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
+    chunk_shape = (min(chunk_rows, fluxes.shape[0]), fluxes.shape[1]) if fluxes.shape[0] else (1, fluxes.shape[1])
+    param_chunk_shape = (min(chunk_rows, params.shape[0]), params.shape[1]) if params.shape[0] else (1, params.shape[1])
+    wl = wavelengths.astype(np.float32, copy=False)
+    param_name_list = [str(x) for x in param_names.tolist()]
+    param_names_u32 = _to_u32_param_names(param_name_list)
 
-    chunk_shape = (min(chunk_rows, fluxes.shape[0]), fluxes.shape[1])
-    root.create_array("wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
+    # DATA_SCHEMA.md synthesis layout
+    root.create_array("wavelength", data=wl, chunks=wl.shape if wl.size else (1,), **compression_kwargs)
     root.create_array("flux", data=fluxes, chunks=chunk_shape, **compression_kwargs)
-    root.create_array("continuum", data=continua, chunks=chunk_shape, **compression_kwargs)
-    root.create_array("mu_selected", data=mu_selected, chunks=min(chunk_rows, len(mu_selected)), **compression_kwargs)
-    root.create_array("mu_selected_index", data=mu_selected_index, chunks=min(chunk_rows, len(mu_selected_index)), **compression_kwargs)
+    root.create_array("params", data=params.astype(np.float32, copy=False), chunks=param_chunk_shape, **compression_kwargs)
+    root.create_array(
+        "param_names",
+        data=param_names_u32,
+        chunks=(min(max(1, params.shape[1]), len(param_names_u32)) if len(param_names_u32) else 1,),
+        **compression_kwargs,
+    )
+    root.create_array(
+        "model_id",
+        data=model_id.astype(np.uint64, copy=False),
+        chunks=(min(chunk_rows, len(model_id)) if len(model_id) else 1,),
+        **compression_kwargs,
+    )
+    _write_fixed_string_scalar(root, "physics_hash", physics_hash, min_width=64, compression_kwargs=compression_kwargs)
+    _write_fixed_string_scalar(root, "schema_version", schema_version, min_width=16, compression_kwargs=compression_kwargs)
 
-    for name, values in column_data.items():
-        if values.dtype.kind in {"U", "S", "O"}:
-            arr = root.create_array(
-                name,
-                shape=values.shape,
-                dtype=VariableLengthUTF8(),
-                serializer=zc.VLenUTF8Codec(),
-                chunks=min(chunk_rows, len(values)),
-                **compression_kwargs,
-            )
-            arr[:] = values.astype(str)
+    # Minimal provenance group requested by DATA_SCHEMA.md
+    prov = root.create_group("provenance")
+    for name, value in provenance_payload.items():
+        _write_string_scalar(prov, name, value, compression_kwargs=compression_kwargs)
+
+    param_units = {}
+    for name in param_name_list:
+        if name == "teff":
+            param_units[name] = "K"
+        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"}:
+            param_units[name] = "dex"
+        elif name == "vmicro":
+            param_units[name] = "km/s"
         else:
-            root.create_array(name, data=values, chunks=min(chunk_rows, len(values)), **compression_kwargs)
+            param_units[name] = ""
 
-    for field_name, values in {"status": statuses, "message": messages}.items():
-        arr = root.create_array(
-            field_name,
-            shape=(len(values),),
-            dtype=VariableLengthUTF8(),
-            serializer=zc.VLenUTF8Codec(),
-            chunks=min(chunk_rows, len(values)),
-            **compression_kwargs,
-        )
-        arr[:] = list(values)
-
-    root.attrs["creation_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    root.attrs["wavelength_count"] = wavelengths.size
-    root.attrs["chunk_rows"] = chunk_rows
-    root.attrs["mu_sampling"] = mu_sampling_json
+    root.attrs.update(
+        {
+            "title": "SPICE Synthetic Spectral Grid",
+            "generator": generator,
+            "created_utc": created_utc,
+            "flux_definition": flux_definition,
+            "wavelength_unit": "angstrom",
+            "flux_unit": "relative",
+            "parameter_units": param_units,
+            "physics_hash": physics_hash,
+            "git_commit": git_commit,
+            "contact": contact,
+            "schema_version": schema_version,
+            "n_models": int(fluxes.shape[0]),
+            "n_lambda": int(fluxes.shape[1]) if fluxes.ndim == 2 else 0,
+            "n_params": int(params.shape[1]) if params.ndim == 2 else 0,
+            # Keep diagnostics in attrs (not top-level arrays) to preserve schema shape.
+            "status_counts": dict(status_counts),
+        }
+    )
     logger.info("Wrote spectra to %s (shape=%s)", os.path.abspath(output_path), fluxes.shape)
 
 
@@ -475,6 +642,11 @@ def main() -> None:
     parser.add_argument("--log-file", default=None, help="Optional log file path")
     parser.add_argument("--chunk-rows", type=int, default=32, help="Zarr chunking along the sample dimension")
     parser.add_argument("--compressor", default=None, help="JSON string describing compressor options (cname, clevel, shuffle)")
+    parser.add_argument("--schema-version", default="1.0.0", help="DATA_SCHEMA.md schema version")
+    parser.add_argument("--physics-hash", default=None, help="Optional override for physics hash")
+    parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
+    parser.add_argument("--generator", default="turbospectrum_nlte", help="Generator string for metadata")
+    parser.add_argument("--flux-definition", default="continuum_normalized", help="Flux definition metadata")
     args = parser.parse_args()
 
     logger = _configure_logging(args.log_level, args.log_file)
@@ -508,11 +680,8 @@ def main() -> None:
         logger.info("Grid calculation_mode values: %s", unique_calc)
 
     fluxes = np.full((row_count, expected_points), np.nan, dtype=np.float32)
-    continua = np.full_like(fluxes, np.nan)
     statuses: List[str] = ["pending"] * row_count
     messages: List[str] = [""] * row_count
-    mu_selected = np.full(row_count, np.nan, dtype=np.float32)
-    mu_selected_index = np.full(row_count, -1, dtype=np.int16)
 
     tasks = _build_tasks(row_count, column_data, config)
     worker_count = int(args.workers) if args.workers and args.workers > 0 else determine_worker_count(config)
@@ -538,17 +707,8 @@ def main() -> None:
 
             statuses[idx] = result["status"]
             messages[idx] = result["message"]
-            try:
-                mu_selected[idx] = float(result.get("mu_selected", np.nan))
-            except Exception:
-                mu_selected[idx] = np.nan
-            try:
-                mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
-            except Exception:
-                mu_selected_index[idx] = -1
-
             if result.get("spectrum"):
-                fluxes[idx], continua[idx] = result["spectrum"]
+                fluxes[idx] = result["spectrum"][0]
             logger.info(
                 "[%d/%d] %s %s (%.2fs) - %s",
                 idx + 1,
@@ -567,17 +727,86 @@ def main() -> None:
             "cross-FS rename will copy+delete (not atomic)"
         )
 
+    params, param_names = _build_params_matrix(column_data)
+    model_id = _compute_model_ids(params)
+    physics_hash = args.physics_hash or _compute_physics_hash(config, column_data)
+    created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    git_commit = _git_commit(project_root)
+    status_counts: Dict[str, int] = {}
+    for s in statuses:
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    provenance_payload = {
+        "canonical_config.yaml": json.dumps(
+            {
+                "physics_hash": physics_hash,
+                "linelist_files": [str(x) for x in (config.linelist_files or [])],
+                "model_atmosphere_path": str(config.model_atmosphere_path),
+                "nlte_default": bool(config.nlte),
+                "wavelength": {
+                    "lam_min": sorted({str(x) for x in np.asarray(column_data["lam_min"]).tolist()}),
+                    "lam_max": sorted({str(x) for x in np.asarray(column_data["lam_max"]).tolist()}),
+                    "lam_step": sorted({str(x) for x in np.asarray(column_data["lam_step"]).tolist()}),
+                },
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "synthesis_config.yaml": json.dumps(dataclasses.asdict(config), sort_keys=True, indent=2, default=str),
+        "linelist_manifest.json": json.dumps(
+            {
+                "source": str(config.linelist_path),
+                "version": "unknown",
+                "files": [str(x) for x in (config.linelist_files or [])],
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "atmosphere_manifest.json": json.dumps(
+            {
+                "path": str(config.model_atmosphere_path),
+                "geometry": "unknown",
+                "version": "unknown",
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "software_manifest.json": json.dumps(
+            {
+                "generator": str(args.generator),
+                "git_commit": git_commit,
+                "python": sys.version.split()[0],
+                "compiler": str(config.compiler),
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "environment.txt": "\n".join(
+            [
+                f"python={sys.version}",
+                f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}",
+                f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS', '')}",
+                f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '')}",
+            ]
+        ),
+    }
+
     _write_zarr_output(
         output_path=write_path,
         wavelengths=wavelengths,
         fluxes=fluxes,
-        continua=continua,
-        mu_selected=mu_selected,
-        mu_selected_index=mu_selected_index,
-        mu_sampling_json=json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
-        column_data=column_data,
-        statuses=statuses,
-        messages=messages,
+        params=params,
+        param_names=param_names,
+        model_id=model_id,
+        physics_hash=physics_hash,
+        schema_version=args.schema_version,
+        created_utc=created_utc,
+        git_commit=git_commit,
+        contact=args.contact,
+        generator=args.generator,
+        flux_definition=args.flux_definition,
+        provenance_payload=provenance_payload,
+        status_counts=status_counts,
         compression_cfg=compressor_cfg,
         chunk_rows=args.chunk_rows,
         logger=logger,
