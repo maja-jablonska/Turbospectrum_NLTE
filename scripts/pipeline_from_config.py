@@ -135,6 +135,13 @@ def main() -> None:
 
     parser.add_argument("--workers", type=int, default=None, help="Override worker process count")
     parser.add_argument("--scratch", default=None, help="Optional scratch dir (passed through to synthesis)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        dest="output_tmp",
+        metavar="TMP_PATH",
+        help="Temp path for atomic write: write to TMP_PATH, then rename to final. Use for stability (avoids partial shards).",
+    )
     args = parser.parse_args()
 
     cfg_path = os.path.abspath(args.config)
@@ -184,6 +191,8 @@ def main() -> None:
             cmd += ["--workers", str(workers)]
         if scratch:
             cmd += ["--scratch", str(scratch)]
+        if args.output_tmp:
+            cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
         _run(cmd)
         print(f"Wrote synthesized spectra Zarr: {out_zarr}")
         return
@@ -221,6 +230,8 @@ def main() -> None:
         cmd += ["--workers", str(workers)]
     if scratch:
         cmd += ["--scratch", str(scratch)]
+    if args.output_tmp:
+        cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
     _run(cmd)
     print(f"Wrote shard spectra Zarr: {out_zarr}")
 

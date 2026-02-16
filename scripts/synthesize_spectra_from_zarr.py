@@ -19,6 +19,7 @@ import sys
 import time
 import copy
 import re
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -290,9 +291,25 @@ def _synthesis_task(args) -> Dict:
     mu_selected_index = -1
     if os.path.exists(spec_path):
         try:
-            data = np.loadtxt(spec_path)
+            try:
+                if os.path.getsize(spec_path) == 0:
+                    raise ValueError("Spectrum file is empty (0 bytes)")
+            except OSError:
+                pass
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("error", message=r"loadtxt: input contained no data.*")
+                data = np.loadtxt(spec_path)
+
+            if data.size == 0:
+                raise ValueError("Spectrum file contains no numeric data")
             if data.ndim != 2 or data.shape[1] < 2:
-                raise ValueError(f"Unexpected spectrum shape {data.shape}")
+                raise ValueError(f"Unexpected spectrum shape {getattr(data, 'shape', None)}")
+
+            expected_n = int(round((cfg.lambda_max - cfg.lambda_min) / cfg.lambda_step)) + 1
+            if data.shape[0] != expected_n:
+                raise ValueError(f"Unexpected wavelength count {data.shape[0]} (expected {expected_n})")
+
             if cfg.calculate_intensity:
                 mu_points = _read_mu_points(spec_path)
                 chosen_idx, mu_selected = _choose_mu_indices(mu_points, row_index=int(index), cfg=cfg)
@@ -441,7 +458,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grid-zarr", required=True, help="Input Zarr grid path")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to Turbospectrum JSON config")
-    parser.add_argument("--output-zarr", default=DEFAULT_OUTPUT_PATH, help="Output Zarr path for synthesized spectra")
+    parser.add_argument("--output-zarr", default=DEFAULT_OUTPUT_PATH, help="Final output Zarr path (after atomic rename if --output-tmp used)")
+    parser.add_argument(
+        "--output-tmp",
+        default=None,
+        metavar="TMP_PATH",
+        help="Temp path for atomic write: write to TMP_PATH, then rename to --output-zarr. Prevents partial outputs.",
+    )
     parser.add_argument("--scratch", default=None, help="Optional node-local scratch dir to reduce shared FS I/O")
     parser.add_argument("--workers", type=int, default=None, help="Override worker process count")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
@@ -532,8 +555,16 @@ def main() -> None:
                 result["message"],
             )
 
+    final_path = os.path.abspath(args.output_zarr)
+    write_path = os.path.abspath(args.output_tmp) if args.output_tmp else final_path
+    if args.output_tmp and os.path.dirname(write_path) != os.path.dirname(final_path):
+        logger.warning(
+            "output-tmp and output-zarr should be on same filesystem for atomic rename; "
+            "cross-FS rename will copy+delete (not atomic)"
+        )
+
     _write_zarr_output(
-        output_path=args.output_zarr,
+        output_path=write_path,
         wavelengths=wavelengths,
         fluxes=fluxes,
         continua=continua,
@@ -547,6 +578,9 @@ def main() -> None:
         chunk_rows=args.chunk_rows,
         logger=logger,
     )
+    if write_path != final_path:
+        os.rename(write_path, final_path)
+        logger.info("Atomic rename: %s -> %s", write_path, final_path)
     logger.info("Completed synthesis in %.2fs", time.perf_counter() - t0)
 
 
