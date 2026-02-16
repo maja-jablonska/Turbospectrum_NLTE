@@ -11,11 +11,10 @@
 #PBS -l storage=scratch/mk27+scratch/y89
 
 set -euo pipefail
-
 cd $PBS_O_WORKDIR
 
 ############################################
-# Thread safety (CRITICAL)
+# Thread caps (CRITICAL)
 ############################################
 
 export OMP_NUM_THREADS=1
@@ -33,8 +32,8 @@ USER_ID=$(whoami)
 
 BASE=/scratch/${PROJECT}/${USER_ID}/turbospec
 REPO=/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE
-PIPELINE_CONFIG_SRC=${REPO}/config_pipeline.json
-PIPELINE_CONFIG_JOB=${BASE}/config_pipeline.${PBS_JOBID}.json
+
+PYTHON=/scratch/y89/mj8805/miniforge/envs/astro/bin/python
 
 GRID_DIR=${BASE}/grid
 GRID_ZARR=${GRID_DIR}/parameter_grid.zarr
@@ -42,162 +41,38 @@ GRID_ZARR=${GRID_DIR}/parameter_grid.zarr
 SHARDS_DIR=${BASE}/shards
 MERGED_ZARR=${BASE}/synthesized_spectra.zarr
 
-TASK_FILE=${BASE}/tasks.txt
-LOCK_FILE=${BASE}/tasks.lock
-DONE_FILE=${BASE}/done.txt
-DONE_LOCK_FILE=${BASE}/done.lock
-PYTHON=/scratch/y89/mj8805/miniforge/envs/astro/bin/python
-N_SHARDS=100
+NEXT_SHARD=${BASE}/next_shard.txt
+LOCK_FILE=${BASE}/counter.lock
 
-# Node-local scratch base (PBS sets PBS_JOBFS on many systems).
+LOG_DIR=${BASE}/logs
+mkdir -p ${LOG_DIR}
+
+############################################
+# Node-local scratch
+############################################
+
 JOBFS_BASE=${PBS_JOBFS:-${TMPDIR:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}}
 
-# Mode:
-# - full: generate grid + synthesize a single output Zarr using multiprocessing
-# - sharded: generate grid + run many shard jobs concurrently (no PBS arrays required),
-#   then optionally merge shards
-MODE=sharded
-
-# If true, rebuild the shard task list at job start (recommended).
-RESET_TASKS=1
-
-mkdir -p ${BASE}
-mkdir -p ${GRID_DIR}
-mkdir -p ${SHARDS_DIR}
-mkdir -p ${BASE}/logs
-
-# Create tracking files early (prevents shard completion writes failing if the
-# directory isn't visible yet on the compute node).
-touch "${LOCK_FILE}" "${DONE_LOCK_FILE}" "${DONE_FILE}"
-
 ############################################
-# Validate pipeline config
+# Grid sanity check
 ############################################
 
-if [[ ! -f "${PIPELINE_CONFIG_SRC}" ]]; then
-  echo "ERROR: Missing ${PIPELINE_CONFIG_SRC}"
-  echo "Create it by copying ${REPO}/config_pipeline.example.json -> ${REPO}/config_pipeline.json and editing paths/outputs."
-  exit 1
-fi
-
-############################################
-# Create a job-specific pipeline config
-# - Keeps ALL outputs under ${BASE}
-# - Uses ${REPO} as project_root for Turbospectrum
-############################################
-
-# Export for the Python snippet (uses os.environ).
-export REPO PIPELINE_CONFIG_SRC PIPELINE_CONFIG_JOB GRID_ZARR SHARDS_DIR MERGED_ZARR
-
-${PYTHON} - <<'PY'
-import json, os
-
-repo = os.environ["REPO"]
-src = os.environ["PIPELINE_CONFIG_SRC"]
-dst = os.environ["PIPELINE_CONFIG_JOB"]
-grid_zarr = os.environ["GRID_ZARR"]
-shards_dir = os.environ["SHARDS_DIR"]
-merged = os.environ["MERGED_ZARR"]
-
-with open(src, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-
-cfg.setdefault("turbospectrum", {})
-cfg["turbospectrum"]["project_root"] = repo
-
-cfg.setdefault("outputs", {})
-cfg["outputs"]["grid_zarr"] = grid_zarr
-cfg["outputs"].setdefault("grid_csv", os.path.join(os.path.dirname(grid_zarr), "parameter_grid.csv"))
-cfg["outputs"]["spectra_zarr"] = merged
-cfg["outputs"]["spectra_shard_template"] = os.path.join(shards_dir, "spectra_shard_{shard_index}.zarr")
-
-os.makedirs(os.path.dirname(dst), exist_ok=True)
-with open(dst, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, indent=2, sort_keys=True)
-
-print("Wrote job pipeline config:", dst)
-PY
-
-if [[ ! -f "${PIPELINE_CONFIG_JOB}" ]]; then
-  echo "ERROR: Failed to create job pipeline config at ${PIPELINE_CONFIG_JOB}"
-  exit 1
-fi
-
-############################################
-# Ensure grid exists (generate once)
-############################################
-
-if [[ ! -d "${GRID_ZARR}" ]]; then
-  echo "Generating grid Zarr at ${GRID_ZARR}"
-  ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
-    --config "${PIPELINE_CONFIG_JOB}" \
-    --skip-synthesis
-fi
-
-# Validate grid row count and clamp shard count to avoid empty shards.
 ROW_COUNT=$(${PYTHON} - <<'PY'
 import os, zarr
-path = os.environ["GRID_ZARR"]
-root = zarr.open_group(path, mode="r")
+root = zarr.open_group(os.environ["GRID_ZARR"], mode="r")
 print(int(root["teff"].shape[0]))
 PY
 )
-echo "Grid row_count=${ROW_COUNT}"
-if [[ "${ROW_COUNT}" -le 0 ]]; then
-  echo "ERROR: Grid has 0 rows at ${GRID_ZARR}. Delete it and re-run."
-  exit 1
-fi
-if [[ "${N_SHARDS}" -gt "${ROW_COUNT}" ]]; then
-  echo "Clamping N_SHARDS=${N_SHARDS} -> ${ROW_COUNT} (cannot have more shards than rows)"
-  N_SHARDS=${ROW_COUNT}
-fi
+
+echo "Grid rows: ${ROW_COUNT}"
 
 ############################################
-# FULL mode: one job, multiprocessing, single output
+# Initialize atomic counter (ONLY once)
 ############################################
 
-if [[ "${MODE}" == "full" ]]; then
-  echo "Running FULL synthesis to ${MERGED_ZARR}"
-  ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
-    --config "${PIPELINE_CONFIG_JOB}" \
-    --skip-grid \
-    --synthesis-mode full \
-    --workers "${PBS_NCPUS:-32}" \
-    --scratch "${JOBFS_BASE}"
-  exit 0
-fi
-
-############################################
-# SHARDED mode: manual work queue (no PBS arrays)
-############################################
-
-# We run many shards concurrently. To avoid oversubscription, each shard is run
-# with workers=1. Increase SHARD_WORKERS only if you also reduce WORKER_PROCS.
-SHARD_WORKERS=1
-WORKER_PROCS=${PBS_NCPUS:-${PBS_NP:-32}}
-
-############################################
-# Create tasks
-############################################
-
-if [[ "${RESET_TASKS}" == "1" ]]; then
-  echo "Resetting task list for N_SHARDS=${N_SHARDS}"
-  rm -f "$TASK_FILE" "$DONE_FILE"
-  touch "${DONE_FILE}"
-fi
-
-if [[ ! -f "$TASK_FILE" ]]; then
-  echo "Generating task list..."
-  seq 0 $((N_SHARDS - 1)) > "$TASK_FILE"
-else
-  # If an old task list exists with out-of-range shards, regenerate it.
-  if awk -v max=$((N_SHARDS - 1)) '($1+0)>max{exit 42}' "$TASK_FILE"; then
-    :
-  else
-    echo "Task list contains shards >= N_SHARDS; regenerating."
-    rm -f "$TASK_FILE" "$DONE_FILE"
-    seq 0 $((N_SHARDS - 1)) > "$TASK_FILE"
-  fi
+if [[ ! -f "${NEXT_SHARD}" ]]; then
+    echo "Initializing shard counter"
+    echo 0 > "${NEXT_SHARD}"
 fi
 
 ############################################
@@ -206,11 +81,12 @@ fi
 
 WALLTIME_SECONDS=$((12*3600))
 START_TIME=$(date +%s)
-SAFETY_BUFFER=600   # stop 10 minutes early
+
+SAFETY_BUFFER=900      # stop 15 minutes early
+EST_RUNTIME=600       # expected shard runtime (tune later)
 
 time_left () {
-    now=$(date +%s)
-    echo $((WALLTIME_SECONDS - (now - START_TIME)))
+    echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
 }
 
 ############################################
@@ -224,132 +100,138 @@ worker() {
 
     while true; do
 
-        if (( $(time_left) < SAFETY_BUFFER )); then
-            echo "Stopping safely before walltime."
+        #################################
+        # Walltime protection
+        #################################
+
+        if (( $(time_left) < EST_RUNTIME + SAFETY_BUFFER )); then
+            echo "Worker exiting safely before walltime."
             break
         fi
 
         #################################
-        # Atomic task grab
+        # Scratch precheck
         #################################
 
-        exec 9<>"$LOCK_FILE"
+        AVAILABLE=$(df -Pk "$JOBFS_DIR" | awk 'NR==2 {print $4}')
+
+        # Require ~5GB free
+        if (( AVAILABLE < 5*1024*1024 )); then
+            echo "Low scratch — sleeping."
+            sleep 60
+            continue
+        fi
+
+        #################################
+        # Atomic shard grab
+        #################################
+
+        exec 9<>${LOCK_FILE}
         flock -x 9
 
-        shard=$(head -n 1 "$TASK_FILE" || true)
-        sed -i '1d' "$TASK_FILE" || true
+        shard=$(cat ${NEXT_SHARD})
+        echo $((shard + 1)) > ${NEXT_SHARD}
 
         flock -u 9
         exec 9>&-
 
-        [[ -z "$shard" ]] && break
+        if (( shard >= ROW_COUNT )); then
+            break
+        fi
 
         OUT=${SHARDS_DIR}/spectra_shard_${shard}.zarr
+        TMP_OUT=${OUT}.tmp
 
-        # Skip if shard looks valid (supports zarr v2/v3 layouts).
+        #################################
+        # Skip valid shards
+        #################################
+
         if ${PYTHON} - <<PY >/dev/null 2>&1
-import zarr, os, numpy as np
+import zarr
 root = zarr.open_group(r"${OUT}", mode="r")
 assert "flux" in root and "wavelength" in root
-flux = root["flux"]
-assert flux.ndim == 2 and flux.shape[0] > 0 and flux.shape[1] == root["wavelength"].shape[0]
 PY
         then
             continue
         fi
 
         #################################
-        # Retry loop
+        # Retry with jitter
         #################################
 
         for attempt in {1..3}; do
 
-            $PYTHON ${REPO}/scripts/pipeline_from_config.py \
-              --config "${PIPELINE_CONFIG_JOB}" \
+            START=$(date +%s)
+
+            ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
+              --config "${BASE}/config_pipeline.${PBS_JOBID}.json" \
               --skip-grid \
               --synthesis-mode sharded \
               --shard-index "$shard" \
-              --shard-count "$N_SHARDS" \
-              --workers "$SHARD_WORKERS" \
+              --shard-count "${ROW_COUNT}" \
+              --workers 1 \
               --scratch "$JOBFS_DIR" \
-              > "${BASE}/logs/shard_${shard}.log" 2>&1
+              --output "$TMP_OUT" \
+              > "${LOG_DIR}/shard_${shard}.log" 2>&1 || true
 
-            # Validate shard output (must contain flux metadata).
+            #################################
+            # Validate (pipeline does atomic rename: TMP_OUT -> OUT)
+            #################################
+
             if ${PYTHON} - <<PY >/dev/null 2>&1
-import zarr, os, numpy as np
+import zarr
 root = zarr.open_group(r"${OUT}", mode="r")
-assert "flux" in root and "wavelength" in root and "status" in root
-flux = root["flux"]
-assert flux.ndim == 2 and flux.shape[0] > 0 and flux.shape[1] == root["wavelength"].shape[0]
+assert "flux" in root and "wavelength" in root and root["flux"].shape[0] > 0
 PY
             then
-              break
+                END=$(date +%s)
+                echo "runtime_seconds=$((END-START))" >> "${LOG_DIR}/shard_${shard}.log"
+                break
             fi
 
-            echo "Shard $shard produced incomplete output; removing and retrying." >> "${BASE}/logs/shard_${shard}.log"
-            rm -rf "$OUT"
+            rm -rf "$TMP_OUT" "$OUT"
 
-            echo "Retry $attempt for shard $shard"
-            sleep 5
+            sleep $(( (RANDOM % 10) + attempt * 15 ))
         done
-
-        if ${PYTHON} - <<PY >/dev/null 2>&1
-import zarr, os, numpy as np
-root = zarr.open_group(r"${OUT}", mode="r")
-assert "flux" in root and "wavelength" in root and "status" in root
-flux = root["flux"]
-assert flux.ndim == 2 and flux.shape[0] > 0 and flux.shape[1] == root["wavelength"].shape[0]
-PY
-        then
-          # Record completion under a dedicated lock (Lustre/NFS append races).
-          mkdir -p "$(dirname "$DONE_FILE")"
-          exec 8<>"$DONE_LOCK_FILE"
-          flock -x 8
-          echo "$shard" >> "$DONE_FILE"
-          flock -u 8
-          exec 8>&-
-        else
-          echo "FAILED shard $shard (see ${BASE}/logs/shard_${shard}.log)" >> "${BASE}/logs/failures.log"
-        fi
     done
 }
 
 export -f worker
-export BASE TASK_FILE LOCK_FILE DONE_FILE DONE_LOCK_FILE START_TIME WALLTIME_SECONDS SAFETY_BUFFER
+export BASE NEXT_SHARD LOCK_FILE ROW_COUNT LOG_DIR REPO PYTHON PBS_JOBID JOBFS_BASE
 
 ############################################
-# Launch workers
+# Launch workers (start conservative!)
 ############################################
 
-echo "Launching ${WORKER_PROCS} workers (each shard workers=${SHARD_WORKERS})..."
+WORKERS=16   # start lower; increase after pilot
 
-for ((i=0;i<WORKER_PROCS;i++)); do
+echo "Launching ${WORKERS} workers..."
+
+for ((i=0;i<WORKERS;i++)); do
     worker &
 done
 
 wait
 
 ############################################
-# Progress summary
+# Auto-resubmit if shards remain
 ############################################
 
-TOTAL=$(wc -l < $TASK_FILE 2>/dev/null || echo 0)
-DONE=$(wc -l < $DONE_FILE 2>/dev/null || echo 0)
+CURRENT=$(cat ${NEXT_SHARD})
 
-echo "Completed shards: $DONE"
-echo "Remaining shards: $TOTAL"
+if (( CURRENT < ROW_COUNT )); then
+    echo "Shards remaining ($CURRENT / $ROW_COUNT). Resubmitting..."
 
-############################################
-# Merge shards
-############################################
+    qsub $0
 
-if [[ "$DONE" -gt 0 ]]; then
-  echo "Merging shards into ${MERGED_ZARR}"
-  ${PYTHON} ${REPO}/scripts/merge_spectra_shards.py \
-    --shard-dir "${SHARDS_DIR}" \
-    --grid-zarr "${GRID_ZARR}" \
-    --output-zarr "${MERGED_ZARR}" \
-    > "${BASE}/logs/merge.log" 2>&1 || true
-  echo "Merge log: ${BASE}/logs/merge.log"
+else
+    echo "All shards completed."
+
+    echo "Merging shards..."
+
+    ${PYTHON} ${REPO}/scripts/merge_spectra_shards.py \
+        --shard-dir "${SHARDS_DIR}" \
+        --grid-zarr "${GRID_ZARR}" \
+        --output-zarr "${MERGED_ZARR}" \
+        > "${LOG_DIR}/merge.log" 2>&1 || true
 fi
-

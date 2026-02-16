@@ -54,6 +54,21 @@
         
         "mu_angles": [],
         "_mu_angles_note": "List of mu angles (cos(theta)) for intensity calculations. If empty and calculate_intensity=true, uses default 12 Gauss-Radau points. Maximum 30 points.",
+
+        "mu_sampling": {
+            "_note": [
+                "Optional: for intensity runs, sample mu points from the Turbospectrum output file and store them in Zarr outputs.",
+                "mode='random' samples from the mu-points header in the .spec file (after filtering by [min,max]).",
+                "reduce='first' keeps one mu; reduce='mean' averages across the sampled mus.",
+                "seed makes selection deterministic per row index."
+            ],
+            "mode": "none",
+            "count": 1,
+            "seed": 0,
+            "min": 0.0,
+            "max": 1.0,
+            "reduce": "first"
+        },
         
         "mu_points_file": "",
         "_mu_points_file_note": "File containing mu points (alternative to mu_angles). Format: first line is number of points, subsequent lines are mu values",

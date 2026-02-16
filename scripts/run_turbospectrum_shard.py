@@ -10,6 +10,7 @@ import sys
 import time
 import copy
 import re
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -295,7 +296,26 @@ def _synthesis_task(batch):
         mu_selected_index = -1
         if os.path.exists(spec_path):
             try:
-                data = np.loadtxt(spec_path)
+                # Fail fast on empty files (Turbospectrum can produce a 0-byte output on failure).
+                try:
+                    if os.path.getsize(spec_path) == 0:
+                        raise ValueError("Spectrum file is empty (0 bytes)")
+                except OSError:
+                    pass
+
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("error", message=r"loadtxt: input contained no data.*")
+                    data = np.loadtxt(spec_path)
+
+                if data.size == 0:
+                    raise ValueError("Spectrum file contains no numeric data")
+                if data.ndim != 2 or data.shape[1] < 2:
+                    raise ValueError(f"Unexpected spectrum shape {getattr(data, 'shape', None)}")
+
+                # Validate wavelength point count matches what the grid requested.
+                expected_n = int(round((cfg.lambda_max - cfg.lambda_min) / cfg.lambda_step)) + 1
+                if data.shape[0] != expected_n:
+                    raise ValueError(f"Unexpected wavelength count {data.shape[0]} (expected {expected_n})")
 
                 if cfg.calculate_intensity:
                     # Optional: pick random mu points from the Intensity file and use
@@ -402,7 +422,13 @@ def main():
 
     parser.add_argument("--grid-zarr", required=True)
     parser.add_argument("--config", required=True)
-    parser.add_argument("--output-zarr", required=True)
+    parser.add_argument("--output-zarr", required=True, help="Final output Zarr path (after atomic rename if --output-tmp used)")
+    parser.add_argument(
+        "--output-tmp",
+        default=None,
+        metavar="TMP_PATH",
+        help="Temp path for atomic write: write to TMP_PATH, then rename to --output-zarr. Prevents partial shards.",
+    )
 
     parser.add_argument("--shard-index", type=int, required=True)
     parser.add_argument("--shard-count", type=int, required=True)
@@ -448,10 +474,25 @@ def main():
     )
 
     ############################################
+    # Output paths (atomic write via temp + rename)
+    ############################################
+
+    final_path = os.path.abspath(args.output_zarr)
+    if args.output_tmp:
+        write_path = os.path.abspath(args.output_tmp)
+        if os.path.dirname(write_path) != os.path.dirname(final_path):
+            logger.warning(
+                "output-tmp and output-zarr should be on same filesystem for atomic rename; "
+                "cross-FS rename will copy+delete (not atomic)"
+            )
+    else:
+        write_path = final_path
+
+    ############################################
     # Idempotency
     ############################################
 
-    if os.path.exists(args.output_zarr):
+    if os.path.exists(final_path):
         logger.warning("Shard output already exists — skipping.")
         return
 
@@ -544,7 +585,7 @@ def main():
                 npts = int(round((lam_max0 - lam_min0) / lam_step0)) + 1
                 wavelengths = lam_min0 + lam_step0 * np.arange(npts, dtype=np.float64)
 
-        root = _open_root_for_write(args.output_zarr)
+        root = _open_root_for_write(write_path)
         _write_array(root, "wavelength", wavelengths, chunks=min(65536, max(1, wavelengths.size)))
         _write_array(root, "global_index", np.asarray([], dtype=np.int64), chunks=1)
         _write_array(
@@ -570,7 +611,11 @@ def main():
             "grid": os.path.abspath(args.grid_zarr),
             "note": "empty shard (no rows assigned)",
         })
-        logger.info("Empty shard written to %s", args.output_zarr)
+        if write_path != final_path:
+            os.rename(write_path, final_path)
+            logger.info("Empty shard written to %s (atomic rename)", final_path)
+        else:
+            logger.info("Empty shard written to %s", final_path)
         return
 
     ############################################
@@ -700,11 +745,11 @@ def main():
 
     logger.info(
         "Writing shard output: %s (rows=%d wl=%d)",
-        args.output_zarr,
+        write_path if write_path != final_path else final_path,
         len(indices),
         len(wavelengths),
     )
-    root = _open_root_for_write(args.output_zarr)
+    root = _open_root_for_write(write_path)
 
     _write_array(root, "wavelength", wavelengths, chunks=min(65536, max(1, wavelengths.size)))
     _write_array(root, "global_index", indices.astype(np.int64), chunks=max(1, min(2048, len(indices))))
@@ -744,7 +789,11 @@ def main():
         "mu_sampling": json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
     })
 
-    logger.info("Shard written to %s", args.output_zarr)
+    if write_path != final_path:
+        os.rename(write_path, final_path)
+        logger.info("Shard written to %s (atomic rename)", final_path)
+    else:
+        logger.info("Shard written to %s", final_path)
 
 
 if __name__ == "__main__":
