@@ -4,6 +4,7 @@
 #PBS -N turbospec
 #PBS -l ncpus=32
 #PBS -l mem=64GB
+#PBS -l jobfs=100GB
 #PBS -l walltime=12:00:00
 #PBS -j oe
 #PBS -M maja.jablonska@anu.edu.au
