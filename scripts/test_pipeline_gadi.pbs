@@ -25,7 +25,8 @@ export VECLIB_MAXIMUM_THREADS=1
 ############################################
 
 PROJECT="${PROJECT:-mk27}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
 SMOKE_SAMPLES="${SMOKE_SAMPLES:-8}"
 SMOKE_WORKERS="${SMOKE_WORKERS:-1}"
@@ -33,11 +34,55 @@ SMOKE_LAM_MIN="${SMOKE_LAM_MIN:-5000}"
 SMOKE_LAM_MAX="${SMOKE_LAM_MAX:-5005}"
 SMOKE_LAM_STEP="${SMOKE_LAM_STEP:-0.5}"
 
+# Prevent mixed-prefix Python startup failures on Gadi login/compute environments.
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+
+activate_mamba() {
+  if [[ -n "${MAMBA_EXE:-}" && -x "${MAMBA_EXE}" ]]; then
+    eval "$("${MAMBA_EXE}" shell hook --shell bash)"
+  elif command -v mamba >/dev/null 2>&1; then
+    eval "$(mamba shell hook --shell bash)"
+  elif [[ -f "${HOME}/miniforge/etc/profile.d/conda.sh" ]]; then
+    # Fallback for installations where mamba hook is unavailable.
+    source "${HOME}/miniforge/etc/profile.d/conda.sh"
+  else
+    return 1
+  fi
+
+  if command -v mamba >/dev/null 2>&1; then
+    mamba activate "${MAMBA_ENV_NAME}"
+  elif command -v conda >/dev/null 2>&1; then
+    conda activate "${MAMBA_ENV_NAME}"
+  else
+    return 1
+  fi
+}
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if activate_mamba; then
+    :
+  else
+    echo "[gadi-smoke] WARN: could not activate mamba env '${MAMBA_ENV_NAME}', falling back to PATH python." >&2
+  fi
+
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    echo "[gadi-smoke] ERROR: no python executable found after env setup." >&2
+    exit 1
+  fi
+fi
+
 RUN_ROOT="/scratch/${PROJECT}/${USER}/turbospec_smoke/${PBS_JOBID}"
 
 echo "[gadi-smoke] repo=${PBS_O_WORKDIR}"
 echo "[gadi-smoke] run_root=${RUN_ROOT}"
 echo "[gadi-smoke] python=${PYTHON_BIN}"
+echo "[gadi-smoke] mamba_env=${MAMBA_ENV_NAME}"
+echo "[gadi-smoke] conda_prefix=${CONDA_PREFIX:-<unset>}"
 echo "[gadi-smoke] config=${CONFIG_PATH}"
 
 mkdir -p "${RUN_ROOT}"
