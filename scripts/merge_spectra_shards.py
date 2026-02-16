@@ -8,14 +8,16 @@ Each shard must contain:
 - `wavelength` (1D)
 - `global_index` (1D int, mapping shard rows -> original grid rows)
 - `flux` (2D: shard_rows x wavelength_points)
-- `continuum` (2D)
 - `status` (1D)
 - `message` (1D)
 
-The merger writes a single output Zarr with shape:
+The merger writes a schema-compliant synthesis Zarr matching DATA_SCHEMA.md:
 - flux: (row_count, wavelength_points)
-- continuum: (row_count, wavelength_points)
-and fills missing rows with NaN / "missing".
+- wavelength: (wavelength_points,)
+- params: (row_count, n_params)
+- param_names: (n_params,)
+- model_id: (row_count,)
+- physics_hash/schema_version scalars
 """
 
 from __future__ import annotations
@@ -23,6 +25,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+import time
+import hashlib
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -112,22 +118,118 @@ def _infer_row_count_from_shards(shards: Sequence[str]) -> int:
     return max_idx + 1
 
 
-def _write_vlen_utf8(root, name: str, values: Sequence[str], chunks: int, compression_kwargs: Mapping[str, Any]):
+def _write_string_scalar(root, name: str, value: str, compression_kwargs: Mapping[str, Any]) -> None:
     import zarr.codecs as zc  # type: ignore
     from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
 
-    arr = root.create_array(
-        name,
-        shape=(len(values),),
-        dtype=VariableLengthUTF8(),
-        serializer=zc.VLenUTF8Codec(),
-        chunks=min(chunks, len(values)) if len(values) else 1,
-        **compression_kwargs,
-    )
-    arr[:] = list(values)
+    try:
+        arr = root.create_array(
+            name,
+            shape=(),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+            **compression_kwargs,
+        )
+        arr[...] = str(value)
+    except Exception:
+        arr = root.create_array(
+            name,
+            shape=(1,),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+            chunks=1,
+            **compression_kwargs,
+        )
+        arr[0] = str(value)
+
+
+def _write_fixed_string_scalar(root, name: str, value: str, min_width: int, compression_kwargs: Mapping[str, Any]) -> None:
+    sval = str(value)
+    width = max(int(min_width), len(sval), 1)
+    try:
+        arr = root.create_array(
+            name,
+            shape=(),
+            dtype=f"<U{width}",
+            **compression_kwargs,
+        )
+        arr[...] = sval
+    except Exception:
+        _write_string_scalar(root, name, sval, compression_kwargs=compression_kwargs)
+
+
+def _to_u32_param_names(values: Sequence[str]) -> np.ndarray:
+    names = [str(v) for v in values]
+    too_long = [n for n in names if len(n) > 32]
+    if too_long:
+        raise ValueError(
+            "param_names entries must be <= 32 characters for DATA_SCHEMA.md U32 storage; "
+            f"offending values: {too_long[:3]}"
+        )
+    return np.asarray(names, dtype="<U32")
+
+
+def _to_float32(values: np.ndarray) -> np.ndarray:
+    out = np.full(len(values), np.nan, dtype=np.float32)
+    for i, v in enumerate(values.tolist()):
+        try:
+            out[i] = np.float32(float(v))
+        except Exception:
+            s = str(v).strip().lower()
+            if s.startswith("t"):
+                s = s[1:]
+            try:
+                out[i] = np.float32(float(s))
+            except Exception:
+                out[i] = np.nan
+    return out
+
+
+def _build_params_matrix(columns: Mapping[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
+    params_by_name: Dict[str, np.ndarray] = {}
+
+    for name in ("teff", "logg", "feh"):
+        if name in columns:
+            params_by_name[name] = _to_float32(np.asarray(columns[name]))
+
+    if "turb" in columns:
+        params_by_name["vmicro"] = _to_float32(np.asarray(columns["turb"]))
+    elif "turbvel" in columns:
+        params_by_name["vmicro"] = _to_float32(np.asarray(columns["turbvel"]))
+    elif "t_value" in columns:
+        params_by_name["vmicro"] = _to_float32(np.asarray(columns["t_value"]))
+
+    for name in ("a", "c", "n", "o", "r", "s"):
+        if name in columns:
+            params_by_name[name] = _to_float32(np.asarray(columns[name]))
+
+    param_names = [n for n in candidate_order if n in params_by_name]
+    if not param_names:
+        raise ValueError("Could not construct params matrix from merged metadata")
+    params = np.column_stack([params_by_name[n] for n in param_names]).astype(np.float32, copy=False)
+    return params, np.asarray(param_names, dtype=object)
+
+
+def _compute_model_ids(params: np.ndarray) -> np.ndarray:
+    ids = np.zeros(params.shape[0], dtype=np.uint64)
+    for i in range(params.shape[0]):
+        row = np.nan_to_num(params[i].astype(np.float32, copy=False), nan=9.96921e36, posinf=3.4e38, neginf=-3.4e38)
+        digest = hashlib.sha256(row.astype("<f4", copy=False).tobytes()).digest()
+        ids[i] = np.uint64(int.from_bytes(digest[:8], "big", signed=False))
+    return ids
+
+
+def _git_commit(project_root: str) -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_root, stderr=subprocess.DEVNULL, timeout=3)
+        return out.decode("utf-8").strip()
+    except Exception:
+        return "unknown"
 
 
 def main() -> None:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-zarr", required=True, help="Consolidated output Zarr path")
     parser.add_argument("--grid-zarr", default=None, help="Optional original grid Zarr to determine total row_count")
@@ -137,6 +239,11 @@ def main() -> None:
 
     parser.add_argument("--chunk-rows", type=int, default=32, help="Chunking along the sample dimension")
     parser.add_argument("--compressor", default=None, help="JSON string describing compressor options (cname, clevel, shuffle)")
+    parser.add_argument("--schema-version", default="1.0.0", help="DATA_SCHEMA.md schema version")
+    parser.add_argument("--physics-hash", default=None, help="Optional override for physics hash")
+    parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
+    parser.add_argument("--generator", default="turbospectrum_nlte.merge", help="Generator string for metadata")
+    parser.add_argument("--flux-definition", default="continuum_normalized", help="Flux definition metadata")
     args = parser.parse_args()
 
     shards = _list_shards(args.shard, args.shard_dir)
@@ -158,8 +265,8 @@ def main() -> None:
 
     # Read wavelength from first shard and validate all shards match.
     first = _open_shard(shards[0])
-    _require_arrays(first, ["wavelength", "flux", "continuum", "global_index", "status", "message"])
-    wavelengths = np.asarray(first["wavelength"][:], dtype=np.float64)
+    _require_arrays(first, ["wavelength", "flux", "global_index", "status", "message"])
+    wavelengths = np.asarray(first["wavelength"][:], dtype=np.float32)
     wl_count = int(wavelengths.size)
     if wl_count <= 0:
         raise ValueError("Shard wavelength array is empty")
@@ -167,32 +274,38 @@ def main() -> None:
     for p in shards[1:]:
         root = _open_shard(p)
         _require_arrays(root, ["wavelength"])
-        other = np.asarray(root["wavelength"][:], dtype=np.float64)
+        other = np.asarray(root["wavelength"][:], dtype=np.float32)
         if other.shape != wavelengths.shape or not np.allclose(other, wavelengths):
             raise ValueError(f"Wavelength mismatch between shards: {shards[0]} vs {p}")
 
-    # Create output store and datasets.
+    # Create output store and base datasets.
     store = _zarr_store(out_path)
     root_out = zarr.group(store=store, overwrite=True, zarr_format=3)
     chunk_shape = (min(int(args.chunk_rows), row_count), wl_count)
     root_out.create_array("wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
     flux_out = root_out.create_array("flux", shape=(row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
-    cont_out = root_out.create_array("continuum", shape=(row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
 
     # Initialize to NaNs for missing rows.
     flux_out[:] = np.nan
-    cont_out[:] = np.nan
 
     statuses = ["missing"] * row_count
     messages = [""] * row_count
 
-    # Optional: merge any metadata columns present in shards (e.g. teff/logg/feh, etc.).
-    # We'll lazily create arrays in output when we see them in the first shard.
-    merged_columns: Dict[str, Any] = {}
+    # Collect parameter metadata columns for schema-compliant params matrix.
+    param_candidate_cols = ["teff", "logg", "feh", "turb", "turbvel", "t_value", "a", "c", "n", "o", "r", "s"]
+    merged_meta: Dict[str, np.ndarray] = {}
+    merged_meta_is_str: Dict[str, bool] = {}
+    for name in param_candidate_cols:
+        if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"}:
+            merged_meta[name] = np.full(row_count, np.nan, dtype=np.float32)
+            merged_meta_is_str[name] = False
+        else:
+            merged_meta[name] = np.array([""] * row_count, dtype=object)
+            merged_meta_is_str[name] = True
 
     for p in shards:
         shard = _open_shard(p)
-        _require_arrays(shard, ["global_index", "flux", "continuum", "status", "message"])
+        _require_arrays(shard, ["global_index", "flux", "status", "message"])
         gidx = np.asarray(shard["global_index"][:], dtype=np.int64)
         if gidx.size == 0:
             continue
@@ -201,19 +314,16 @@ def main() -> None:
             raise ValueError(f"Shard {p} contains global_index beyond row_count={row_count}")
 
         flux = np.asarray(shard["flux"][:], dtype=np.float32)
-        cont = np.asarray(shard["continuum"][:], dtype=np.float32)
-        if flux.shape != (gidx.size, wl_count) or cont.shape != (gidx.size, wl_count):
-            raise ValueError(f"Shard {p} has unexpected flux/continuum shape: {flux.shape} / {cont.shape}")
+        if flux.shape != (gidx.size, wl_count):
+            raise ValueError(f"Shard {p} has unexpected flux shape: {flux.shape}")
 
         # Write shard rows into the consolidated arrays.
         # Use oindex when available for correct fancy indexing.
         try:
             flux_out.oindex[gidx, :] = flux  # type: ignore[attr-defined]
-            cont_out.oindex[gidx, :] = cont  # type: ignore[attr-defined]
         except Exception:
             for i, gi in enumerate(gidx.tolist()):
                 flux_out[int(gi), :] = flux[i]
-                cont_out[int(gi), :] = cont[i]
 
         shard_status = [str(x) for x in np.asarray(shard["status"][:]).tolist()]
         shard_msg = [str(x) for x in np.asarray(shard["message"][:]).tolist()]
@@ -221,49 +331,152 @@ def main() -> None:
             statuses[int(gi)] = shard_status[i]
             messages[int(gi)] = shard_msg[i]
 
-        # Merge metadata columns if present (best-effort).
-        for name in shard.keys():
-            if name in {"wavelength", "global_index", "flux", "continuum", "status", "message"}:
+        # Merge metadata columns if present.
+        for name in param_candidate_cols:
+            if name not in shard:
                 continue
-            arr = shard[name]
+            arr = np.asarray(shard[name][:])
             if arr.shape[0] != gidx.size:
                 continue
-            # Create output array lazily.
-            if name not in merged_columns:
-                # Determine dtype handling.
-                data0 = np.asarray(arr[:])
-                if data0.dtype.kind in {"U", "S", "O"}:
-                    _write_vlen_utf8(root_out, name, [""] * row_count, chunks=int(args.chunk_rows), compression_kwargs=compression_kwargs)
-                    merged_columns[name] = root_out[name]
-                else:
-                    merged_columns[name] = root_out.create_array(
-                        name,
-                        shape=(row_count,),
-                        dtype=data0.dtype,
-                        chunks=min(int(args.chunk_rows), row_count),
-                        **compression_kwargs,
-                    )
-                    merged_columns[name][:] = np.nan if np.issubdtype(data0.dtype, np.floating) else 0
 
-            out_arr = merged_columns[name]
-            values = np.asarray(arr[:])
-            try:
-                out_arr.oindex[gidx] = values  # type: ignore[attr-defined]
-            except Exception:
+            if merged_meta_is_str[name]:
+                vals = np.asarray(arr).astype(str)
                 for i, gi in enumerate(gidx.tolist()):
-                    out_arr[int(gi)] = values[i]
+                    merged_meta[name][int(gi)] = vals[i]
+            else:
+                vals = _to_float32(np.asarray(arr))
+                for i, gi in enumerate(gidx.tolist()):
+                    merged_meta[name][int(gi)] = vals[i]
 
-    _write_vlen_utf8(root_out, "status", statuses, chunks=int(args.chunk_rows), compression_kwargs=compression_kwargs)
-    _write_vlen_utf8(root_out, "message", messages, chunks=int(args.chunk_rows), compression_kwargs=compression_kwargs)
+    # Build params matrix from original grid when available; otherwise fall back to merged shard metadata.
+    if args.grid_zarr:
+        grid_root = zarr.open_group(store=_zarr_store(os.path.abspath(args.grid_zarr)), mode="r")
+        grid_cols: Dict[str, np.ndarray] = {}
+        for name in ("teff", "logg", "feh", "a", "c", "n", "o", "r", "s"):
+            if name in grid_root:
+                grid_cols[name] = np.asarray(grid_root[name][:])
+        if "turbvel" in grid_root:
+            grid_cols["turb"] = np.asarray(grid_root["turbvel"][:])
+        elif "t_value" in grid_root:
+            grid_cols["turb"] = np.asarray(grid_root["t_value"][:])
+        params, param_names = _build_params_matrix(grid_cols)
+    else:
+        params_source: Dict[str, np.ndarray] = {}
+        for name in ("teff", "logg", "feh", "a", "c", "n", "o", "r", "s"):
+            if name in merged_meta:
+                params_source[name] = np.asarray(merged_meta[name])
+        if "turb" in merged_meta and any(str(x).strip() for x in merged_meta["turb"].tolist()):
+            params_source["turb"] = np.asarray(merged_meta["turb"])
+        elif "turbvel" in merged_meta and any(str(x).strip() for x in merged_meta["turbvel"].tolist()):
+            params_source["turb"] = np.asarray(merged_meta["turbvel"])
+        elif "t_value" in merged_meta and any(str(x).strip() for x in merged_meta["t_value"].tolist()):
+            params_source["turb"] = np.asarray(merged_meta["t_value"])
+        params, param_names = _build_params_matrix(params_source)
+
+    model_id = _compute_model_ids(params)
+
+    if args.physics_hash:
+        physics_hash = args.physics_hash
+    else:
+        payload = {
+            "grid_zarr": os.path.abspath(args.grid_zarr) if args.grid_zarr else "",
+            "shards": [os.path.abspath(p) for p in shards],
+            "schema_version": args.schema_version,
+        }
+        physics_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    param_name_list = [str(x) for x in param_names.tolist()]
+    param_names_u32 = _to_u32_param_names(param_name_list)
+    root_out.create_array(
+        "param_names",
+        data=param_names_u32,
+        chunks=(min(max(1, params.shape[1]), len(param_names_u32)) if len(param_names_u32) else 1,),
+        **compression_kwargs,
+    )
+    root_out.create_array(
+        "params",
+        data=params.astype(np.float32, copy=False),
+        chunks=(min(int(args.chunk_rows), row_count), params.shape[1]),
+        **compression_kwargs,
+    )
+    root_out.create_array(
+        "model_id",
+        data=model_id.astype(np.uint64, copy=False),
+        chunks=(min(int(args.chunk_rows), len(model_id)) if len(model_id) else 1,),
+        **compression_kwargs,
+    )
+    _write_fixed_string_scalar(root_out, "physics_hash", physics_hash, min_width=64, compression_kwargs=compression_kwargs)
+    _write_fixed_string_scalar(root_out, "schema_version", args.schema_version, min_width=16, compression_kwargs=compression_kwargs)
+
+    prov = root_out.create_group("provenance")
+    _write_string_scalar(
+        prov,
+        "canonical_config.yaml",
+        json.dumps({"grid_zarr": os.path.abspath(args.grid_zarr) if args.grid_zarr else "unknown", "physics_hash": physics_hash}, indent=2, sort_keys=True),
+        compression_kwargs=compression_kwargs,
+    )
+    _write_string_scalar(prov, "synthesis_config.yaml", "unknown", compression_kwargs=compression_kwargs)
+    _write_string_scalar(
+        prov,
+        "linelist_manifest.json",
+        json.dumps({"source": "unknown", "version": "unknown"}, indent=2, sort_keys=True),
+        compression_kwargs=compression_kwargs,
+    )
+    _write_string_scalar(
+        prov,
+        "atmosphere_manifest.json",
+        json.dumps({"source": "unknown", "version": "unknown"}, indent=2, sort_keys=True),
+        compression_kwargs=compression_kwargs,
+    )
+    _write_string_scalar(
+        prov,
+        "software_manifest.json",
+        json.dumps({"generator": args.generator, "git_commit": _git_commit(project_root), "python": sys.version.split()[0]}, indent=2, sort_keys=True),
+        compression_kwargs=compression_kwargs,
+    )
+    _write_string_scalar(
+        prov,
+        "environment.txt",
+        f"python={sys.version}\nOMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}\n",
+        compression_kwargs=compression_kwargs,
+    )
+
+    status_counts: Dict[str, int] = {}
+    for s in statuses:
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    param_units: Dict[str, str] = {}
+    for name in param_name_list:
+        if name == "teff":
+            param_units[name] = "K"
+        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"}:
+            param_units[name] = "dex"
+        elif name == "vmicro":
+            param_units[name] = "km/s"
+        else:
+            param_units[name] = ""
 
     root_out.attrs.update(
         {
-            "row_count": int(row_count),
-            "wavelength_count": int(wl_count),
+            "title": "SPICE Synthetic Spectral Grid",
+            "generator": args.generator,
+            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "flux_definition": args.flux_definition,
+            "wavelength_unit": "angstrom",
+            "flux_unit": "relative",
+            "parameter_units": param_units,
+            "physics_hash": physics_hash,
+            "git_commit": _git_commit(project_root),
+            "contact": args.contact,
+            "schema_version": args.schema_version,
+            "n_models": int(row_count),
+            "n_lambda": int(wl_count),
+            "n_params": int(params.shape[1]),
             "shards_merged": len(shards),
-            "shards": [os.path.abspath(p) for p in shards],
+            "status_counts": status_counts,
         }
     )
+
     print(f"Wrote merged spectra Zarr: {out_path}")
 
 

@@ -23,6 +23,54 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 
+# Prevent mixed-prefix Python startup failures on HPC nodes.
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+PYTHON_BIN="${PYTHON_BIN:-}"
+MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
+
+activate_mamba() {
+    if [[ -n "${MAMBA_EXE:-}" && -x "${MAMBA_EXE}" ]]; then
+        eval "$("${MAMBA_EXE}" shell hook --shell bash)"
+    elif command -v mamba >/dev/null 2>&1; then
+        eval "$(mamba shell hook --shell bash)"
+    elif [[ -f "${HOME}/miniforge/etc/profile.d/conda.sh" ]]; then
+        source "${HOME}/miniforge/etc/profile.d/conda.sh"
+    else
+        return 1
+    fi
+
+    if command -v mamba >/dev/null 2>&1; then
+        mamba activate "${MAMBA_ENV_NAME}"
+    elif command -v conda >/dev/null 2>&1; then
+        conda activate "${MAMBA_ENV_NAME}"
+    else
+        return 1
+    fi
+}
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if activate_mamba; then
+        :
+    else
+        echo "[turbospec] WARN: could not activate mamba env '${MAMBA_ENV_NAME}', falling back to PATH python." >&2
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    else
+        echo "[turbospec] ERROR: no python executable found after env setup." >&2
+        exit 1
+    fi
+fi
+
+PYTHON="${PYTHON_BIN}"
+echo "[turbospec] Python: ${PYTHON}"
+echo "[turbospec] Mamba env: ${MAMBA_ENV_NAME}"
+echo "[turbospec] Conda prefix: ${CONDA_PREFIX:-<unset>}"
+
 ############################################
 # Paths
 ############################################
@@ -32,8 +80,6 @@ USER_ID=$(whoami)
 
 BASE=/scratch/${PROJECT}/${USER_ID}/turbospec
 REPO=/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE
-
-PYTHON=/scratch/y89/mj8805/miniforge/envs/astro/bin/python
 
 GRID_DIR=${BASE}/grid
 GRID_ZARR=${GRID_DIR}/parameter_grid.zarr
