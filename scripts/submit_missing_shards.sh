@@ -12,6 +12,8 @@ Required:
 Optional:
   --expected-shards <N>     Total shard count. If omitted, inferred from grid Zarr row count.
   --max-array-size <N>      Max array tasks per qsub submission (default: 20).
+  --python-bin <path>       Python executable to use on compute nodes.
+  --mamba-env <name>        Conda/mamba env name to activate (default: astro).
   --shards-dir <path>       Override shard directory (default: <run-root>/outputs/shards).
   --grid-zarr <path>        Override grid Zarr (default: <run-root>/outputs/grids/parameter_grid.zarr).
   --config <path>           Synthesis config (default: configs/synthesis/config_sample_comprehensive.json).
@@ -32,6 +34,8 @@ PBS_SCRIPT="scripts/pbs_resume_missing_shards_array.pbs"
 MISSING_FILE=""
 MAX_ATTEMPTS="3"
 MAX_ARRAY_SIZE="20"
+PYTHON_BIN=""
+MAMBA_ENV_NAME="astro"
 QSUB_EXTRA=""
 DRY_RUN="0"
 
@@ -46,6 +50,8 @@ while [[ $# -gt 0 ]]; do
     --missing-file) MISSING_FILE="$2"; shift 2 ;;
     --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
     --max-array-size) MAX_ARRAY_SIZE="$2"; shift 2 ;;
+    --python-bin) PYTHON_BIN="$2"; shift 2 ;;
+    --mamba-env) MAMBA_ENV_NAME="$2"; shift 2 ;;
     --qsub-extra) QSUB_EXTRA="$2"; shift 2 ;;
     --dry-run) DRY_RUN="1"; shift 1 ;;
     -h|--help) usage; exit 0 ;;
@@ -137,7 +143,10 @@ while (( START < MISSING_COUNT )); do
 
   CHUNK_COUNT=$(( END - START + 1 ))
   ARRAY_RANGE="0-$((CHUNK_COUNT - 1))"
-  VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${CHUNK_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS}"
+  VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${CHUNK_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS},MAMBA_ENV_NAME=${MAMBA_ENV_NAME}"
+  if [[ -n "${PYTHON_BIN}" ]]; then
+    VARS="${VARS},PYTHON_BIN=${PYTHON_BIN}"
+  fi
 
   CMD=(
     qsub
