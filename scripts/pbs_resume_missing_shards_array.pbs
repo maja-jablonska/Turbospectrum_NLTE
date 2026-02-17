@@ -103,6 +103,20 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   fi
 fi
 
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "[resume-missing] ERROR: PYTHON_BIN is not executable: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+if ! "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import numpy
+import zarr
+PY
+then
+  echo "[resume-missing] ERROR: Python missing required packages (numpy,zarr): ${PYTHON_BIN}" >&2
+  echo "[resume-missing] Hint: submit with --python-bin \"\$(which python)\" from your working env." >&2
+  exit 1
+fi
+
 mkdir -p "${OUT_DIR}" "${RUN_ROOT}/logs/pbs" "logs/pbs" "${SCRATCH_BASE}" "${RUN_ROOT}/logs/shards_resume"
 
 TASK_ORDINAL="${PBS_ARRAY_INDEX:-0}"
