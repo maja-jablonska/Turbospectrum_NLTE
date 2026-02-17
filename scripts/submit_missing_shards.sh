@@ -108,6 +108,9 @@ if ! [[ "${MAX_ARRAY_SIZE}" =~ ^[0-9]+$ ]] || (( MAX_ARRAY_SIZE <= 0 )); then
   echo "ERROR: --max-array-size must be a positive integer, got '${MAX_ARRAY_SIZE}'." >&2
   exit 2
 fi
+if [[ -z "${PYTHON_BIN}" ]] && command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+fi
 
 python scripts/find_missing_shards.py \
   --shard-dir "${SHARDS_DIR}" \
