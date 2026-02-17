@@ -137,6 +137,7 @@ LOG_FILE="${RUN_ROOT}/logs/shards_resume/shard_${SHARD_INDEX}.log"
 mkdir -p "${SCRATCH}"
 
 echo "[resume-missing] job=${PBS_JOBID} task=${TASK_ORDINAL} shard=${SHARD_INDEX}" | tee -a "${LOG_FILE}"
+echo "[resume-missing] PYTHON_BIN(env)=${PYTHON_BIN}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] grid=${GRID_ZARR}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] config=${TS_CONFIG}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] output=${OUT}" | tee -a "${LOG_FILE}"
