@@ -63,6 +63,7 @@ SHARDS_DIR="${SHARDS_DIR:-${RUN_ROOT}/outputs/shards}"
 GRID_ZARR="${GRID_ZARR:-${RUN_ROOT}/outputs/grids/parameter_grid.zarr}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 PBS_LOG_DIR="${RUN_ROOT}/logs/pbs"
+CHUNK_DIR="${RUN_ROOT}/missing_shards_chunks"
 
 if [[ ! -d "${SHARDS_DIR}" ]]; then
   echo "ERROR: shard directory not found: ${SHARDS_DIR}" >&2
@@ -82,6 +83,8 @@ if [[ ! -f "${PBS_SCRIPT}" ]]; then
 fi
 
 mkdir -p "${PBS_LOG_DIR}"
+mkdir -p "${CHUNK_DIR}"
+rm -f "${CHUNK_DIR}"/missing_chunk_*.txt
 
 if [[ -z "${EXPECTED_SHARDS}" ]]; then
   EXPECTED_SHARDS="$(python - <<PY
@@ -122,14 +125,19 @@ fi
 
 START=0
 SUBMITTED=0
+CHUNK_ID=0
 while (( START < MISSING_COUNT )); do
   END=$(( START + MAX_ARRAY_SIZE - 1 ))
   if (( END >= MISSING_COUNT )); then
     END=$(( MISSING_COUNT - 1 ))
   fi
 
-  ARRAY_RANGE="${START}-${END}"
-  VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${MISSING_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS}"
+  CHUNK_FILE="${CHUNK_DIR}/missing_chunk_${CHUNK_ID}.txt"
+  sed -n "$((START + 1)),$((END + 1))p" "${MISSING_FILE}" > "${CHUNK_FILE}"
+
+  CHUNK_COUNT=$(( END - START + 1 ))
+  ARRAY_RANGE="0-$((CHUNK_COUNT - 1))"
+  VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${CHUNK_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS}"
 
   CMD=(
     qsub
@@ -146,7 +154,7 @@ while (( START < MISSING_COUNT )); do
   fi
   CMD+=("${PBS_SCRIPT}")
 
-  echo "Submit chunk: array ${ARRAY_RANGE}"
+  echo "Submit chunk ${CHUNK_ID}: array ${ARRAY_RANGE} from ${CHUNK_FILE}"
   printf '  %q' "${CMD[@]}"
   echo
 
@@ -157,6 +165,7 @@ while (( START < MISSING_COUNT )); do
   fi
 
   START=$(( END + 1 ))
+  CHUNK_ID=$(( CHUNK_ID + 1 ))
 done
 
 if [[ "${DRY_RUN}" == "1" ]]; then
