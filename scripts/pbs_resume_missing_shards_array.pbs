@@ -1,15 +1,10 @@
 #!/bin/bash
 #PBS -N ts-resume-missing
-#PBS -l ncpus=32
-#PBS -l mem=64gb
+#PBS -r y
+#PBS -l select=1:ncpus=32:mem=64gb
 #PBS -l walltime=12:00:00
 #PBS -l jobfs=100gb
-#PBS -l storage=scratch/mk27
 #PBS -j oe
-#PBS -q rsaa
-#PBS -P mk27
-#PBS -M maja.jablonska@anu.edu.au
-#PBS -m bae
 
 set -euo pipefail
 
