@@ -111,6 +111,23 @@ fi
 if [[ -z "${PYTHON_BIN}" ]] && command -v python >/dev/null 2>&1; then
   PYTHON_BIN="$(command -v python)"
 fi
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "ERROR: could not determine python. Activate env first or pass --python-bin <path>." >&2
+  exit 2
+fi
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "ERROR: --python-bin is not executable: ${PYTHON_BIN}" >&2
+  exit 2
+fi
+if ! "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import numpy
+import zarr
+PY
+then
+  echo "ERROR: selected python is missing required packages (numpy,zarr): ${PYTHON_BIN}" >&2
+  echo "Hint: activate your astro env, then rerun with --python-bin \"\$(which python)\"." >&2
+  exit 2
+fi
 
 python scripts/find_missing_shards.py \
   --shard-dir "${SHARDS_DIR}" \
@@ -127,6 +144,7 @@ echo "Missing shards: ${MISSING_COUNT}"
 echo "Max array size per submit: ${MAX_ARRAY_SIZE}"
 echo "Missing file: ${MISSING_FILE}"
 echo "PBS script: ${PBS_SCRIPT}"
+echo "Python bin: ${PYTHON_BIN}"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "Dry run enabled: printing chunked qsub commands."
