@@ -1,7 +1,14 @@
 #!/bin/bash
 #PBS -N ts-resume-missing
-#PBS -l select=1:ncpus=32:mem=64gb
+#PBS -l ncpus=32
+#PBS -l mem=64gb
 #PBS -l walltime=12:00:00
+#PBS -l jobfs=100gb
+#PBS -l storage=scratch/mk27
+#PBS -j oe
+#PBS -M maja.jablonska@anu.edu.au
+#PBS -m bae
+
 # PBS array range is set at submit time, e.g. -J 0-30
 #PBS -o logs/pbs/ts-resume-missing.${PBS_JOBID}.out
 #PBS -e logs/pbs/ts-resume-missing.${PBS_JOBID}.err
