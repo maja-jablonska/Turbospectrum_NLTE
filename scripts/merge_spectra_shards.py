@@ -340,7 +340,8 @@ def main() -> None:
                 continue
 
             if merged_meta_is_str[name]:
-                vals = np.asarray(arr).astype(str)
+                # NumPy 2 may use StringDType, which can fail on astype(str).
+                vals = [str(x) for x in np.asarray(arr).tolist()]
                 for i, gi in enumerate(gidx.tolist()):
                     merged_meta[name][int(gi)] = vals[i]
             else:
