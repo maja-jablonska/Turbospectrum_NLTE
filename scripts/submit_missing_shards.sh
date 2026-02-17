@@ -148,14 +148,26 @@ while (( START < MISSING_COUNT )); do
     VARS="${VARS},PYTHON_BIN=${PYTHON_BIN}"
   fi
 
-  CMD=(
-    qsub
-    -r y
-    -J "${ARRAY_RANGE}"
-    -v "${VARS}"
-    -o "${PBS_LOG_DIR}/"
-    -e "${PBS_LOG_DIR}/"
-  )
+  if (( CHUNK_COUNT == 1 )); then
+    CMD=(
+      qsub
+      -r y
+      -v "${VARS}"
+      -o "${PBS_LOG_DIR}/"
+      -e "${PBS_LOG_DIR}/"
+    )
+    DESC="single task from ${CHUNK_FILE}"
+  else
+    CMD=(
+      qsub
+      -r y
+      -J "${ARRAY_RANGE}"
+      -v "${VARS}"
+      -o "${PBS_LOG_DIR}/"
+      -e "${PBS_LOG_DIR}/"
+    )
+    DESC="array ${ARRAY_RANGE} from ${CHUNK_FILE}"
+  fi
   if [[ -n "${QSUB_EXTRA}" ]]; then
     # shellcheck disable=SC2206
     EXTRA_ARGS=(${QSUB_EXTRA})
@@ -163,7 +175,7 @@ while (( START < MISSING_COUNT )); do
   fi
   CMD+=("${PBS_SCRIPT}")
 
-  echo "Submit chunk ${CHUNK_ID}: array ${ARRAY_RANGE} from ${CHUNK_FILE}"
+  echo "Submit chunk ${CHUNK_ID}: ${DESC}"
   printf '  %q' "${CMD[@]}"
   echo
 
