@@ -6,6 +6,8 @@
 #PBS -l jobfs=100gb
 #PBS -l storage=scratch/mk27
 #PBS -j oe
+#PBS -q rsaa
+#PBS -P mk27
 #PBS -M maja.jablonska@anu.edu.au
 #PBS -m bae
 
