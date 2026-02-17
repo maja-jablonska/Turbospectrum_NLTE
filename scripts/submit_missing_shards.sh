@@ -109,6 +109,7 @@ VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR}
 
 CMD=(
   qsub
+  -r y
   -J "${ARRAY_RANGE}"
   -v "${VARS}"
   -o "${PBS_LOG_DIR}/"
