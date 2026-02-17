@@ -11,10 +11,6 @@
 #PBS -M maja.jablonska@anu.edu.au
 #PBS -m bae
 
-# PBS array range is set at submit time, e.g. -J 0-30
-#PBS -o logs/pbs/ts-resume-missing.${PBS_JOBID}.out
-#PBS -e logs/pbs/ts-resume-missing.${PBS_JOBID}.err
-
 set -euo pipefail
 
 cd "${PBS_O_WORKDIR}"
