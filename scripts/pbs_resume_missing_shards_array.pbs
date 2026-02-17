@@ -1,0 +1,165 @@
+#!/bin/bash
+#PBS -N ts-resume-missing
+#PBS -l select=1:ncpus=32:mem=64gb
+#PBS -l walltime=12:00:00
+# PBS array range is set at submit time, e.g. -J 0-30
+#PBS -o logs/pbs/ts-resume-missing.${PBS_JOBID}.out
+#PBS -e logs/pbs/ts-resume-missing.${PBS_JOBID}.err
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+############################################
+# Required inputs (via qsub -v ...)
+############################################
+
+MISSING_IDS_FILE="${MISSING_IDS_FILE:-}"
+SHARD_COUNT="${SHARD_COUNT:-}"
+
+if [[ -z "${MISSING_IDS_FILE}" ]]; then
+  echo "[resume-missing] ERROR: MISSING_IDS_FILE is required." >&2
+  exit 2
+fi
+if [[ -z "${SHARD_COUNT}" ]]; then
+  echo "[resume-missing] ERROR: SHARD_COUNT is required." >&2
+  exit 2
+fi
+if [[ ! -f "${MISSING_IDS_FILE}" ]]; then
+  echo "[resume-missing] ERROR: MISSING_IDS_FILE not found: ${MISSING_IDS_FILE}" >&2
+  exit 2
+fi
+
+############################################
+# User-overridable knobs
+############################################
+
+RUN_ROOT="${RUN_ROOT:-runs/local-dev}"
+GRID_ZARR="${GRID_ZARR:-${RUN_ROOT}/outputs/grids/parameter_grid.zarr}"
+TS_CONFIG="${TS_CONFIG:-configs/synthesis/config_sample_comprehensive.json}"
+OUT_DIR="${OUT_DIR:-${RUN_ROOT}/outputs/shards}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+SCRATCH_BASE="${TMPDIR:-/tmp/${USER}/pbs_${PBS_JOBID}}"
+
+############################################
+# Safe threading defaults
+############################################
+
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+# Prevent mixed-prefix startup failures.
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+
+activate_mamba() {
+  if [[ -n "${MAMBA_EXE:-}" && -x "${MAMBA_EXE}" ]]; then
+    eval "$("${MAMBA_EXE}" shell hook --shell bash)"
+  elif command -v mamba >/dev/null 2>&1; then
+    eval "$(mamba shell hook --shell bash)"
+  elif [[ -f "${HOME}/miniforge/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/miniforge/etc/profile.d/conda.sh"
+  else
+    return 1
+  fi
+
+  if command -v mamba >/dev/null 2>&1; then
+    mamba activate "${MAMBA_ENV_NAME}"
+  elif command -v conda >/dev/null 2>&1; then
+    conda activate "${MAMBA_ENV_NAME}"
+  else
+    return 1
+  fi
+}
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if activate_mamba; then
+    :
+  else
+    echo "[resume-missing] WARN: could not activate mamba env '${MAMBA_ENV_NAME}', falling back to PATH python." >&2
+  fi
+
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    echo "[resume-missing] ERROR: no python executable found." >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "${OUT_DIR}" "${RUN_ROOT}/logs/pbs" "logs/pbs" "${SCRATCH_BASE}" "${RUN_ROOT}/logs/shards_resume"
+
+TASK_ORDINAL="${PBS_ARRAY_INDEX:-0}"
+LINE_NO=$((TASK_ORDINAL + 1))
+SHARD_INDEX="$(sed -n "${LINE_NO}p" "${MISSING_IDS_FILE}" | tr -d '[:space:]')"
+if [[ -z "${SHARD_INDEX}" ]]; then
+  echo "[resume-missing] ERROR: no shard ID at line ${LINE_NO} in ${MISSING_IDS_FILE}" >&2
+  exit 2
+fi
+if ! [[ "${SHARD_INDEX}" =~ ^[0-9]+$ ]]; then
+  echo "[resume-missing] ERROR: invalid shard ID '${SHARD_INDEX}' at line ${LINE_NO}" >&2
+  exit 2
+fi
+
+OUT="${OUT_DIR}/spectra_shard_${SHARD_INDEX}.zarr"
+SCRATCH="${SCRATCH_BASE}/shard_${SHARD_INDEX}"
+LOG_FILE="${RUN_ROOT}/logs/shards_resume/shard_${SHARD_INDEX}.log"
+mkdir -p "${SCRATCH}"
+
+echo "[resume-missing] job=${PBS_JOBID} task=${TASK_ORDINAL} shard=${SHARD_INDEX}" | tee -a "${LOG_FILE}"
+echo "[resume-missing] grid=${GRID_ZARR}" | tee -a "${LOG_FILE}"
+echo "[resume-missing] config=${TS_CONFIG}" | tee -a "${LOG_FILE}"
+echo "[resume-missing] output=${OUT}" | tee -a "${LOG_FILE}"
+echo "[resume-missing] python=${PYTHON_BIN}" | tee -a "${LOG_FILE}"
+
+if "${PYTHON_BIN}" - <<PY >/dev/null 2>&1
+import zarr
+root = zarr.open_group(r"${OUT}", mode="r")
+assert "flux" in root and "wavelength" in root and root["flux"].shape[0] > 0
+PY
+then
+  echo "[resume-missing] shard ${SHARD_INDEX} already valid. Skipping." | tee -a "${LOG_FILE}"
+  exit 0
+fi
+
+for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+  TMP_OUT="${OUT}.tmp.${PBS_JOBID}.${attempt}"
+  rm -rf "${TMP_OUT}" || true
+  echo "[resume-missing] attempt ${attempt}/${MAX_ATTEMPTS}" | tee -a "${LOG_FILE}"
+
+  "${PYTHON_BIN}" scripts/run_turbospectrum_shard.py \
+    --grid-zarr "${GRID_ZARR}" \
+    --config "${TS_CONFIG}" \
+    --output-zarr "${TMP_OUT}" \
+    --shard-index "${SHARD_INDEX}" \
+    --shard-count "${SHARD_COUNT}" \
+    --workers "${PBS_NP:-32}" \
+    --scratch "${SCRATCH}" \
+    --log-level INFO \
+    >> "${LOG_FILE}" 2>&1 || true
+
+  if "${PYTHON_BIN}" - <<PY >/dev/null 2>&1
+import zarr
+root = zarr.open_group(r"${TMP_OUT}", mode="r")
+assert "flux" in root and "wavelength" in root and root["flux"].shape[0] > 0
+PY
+  then
+    rm -rf "${OUT}" || true
+    mv "${TMP_OUT}" "${OUT}"
+    echo "[resume-missing] shard ${SHARD_INDEX} succeeded on attempt ${attempt}" | tee -a "${LOG_FILE}"
+    exit 0
+  fi
+
+  rm -rf "${TMP_OUT}" || true
+  sleep $(( (RANDOM % 10) + attempt * 15 ))
+done
+
+echo "[resume-missing] ERROR: shard ${SHARD_INDEX} failed after ${MAX_ATTEMPTS} attempts." | tee -a "${LOG_FILE}"
+exit 1
