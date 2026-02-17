@@ -63,6 +63,7 @@ RUN_ROOT="$(cd "${RUN_ROOT}" && pwd)"
 SHARDS_DIR="${SHARDS_DIR:-${RUN_ROOT}/outputs/shards}"
 GRID_ZARR="${GRID_ZARR:-${RUN_ROOT}/outputs/grids/parameter_grid.zarr}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
+PBS_LOG_DIR="${RUN_ROOT}/logs/pbs"
 
 if [[ ! -d "${SHARDS_DIR}" ]]; then
   echo "ERROR: shard directory not found: ${SHARDS_DIR}" >&2
@@ -81,6 +82,8 @@ if [[ ! -f "${PBS_SCRIPT}" ]]; then
   exit 2
 fi
 
+mkdir -p "${PBS_LOG_DIR}"
+
 python scripts/find_missing_shards.py \
   --shard-dir "${SHARDS_DIR}" \
   --expected-shards "${EXPECTED_SHARDS}" \
@@ -95,7 +98,13 @@ fi
 ARRAY_RANGE="0-$((MISSING_COUNT - 1))"
 VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${MISSING_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS}"
 
-CMD=(qsub -J "${ARRAY_RANGE}" -v "${VARS}")
+CMD=(
+  qsub
+  -J "${ARRAY_RANGE}"
+  -v "${VARS}"
+  -o "${PBS_LOG_DIR}/"
+  -e "${PBS_LOG_DIR}/"
+)
 if [[ -n "${QSUB_EXTRA}" ]]; then
   # shellcheck disable=SC2206
   EXTRA_ARGS=(${QSUB_EXTRA})
