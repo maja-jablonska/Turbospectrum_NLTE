@@ -11,6 +11,7 @@ Required:
 
 Optional:
   --expected-shards <N>     Total shard count. If omitted, inferred from grid Zarr row count.
+  --max-array-size <N>      Max array tasks per qsub submission (default: 20).
   --shards-dir <path>       Override shard directory (default: <run-root>/outputs/shards).
   --grid-zarr <path>        Override grid Zarr (default: <run-root>/outputs/grids/parameter_grid.zarr).
   --config <path>           Synthesis config (default: configs/synthesis/config_sample_comprehensive.json).
@@ -30,6 +31,7 @@ TS_CONFIG="configs/synthesis/config_sample_comprehensive.json"
 PBS_SCRIPT="scripts/pbs_resume_missing_shards_array.pbs"
 MISSING_FILE=""
 MAX_ATTEMPTS="3"
+MAX_ARRAY_SIZE="20"
 QSUB_EXTRA=""
 DRY_RUN="0"
 
@@ -43,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --pbs-script) PBS_SCRIPT="$2"; shift 2 ;;
     --missing-file) MISSING_FILE="$2"; shift 2 ;;
     --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
+    --max-array-size) MAX_ARRAY_SIZE="$2"; shift 2 ;;
     --qsub-extra) QSUB_EXTRA="$2"; shift 2 ;;
     --dry-run) DRY_RUN="1"; shift 1 ;;
     -h|--help) usage; exit 0 ;;
@@ -92,6 +95,10 @@ if ! [[ "${EXPECTED_SHARDS}" =~ ^[0-9]+$ ]] || (( EXPECTED_SHARDS <= 0 )); then
   echo "ERROR: --expected-shards must be a positive integer, got '${EXPECTED_SHARDS}'." >&2
   exit 2
 fi
+if ! [[ "${MAX_ARRAY_SIZE}" =~ ^[0-9]+$ ]] || (( MAX_ARRAY_SIZE <= 0 )); then
+  echo "ERROR: --max-array-size must be a positive integer, got '${MAX_ARRAY_SIZE}'." >&2
+  exit 2
+fi
 
 python scripts/find_missing_shards.py \
   --shard-dir "${SHARDS_DIR}" \
@@ -104,36 +111,58 @@ if (( MISSING_COUNT == 0 )); then
   exit 0
 fi
 
-ARRAY_RANGE="0-$((MISSING_COUNT - 1))"
-VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${MISSING_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS}"
-
-CMD=(
-  qsub
-  -r y
-  -J "${ARRAY_RANGE}"
-  -v "${VARS}"
-  -o "${PBS_LOG_DIR}/"
-  -e "${PBS_LOG_DIR}/"
-)
-if [[ -n "${QSUB_EXTRA}" ]]; then
-  # shellcheck disable=SC2206
-  EXTRA_ARGS=(${QSUB_EXTRA})
-  CMD+=("${EXTRA_ARGS[@]}")
-fi
-CMD+=("${PBS_SCRIPT}")
-
 echo "Missing shards: ${MISSING_COUNT}"
-echo "Array range: ${ARRAY_RANGE}"
+echo "Max array size per submit: ${MAX_ARRAY_SIZE}"
 echo "Missing file: ${MISSING_FILE}"
-echo "Submit command:"
-printf '  %q' "${CMD[@]}"
-echo
+echo "PBS script: ${PBS_SCRIPT}"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "Dry run enabled: printing chunked qsub commands."
+fi
+
+START=0
+SUBMITTED=0
+while (( START < MISSING_COUNT )); do
+  END=$(( START + MAX_ARRAY_SIZE - 1 ))
+  if (( END >= MISSING_COUNT )); then
+    END=$(( MISSING_COUNT - 1 ))
+  fi
+
+  ARRAY_RANGE="${START}-${END}"
+  VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${MISSING_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS}"
+
+  CMD=(
+    qsub
+    -r y
+    -J "${ARRAY_RANGE}"
+    -v "${VARS}"
+    -o "${PBS_LOG_DIR}/"
+    -e "${PBS_LOG_DIR}/"
+  )
+  if [[ -n "${QSUB_EXTRA}" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA_ARGS=(${QSUB_EXTRA})
+    CMD+=("${EXTRA_ARGS[@]}")
+  fi
+  CMD+=("${PBS_SCRIPT}")
+
+  echo "Submit chunk: array ${ARRAY_RANGE}"
+  printf '  %q' "${CMD[@]}"
+  echo
+
+  if [[ "${DRY_RUN}" != "1" ]]; then
+    JOB_SUBMIT_OUT="$("${CMD[@]}")"
+    echo "Submitted: ${JOB_SUBMIT_OUT}"
+    SUBMITTED=$((SUBMITTED + 1))
+  fi
+
+  START=$(( END + 1 ))
+done
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
-JOB_SUBMIT_OUT="$("${CMD[@]}")"
-echo "Submitted: ${JOB_SUBMIT_OUT}"
+echo "Submitted chunks: ${SUBMITTED}"
 echo "PBS logs: ${PBS_LOG_DIR}"
 echo "Per-shard resume logs: ${RUN_ROOT}/logs/shards_resume"
