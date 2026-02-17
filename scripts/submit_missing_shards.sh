@@ -4,13 +4,13 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/submit_missing_shards.sh --run-root <path> --expected-shards <N> [options]
+  scripts/submit_missing_shards.sh --run-root <path> [options]
 
 Required:
   --run-root <path>         Run root (contains outputs/shards and outputs/grids).
-  --expected-shards <N>     Total shard count (e.g. 1000).
 
 Optional:
+  --expected-shards <N>     Total shard count. If omitted, inferred from grid Zarr row count.
   --shards-dir <path>       Override shard directory (default: <run-root>/outputs/shards).
   --grid-zarr <path>        Override grid Zarr (default: <run-root>/outputs/grids/parameter_grid.zarr).
   --config <path>           Synthesis config (default: configs/synthesis/config_sample_comprehensive.json).
@@ -50,12 +50,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${RUN_ROOT}" || -z "${EXPECTED_SHARDS}" ]]; then
+if [[ -z "${RUN_ROOT}" ]]; then
   usage
-  exit 2
-fi
-if ! [[ "${EXPECTED_SHARDS}" =~ ^[0-9]+$ ]] || (( EXPECTED_SHARDS <= 0 )); then
-  echo "ERROR: --expected-shards must be a positive integer." >&2
   exit 2
 fi
 
@@ -83,6 +79,19 @@ if [[ ! -f "${PBS_SCRIPT}" ]]; then
 fi
 
 mkdir -p "${PBS_LOG_DIR}"
+
+if [[ -z "${EXPECTED_SHARDS}" ]]; then
+  EXPECTED_SHARDS="$(python - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
+print(int(root["teff"].shape[0]))
+PY
+)"
+fi
+if ! [[ "${EXPECTED_SHARDS}" =~ ^[0-9]+$ ]] || (( EXPECTED_SHARDS <= 0 )); then
+  echo "ERROR: --expected-shards must be a positive integer, got '${EXPECTED_SHARDS}'." >&2
+  exit 2
+fi
 
 python scripts/find_missing_shards.py \
   --shard-dir "${SHARDS_DIR}" \
@@ -123,4 +132,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
-"${CMD[@]}"
+JOB_SUBMIT_OUT="$("${CMD[@]}")"
+echo "Submitted: ${JOB_SUBMIT_OUT}"
+echo "PBS logs: ${PBS_LOG_DIR}"
+echo "Per-shard resume logs: ${RUN_ROOT}/logs/shards_resume"

@@ -19,11 +19,15 @@ cd "${PBS_O_WORKDIR}"
 # Required inputs (via qsub -v ...)
 ############################################
 
-MISSING_IDS_FILE="${MISSING_IDS_FILE:-}"
+RUN_ROOT="${RUN_ROOT:-runs/local-dev}"
+MISSING_IDS_FILE="${MISSING_IDS_FILE:-${MISSING_FILE:-}}"
 SHARD_COUNT="${SHARD_COUNT:-}"
 
+if [[ -z "${MISSING_IDS_FILE}" && -f "${RUN_ROOT}/missing_shards.txt" ]]; then
+  MISSING_IDS_FILE="${RUN_ROOT}/missing_shards.txt"
+fi
 if [[ -z "${MISSING_IDS_FILE}" ]]; then
-  echo "[resume-missing] ERROR: MISSING_IDS_FILE is required." >&2
+  echo "[resume-missing] ERROR: missing ID file not set. Pass MISSING_IDS_FILE (or MISSING_FILE), or create ${RUN_ROOT}/missing_shards.txt." >&2
   exit 2
 fi
 if [[ -z "${SHARD_COUNT}" ]]; then
@@ -39,7 +43,6 @@ fi
 # User-overridable knobs
 ############################################
 
-RUN_ROOT="${RUN_ROOT:-runs/local-dev}"
 GRID_ZARR="${GRID_ZARR:-${RUN_ROOT}/outputs/grids/parameter_grid.zarr}"
 TS_CONFIG="${TS_CONFIG:-configs/synthesis/config_sample_comprehensive.json}"
 OUT_DIR="${OUT_DIR:-${RUN_ROOT}/outputs/shards}"
