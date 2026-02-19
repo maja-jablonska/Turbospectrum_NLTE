@@ -30,7 +30,7 @@ import time
 import hashlib
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple
 
 import numpy as np
 import zarr
@@ -228,6 +228,66 @@ def _git_commit(project_root: str) -> str:
         return "unknown"
 
 
+def _stable_numeric_digest(values: np.ndarray, dtype: str) -> str:
+    arr = np.asarray(values).astype(dtype, copy=False)
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = np.nan_to_num(arr, nan=9.96921e36, posinf=3.4e38, neginf=-3.4e38)
+    return hashlib.sha256(np.ascontiguousarray(arr).tobytes()).hexdigest()
+
+
+def _collect_unique_strings(values: np.ndarray) -> List[str]:
+    unique = {str(v).strip() for v in np.asarray(values).tolist()}
+    return sorted(v for v in unique if v)
+
+
+def _physics_relevant_grid_attrs(attrs: Mapping[str, Any]) -> Dict[str, str]:
+    tokens = (
+        "physics",
+        "hash",
+        "linelist",
+        "line",
+        "atmos",
+        "opacity",
+        "nlte",
+        "lte",
+        "abund",
+        "config",
+        "commit",
+        "version",
+        "turb",
+    )
+    out: Dict[str, str] = {}
+    for key, value in attrs.items():
+        key_s = str(key)
+        if any(t in key_s.lower() for t in tokens):
+            out[key_s] = str(value)
+    return out
+
+
+def _compute_merge_physics_hash(
+    *,
+    wavelengths: np.ndarray,
+    params: np.ndarray,
+    param_names: Sequence[str],
+    output_mode_values: Sequence[str],
+    calculation_mode_values: Sequence[str],
+    mu_sampling_values: Sequence[str],
+    grid_attrs: Mapping[str, Any],
+) -> tuple[str, Dict[str, Any]]:
+    payload: Dict[str, Any] = {
+        "hash_basis": "merge-physics-v1",
+        "wavelength_hash": _stable_numeric_digest(wavelengths, dtype="<f8"),
+        "params_hash": _stable_numeric_digest(params, dtype="<f4"),
+        "param_names": [str(v) for v in param_names],
+        "output_mode_values": [str(v) for v in output_mode_values],
+        "calculation_mode_values": [str(v) for v in calculation_mode_values],
+        "mu_sampling_values": [str(v) for v in mu_sampling_values],
+        "grid_attrs": _physics_relevant_grid_attrs(grid_attrs),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), payload
+
+
 def main() -> None:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     parser = argparse.ArgumentParser(description=__doc__)
@@ -278,6 +338,67 @@ def main() -> None:
         if other.shape != wavelengths.shape or not np.allclose(other, wavelengths):
             raise ValueError(f"Wavelength mismatch between shards: {shards[0]} vs {p}")
 
+    # Open grid once for metadata/params if provided.
+    grid_root = None
+    grid_attrs: Dict[str, Any] = {}
+    if args.grid_zarr:
+        grid_root = zarr.open_group(store=_zarr_store(os.path.abspath(args.grid_zarr)), mode="r")
+        try:
+            grid_attrs = {str(k): grid_root.attrs[k] for k in grid_root.attrs.keys()}
+        except Exception:
+            try:
+                grid_attrs = {str(k): v for k, v in dict(grid_root.attrs).items()}
+            except Exception:
+                grid_attrs = {}
+
+    # Preflight integrity checks: every row must be written exactly once.
+    seen_rows = np.zeros(row_count, dtype=bool)
+    mu_sampling_values: Set[str] = set()
+    for p in shards:
+        shard = _open_shard(p)
+        _require_arrays(shard, ["global_index", "flux", "status", "message"])
+        gidx = np.asarray(shard["global_index"][:], dtype=np.int64)
+        if gidx.ndim != 1:
+            raise ValueError(f"Shard {p} global_index must be 1D, got shape={gidx.shape}")
+        if gidx.size == 0:
+            continue
+        if np.any(gidx < 0):
+            bad = gidx[gidx < 0][:10].tolist()
+            raise ValueError(f"Shard {p} contains negative global_index values: {bad}")
+        if int(gidx.max()) >= row_count:
+            raise ValueError(f"Shard {p} contains global_index beyond row_count={row_count}")
+
+        uniq, counts = np.unique(gidx, return_counts=True)
+        dup_within = uniq[counts > 1]
+        if dup_within.size:
+            raise ValueError(
+                f"Shard {p} contains duplicate global_index values within shard: "
+                f"{dup_within[:20].tolist()}"
+            )
+
+        overlap = uniq[seen_rows[uniq]]
+        if overlap.size:
+            raise ValueError(
+                f"Duplicate global_index encountered across shards while reading {p}: "
+                f"{overlap[:20].tolist()}"
+            )
+        seen_rows[uniq] = True
+
+        mu_sampling_attr = shard.attrs.get("mu_sampling")
+        if mu_sampling_attr is not None:
+            sval = str(mu_sampling_attr).strip()
+            if sval:
+                mu_sampling_values.add(sval)
+
+    missing_rows = np.flatnonzero(~seen_rows)
+    if missing_rows.size:
+        preview = missing_rows[:20].tolist()
+        suffix = " (truncated)" if missing_rows.size > 20 else ""
+        raise ValueError(
+            f"Merged dataset would be incomplete: missing {missing_rows.size} row(s), "
+            f"examples={preview}{suffix}"
+        )
+
     # Create output store and base datasets.
     store = _zarr_store(out_path)
     root_out = zarr.group(store=store, overwrite=True, zarr_format=3)
@@ -292,7 +413,22 @@ def main() -> None:
     messages = [""] * row_count
 
     # Collect parameter metadata columns for schema-compliant params matrix.
-    param_candidate_cols = ["teff", "logg", "feh", "turb", "turbvel", "t_value", "a", "c", "n", "o", "r", "s"]
+    param_candidate_cols = [
+        "teff",
+        "logg",
+        "feh",
+        "turb",
+        "turbvel",
+        "t_value",
+        "a",
+        "c",
+        "n",
+        "o",
+        "r",
+        "s",
+        "output_mode",
+        "calculation_mode",
+    ]
     merged_meta: Dict[str, np.ndarray] = {}
     merged_meta_is_str: Dict[str, bool] = {}
     for name in param_candidate_cols:
@@ -310,9 +446,6 @@ def main() -> None:
         if gidx.size == 0:
             continue
 
-        if int(gidx.max()) >= row_count:
-            raise ValueError(f"Shard {p} contains global_index beyond row_count={row_count}")
-
         flux = np.asarray(shard["flux"][:], dtype=np.float32)
         if flux.shape != (gidx.size, wl_count):
             raise ValueError(f"Shard {p} has unexpected flux shape: {flux.shape}")
@@ -327,6 +460,11 @@ def main() -> None:
 
         shard_status = [str(x) for x in np.asarray(shard["status"][:]).tolist()]
         shard_msg = [str(x) for x in np.asarray(shard["message"][:]).tolist()]
+        if len(shard_status) != gidx.size or len(shard_msg) != gidx.size:
+            raise ValueError(
+                f"Shard {p} has inconsistent status/message lengths: "
+                f"status={len(shard_status)} message={len(shard_msg)} rows={gidx.size}"
+            )
         for i, gi in enumerate(gidx.tolist()):
             statuses[int(gi)] = shard_status[i]
             messages[int(gi)] = shard_msg[i]
@@ -336,8 +474,11 @@ def main() -> None:
             if name not in shard:
                 continue
             arr = np.asarray(shard[name][:])
-            if arr.shape[0] != gidx.size:
-                continue
+            if arr.ndim != 1 or arr.shape[0] != gidx.size:
+                raise ValueError(
+                    f"Shard {p} metadata column '{name}' shape mismatch: "
+                    f"expected ({gidx.size},), got {arr.shape}"
+                )
 
             if merged_meta_is_str[name]:
                 # NumPy 2 may use StringDType, which can fail on astype(str).
@@ -349,9 +490,17 @@ def main() -> None:
                 for i, gi in enumerate(gidx.tolist()):
                     merged_meta[name][int(gi)] = vals[i]
 
+    missing_status_rows = [i for i, s in enumerate(statuses) if s == "missing"]
+    if missing_status_rows:
+        preview = missing_status_rows[:20]
+        suffix = " (truncated)" if len(missing_status_rows) > 20 else ""
+        raise ValueError(
+            f"Merged status vector is incomplete: {len(missing_status_rows)} row(s) still missing, "
+            f"examples={preview}{suffix}"
+        )
+
     # Build params matrix from original grid when available; otherwise fall back to merged shard metadata.
-    if args.grid_zarr:
-        grid_root = zarr.open_group(store=_zarr_store(os.path.abspath(args.grid_zarr)), mode="r")
+    if grid_root is not None:
         grid_cols: Dict[str, np.ndarray] = {}
         for name in ("teff", "logg", "feh", "a", "c", "n", "o", "r", "s"):
             if name in grid_root:
@@ -375,18 +524,32 @@ def main() -> None:
         params, param_names = _build_params_matrix(params_source)
 
     model_id = _compute_model_ids(params)
+    param_name_list = [str(x) for x in param_names.tolist()]
+
+    if grid_root is not None and "output_mode" in grid_root:
+        output_mode_values = _collect_unique_strings(np.asarray(grid_root["output_mode"][:]))
+    else:
+        output_mode_values = _collect_unique_strings(np.asarray(merged_meta["output_mode"]))
+
+    if grid_root is not None and "calculation_mode" in grid_root:
+        calculation_mode_values = _collect_unique_strings(np.asarray(grid_root["calculation_mode"][:]))
+    else:
+        calculation_mode_values = _collect_unique_strings(np.asarray(merged_meta["calculation_mode"]))
 
     if args.physics_hash:
         physics_hash = args.physics_hash
+        physics_payload: Dict[str, Any] = {"hash_basis": "cli-override", "physics_hash": physics_hash}
     else:
-        payload = {
-            "grid_zarr": os.path.abspath(args.grid_zarr) if args.grid_zarr else "",
-            "shards": [os.path.abspath(p) for p in shards],
-            "schema_version": args.schema_version,
-        }
-        physics_hash = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        physics_hash, physics_payload = _compute_merge_physics_hash(
+            wavelengths=wavelengths,
+            params=params,
+            param_names=param_name_list,
+            output_mode_values=output_mode_values,
+            calculation_mode_values=calculation_mode_values,
+            mu_sampling_values=sorted(mu_sampling_values),
+            grid_attrs=grid_attrs,
+        )
 
-    param_name_list = [str(x) for x in param_names.tolist()]
     param_names_u32 = _to_u32_param_names(param_name_list)
     root_out.create_array(
         "param_names",
@@ -413,7 +576,15 @@ def main() -> None:
     _write_string_scalar(
         prov,
         "canonical_config.yaml",
-        json.dumps({"grid_zarr": os.path.abspath(args.grid_zarr) if args.grid_zarr else "unknown", "physics_hash": physics_hash}, indent=2, sort_keys=True),
+        json.dumps(
+            {
+                "physics_hash": physics_hash,
+                "physics_hash_payload": physics_payload,
+                "grid_reference": os.path.abspath(args.grid_zarr) if args.grid_zarr else "unknown",
+            },
+            indent=2,
+            sort_keys=True,
+        ),
         compression_kwargs=compression_kwargs,
     )
     _write_string_scalar(prov, "synthesis_config.yaml", "unknown", compression_kwargs=compression_kwargs)
@@ -475,6 +646,9 @@ def main() -> None:
             "n_params": int(params.shape[1]),
             "shards_merged": len(shards),
             "status_counts": status_counts,
+            "output_mode_values": output_mode_values,
+            "calculation_mode_values": calculation_mode_values,
+            "mu_sampling_values": sorted(mu_sampling_values),
         }
     )
 
