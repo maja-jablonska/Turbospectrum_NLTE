@@ -92,22 +92,6 @@ mkdir -p "${PBS_LOG_DIR}"
 mkdir -p "${CHUNK_DIR}"
 rm -f "${CHUNK_DIR}"/missing_chunk_*.txt
 
-if [[ -z "${EXPECTED_SHARDS}" ]]; then
-  EXPECTED_SHARDS="$(python - <<PY
-import zarr
-root = zarr.open_group(r"${GRID_ZARR}", mode="r")
-print(int(root["teff"].shape[0]))
-PY
-)"
-fi
-if ! [[ "${EXPECTED_SHARDS}" =~ ^[0-9]+$ ]] || (( EXPECTED_SHARDS <= 0 )); then
-  echo "ERROR: --expected-shards must be a positive integer, got '${EXPECTED_SHARDS}'." >&2
-  exit 2
-fi
-if ! [[ "${MAX_ARRAY_SIZE}" =~ ^[0-9]+$ ]] || (( MAX_ARRAY_SIZE <= 0 )); then
-  echo "ERROR: --max-array-size must be a positive integer, got '${MAX_ARRAY_SIZE}'." >&2
-  exit 2
-fi
 if [[ -z "${PYTHON_BIN}" ]] && command -v python >/dev/null 2>&1; then
   PYTHON_BIN="$(command -v python)"
 fi
@@ -129,7 +113,24 @@ then
   exit 2
 fi
 
-python scripts/find_missing_shards.py \
+if [[ -z "${EXPECTED_SHARDS}" ]]; then
+  EXPECTED_SHARDS="$("${PYTHON_BIN}" - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
+print(int(root["teff"].shape[0]))
+PY
+)"
+fi
+if ! [[ "${EXPECTED_SHARDS}" =~ ^[0-9]+$ ]] || (( EXPECTED_SHARDS <= 0 )); then
+  echo "ERROR: --expected-shards must be a positive integer, got '${EXPECTED_SHARDS}'." >&2
+  exit 2
+fi
+if ! [[ "${MAX_ARRAY_SIZE}" =~ ^[0-9]+$ ]] || (( MAX_ARRAY_SIZE <= 0 )); then
+  echo "ERROR: --max-array-size must be a positive integer, got '${MAX_ARRAY_SIZE}'." >&2
+  exit 2
+fi
+
+"${PYTHON_BIN}" scripts/find_missing_shards.py \
   --shard-dir "${SHARDS_DIR}" \
   --expected-shards "${EXPECTED_SHARDS}" \
   --output "${MISSING_FILE}"
