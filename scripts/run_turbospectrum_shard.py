@@ -787,6 +787,19 @@ def main():
         "shard_count": args.shard_count,
         "grid": os.path.abspath(args.grid_zarr),
         "mu_sampling": json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
+        "linelist_path": str(getattr(config, "linelist_path", "")),
+        "linelist_files": json.dumps([str(x) for x in (getattr(config, "linelist_files", []) or [])], sort_keys=True),
+        "linelist_version": str(getattr(config, "linelist_version", "")),
+        "linelist_sha256": str(getattr(config, "linelist_sha256", "")),
+        "linelist_preprocessing": str(getattr(config, "linelist_preprocessing", "")),
+        "model_atmosphere_path": str(getattr(config, "model_atmosphere_path", "")),
+        "atmosphere_geometry": str(getattr(config, "atmosphere_geometry", "")),
+        "atmosphere_version": str(getattr(config, "atmosphere_version", "")),
+        "atmosphere_sha256": str(getattr(config, "atmosphere_sha256", "")),
+        "synthesis_code_version": str(getattr(config, "synthesis_code_version", "")),
+        "spice_version": str(getattr(config, "spice_version", "")),
+        "compiler": str(getattr(config, "compiler", "")),
+        "nlte": bool(getattr(config, "nlte", False)),
     })
 
     if write_path != final_path:

@@ -107,6 +107,22 @@
     "nlte": {
       "enabled": false,
       "nlte_info_file": ""
+    },
+
+    "provenance": {
+      "_note": [
+        "Populate these when available to avoid placeholder provenance values.",
+        "If left blank, scripts will still write manifests using best-effort runtime/file metadata."
+      ],
+      "linelist_version": "",
+      "linelist_sha256": "",
+      "linelist_preprocessing": "",
+      "atmosphere_geometry": "",
+      "atmosphere_version": "",
+      "atmosphere_sha256": "",
+      "synthesis_code_version": "",
+      "spice_version": "",
+      "environment_capture": "pip_freeze"
     }
   },
 

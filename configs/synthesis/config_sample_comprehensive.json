@@ -99,6 +99,28 @@
         "departure_binary": true,
         "_departure_binary_note": "Whether departure file is binary (true) or ASCII (false)"
     },
+
+    "provenance": {
+        "_note": "Optional metadata used to fully populate DATA_SCHEMA.md provenance manifests.",
+        "linelist_version": "",
+        "_linelist_version_note": "Version tag for the active linelist release (e.g. 6.1)",
+        "linelist_sha256": "",
+        "_linelist_sha256_note": "Checksum of the full linelist package; leave empty to auto-compute per-file checksums when possible",
+        "linelist_preprocessing": "",
+        "_linelist_preprocessing_note": "Brief description of filtering/normalization steps applied to the raw linelist",
+        "atmosphere_geometry": "",
+        "_atmosphere_geometry_note": "e.g. spherical or plane_parallel",
+        "atmosphere_version": "",
+        "_atmosphere_version_note": "Atmosphere grid version tag/release",
+        "atmosphere_sha256": "",
+        "_atmosphere_sha256_note": "Checksum for atmosphere bundle if available",
+        "synthesis_code_version": "",
+        "_synthesis_code_version_note": "Turbospectrum code version/build identifier",
+        "spice_version": "",
+        "_spice_version_note": "Pipeline/package version tag",
+        "environment_capture": "pip_freeze",
+        "_environment_capture_options": ["pip_freeze", "conda_env_export", "auto"]
+    },
     
     "model_atmosphere": {
         "marcs_file": true,
