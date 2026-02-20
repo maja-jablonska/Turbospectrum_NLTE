@@ -82,6 +82,17 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["nlte"] = nlte_cfg.get("enabled", False)
     flat["nlte_info_file"] = nlte_cfg.get("nlte_info_file", "")
 
+    provenance_cfg = cfg_data.get("provenance", {}) or {}
+    flat["linelist_version"] = provenance_cfg.get("linelist_version", "")
+    flat["linelist_sha256"] = provenance_cfg.get("linelist_sha256", "")
+    flat["linelist_preprocessing"] = provenance_cfg.get("linelist_preprocessing", "")
+    flat["atmosphere_geometry"] = provenance_cfg.get("atmosphere_geometry", "")
+    flat["atmosphere_version"] = provenance_cfg.get("atmosphere_version", "")
+    flat["atmosphere_sha256"] = provenance_cfg.get("atmosphere_sha256", "")
+    flat["synthesis_code_version"] = provenance_cfg.get("synthesis_code_version", "")
+    flat["spice_version"] = provenance_cfg.get("spice_version", "")
+    flat["environment_capture"] = provenance_cfg.get("environment_capture", "pip_freeze")
+
     # Grid points: accept either legacy [[teff, logg, feh, turb_str], ...]
     # or comprehensive objects [{teff, logg, feh, microturb_str}, ...]
     grid_points = cfg_data.get("grid_points", []) or []
@@ -148,6 +159,17 @@ class TurbospectrumConfig:
     lambda_max: float = 8000
     lambda_step: float = 0.1
     model_opac_dir: str = "COM/contopac"
+    # Optional provenance metadata used to populate DATA_SCHEMA.md manifests.
+    linelist_version: str = ""
+    linelist_sha256: str = ""
+    linelist_preprocessing: str = ""
+    atmosphere_geometry: str = ""
+    atmosphere_version: str = ""
+    atmosphere_sha256: str = ""
+    synthesis_code_version: str = ""
+    spice_version: str = ""
+    # Controls provenance environment capture; options: pip_freeze, conda_env_export, auto.
+    environment_capture: str = "pip_freeze"
 
     # Parallelization
     # If None, the script will try to detect the assigned CPUs from the environment

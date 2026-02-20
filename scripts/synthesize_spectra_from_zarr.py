@@ -255,6 +255,73 @@ def _git_commit(project_root: str) -> str:
         return "unknown"
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _resolve_linelist_paths(config: TurbospectrumConfig) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in (config.linelist_files or []):
+        raw = str(item).strip()
+        if not raw:
+            continue
+        path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(str(config.linelist_path), raw))
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _capture_environment_text(mode: str) -> str:
+    mode_norm = str(mode or "pip_freeze").strip().lower()
+    attempts: List[Tuple[List[str], str]] = []
+    if mode_norm in {"pip_freeze", "auto"}:
+        attempts.append(([sys.executable, "-m", "pip", "freeze"], "pip_freeze"))
+    if mode_norm in {"conda_env_export", "auto"}:
+        attempts.append((["conda", "env", "export"], "conda_env_export"))
+    if not attempts:
+        attempts.append(([sys.executable, "-m", "pip", "freeze"], "pip_freeze"))
+
+    errors: List[str] = []
+    for cmd, label in attempts:
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=30)
+            txt = out.decode("utf-8", errors="replace").strip()
+            if txt:
+                return txt
+            errors.append(f"{label}: command succeeded but returned empty output")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{label}: {exc}")
+
+    return "\n".join(
+        [
+            "# Environment capture fallback (failed to run pip/conda export)",
+            *[f"# {err}" for err in errors],
+            f"python={sys.version}",
+            f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}",
+            f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS', '')}",
+            f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '')}",
+            f"VECLIB_MAXIMUM_THREADS={os.environ.get('VECLIB_MAXIMUM_THREADS', '')}",
+        ]
+    )
+
+
+def _count_matching_files(root_path: str, suffix: str) -> int:
+    try:
+        total = 0
+        for _dirpath, _dirnames, filenames in os.walk(root_path):
+            total += sum(1 for fname in filenames if fname.lower().endswith(suffix.lower()))
+        return int(total)
+    except Exception:
+        return 0
+
+
 def _compute_physics_hash(config: TurbospectrumConfig, column_data: Mapping[str, np.ndarray]) -> str:
     def _uniq(name: str) -> List[str]:
         if name not in column_data:
@@ -266,8 +333,16 @@ def _compute_physics_hash(config: TurbospectrumConfig, column_data: Mapping[str,
         "nlte_default": bool(config.nlte),
         "linelist_path": str(config.linelist_path),
         "linelist_files": [str(x) for x in (config.linelist_files or [])],
+        "linelist_version": str(getattr(config, "linelist_version", "")),
+        "linelist_sha256": str(getattr(config, "linelist_sha256", "")),
+        "linelist_preprocessing": str(getattr(config, "linelist_preprocessing", "")),
         "model_atmosphere_path": str(config.model_atmosphere_path),
+        "atmosphere_geometry": str(getattr(config, "atmosphere_geometry", "")),
+        "atmosphere_version": str(getattr(config, "atmosphere_version", "")),
+        "atmosphere_sha256": str(getattr(config, "atmosphere_sha256", "")),
         "model_opac_dir": str(config.model_opac_dir),
+        "synthesis_code_version": str(getattr(config, "synthesis_code_version", "")),
+        "spice_version": str(getattr(config, "spice_version", "")),
         "mu_sampling": getattr(config, "mu_sampling", {}) or {},
         "wavelength": {
             "lam_min": _uniq("lam_min"),
@@ -736,37 +811,101 @@ def main() -> None:
     for s in statuses:
         status_counts[s] = status_counts.get(s, 0) + 1
 
+    linelist_files_abs = _resolve_linelist_paths(config)
+    linelist_files_manifest: List[Dict[str, Any]] = []
+    linelist_digest_tokens: List[str] = []
+    for path in linelist_files_abs:
+        entry: Dict[str, Any] = {"path": path, "exists": bool(os.path.isfile(path))}
+        if entry["exists"]:
+            try:
+                sha = _sha256_file(path)
+                entry["sha256"] = sha
+                entry["size_bytes"] = int(os.path.getsize(path))
+                linelist_digest_tokens.append(f"{path}:{sha}")
+            except Exception as exc:  # noqa: BLE001
+                entry["sha256_error"] = str(exc)
+        linelist_files_manifest.append(entry)
+    computed_linelist_sha = ""
+    if linelist_digest_tokens:
+        canonical_tokens = json.dumps(sorted(linelist_digest_tokens), separators=(",", ":"))
+        computed_linelist_sha = hashlib.sha256(canonical_tokens.encode("utf-8")).hexdigest()
+
+    atmosphere_path = os.path.abspath(str(config.model_atmosphere_path))
+    atmosphere_model_count = _count_matching_files(atmosphere_path, ".mod")
+    configured_atmosphere_sha = str(getattr(config, "atmosphere_sha256", "") or "").strip()
+    atmosphere_sha = configured_atmosphere_sha
+    if not atmosphere_sha and os.path.isfile(atmosphere_path):
+        try:
+            atmosphere_sha = _sha256_file(atmosphere_path)
+        except Exception:
+            atmosphere_sha = ""
+
+    linelist_version = str(getattr(config, "linelist_version", "") or "").strip()
+    linelist_sha = str(getattr(config, "linelist_sha256", "") or "").strip() or computed_linelist_sha or "not_recorded"
+    linelist_preprocessing = str(getattr(config, "linelist_preprocessing", "") or "").strip()
+    atmosphere_geometry = str(getattr(config, "atmosphere_geometry", "") or "").strip()
+    atmosphere_version = str(getattr(config, "atmosphere_version", "") or "").strip()
+    synthesis_code_version = str(getattr(config, "synthesis_code_version", "") or "").strip()
+    spice_version = str(getattr(config, "spice_version", "") or "").strip()
+    environment_capture = str(getattr(config, "environment_capture", "pip_freeze") or "pip_freeze")
+
+    canonical_config_payload = {
+        "physics_hash": physics_hash,
+        "linelist": {
+            "path": str(config.linelist_path),
+            "files": [str(x) for x in (config.linelist_files or [])],
+            "version": linelist_version or "not_recorded",
+            "sha256": linelist_sha,
+            "preprocessing": linelist_preprocessing or "not_recorded",
+        },
+        "atmospheres": {
+            "path": atmosphere_path,
+            "geometry": atmosphere_geometry or "not_recorded",
+            "version": atmosphere_version or "not_recorded",
+            "sha256": atmosphere_sha or "not_recorded",
+            "model_file_count": atmosphere_model_count,
+        },
+        "physics": {
+            "nlte": bool(config.nlte),
+            "mu_sampling": getattr(config, "mu_sampling", {}) or {},
+            "output_mode_values": sorted({str(x) for x in np.asarray(column_data.get("output_mode", [])).tolist()}) if "output_mode" in column_data else [],
+            "calculation_mode_values": sorted({str(x) for x in np.asarray(column_data.get("calculation_mode", [])).tolist()}) if "calculation_mode" in column_data else [],
+            "compiler": str(config.compiler),
+        },
+        "synthesis": {
+            "code": str(args.generator),
+            "version": synthesis_code_version or "not_recorded",
+            "spice_version": spice_version or "not_recorded",
+            "git_commit": git_commit,
+        },
+        "wavelength": {
+            "lam_min": sorted({str(x) for x in np.asarray(column_data["lam_min"]).tolist()}),
+            "lam_max": sorted({str(x) for x in np.asarray(column_data["lam_max"]).tolist()}),
+            "lam_step": sorted({str(x) for x in np.asarray(column_data["lam_step"]).tolist()}),
+        },
+    }
+
     provenance_payload = {
-        "canonical_config.yaml": json.dumps(
-            {
-                "physics_hash": physics_hash,
-                "linelist_files": [str(x) for x in (config.linelist_files or [])],
-                "model_atmosphere_path": str(config.model_atmosphere_path),
-                "nlte_default": bool(config.nlte),
-                "wavelength": {
-                    "lam_min": sorted({str(x) for x in np.asarray(column_data["lam_min"]).tolist()}),
-                    "lam_max": sorted({str(x) for x in np.asarray(column_data["lam_max"]).tolist()}),
-                    "lam_step": sorted({str(x) for x in np.asarray(column_data["lam_step"]).tolist()}),
-                },
-            },
-            sort_keys=True,
-            indent=2,
-        ),
+        "canonical_config.yaml": json.dumps(canonical_config_payload, sort_keys=True, indent=2),
         "synthesis_config.yaml": json.dumps(dataclasses.asdict(config), sort_keys=True, indent=2, default=str),
         "linelist_manifest.json": json.dumps(
             {
                 "source": str(config.linelist_path),
-                "version": "unknown",
-                "files": [str(x) for x in (config.linelist_files or [])],
+                "version": linelist_version or "not_recorded",
+                "sha256": linelist_sha,
+                "preprocessing": linelist_preprocessing or "not_recorded",
+                "files": linelist_files_manifest,
             },
             sort_keys=True,
             indent=2,
         ),
         "atmosphere_manifest.json": json.dumps(
             {
-                "path": str(config.model_atmosphere_path),
-                "geometry": "unknown",
-                "version": "unknown",
+                "path": atmosphere_path,
+                "geometry": atmosphere_geometry or "not_recorded",
+                "version": atmosphere_version or "not_recorded",
+                "sha256": atmosphere_sha or "not_recorded",
+                "model_file_count": atmosphere_model_count,
             },
             sort_keys=True,
             indent=2,
@@ -777,18 +916,13 @@ def main() -> None:
                 "git_commit": git_commit,
                 "python": sys.version.split()[0],
                 "compiler": str(config.compiler),
+                "synthesis_code_version": synthesis_code_version or "not_recorded",
+                "spice_version": spice_version or "not_recorded",
             },
             sort_keys=True,
             indent=2,
         ),
-        "environment.txt": "\n".join(
-            [
-                f"python={sys.version}",
-                f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}",
-                f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS', '')}",
-                f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '')}",
-            ]
-        ),
+        "environment.txt": _capture_environment_text(environment_capture),
     }
 
     _write_zarr_output(
