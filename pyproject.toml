@@ -1,0 +1,6 @@
+[tool.dg]
+directory_type = "project"
+
+[tool.dg.project]
+root_module = "dagster_orch"
+code_location_target_module = "dagster_orch.definitions"

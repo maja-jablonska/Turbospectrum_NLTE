@@ -35,6 +35,15 @@ from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple
 import numpy as np
 import zarr
 
+PROVENANCE_FILENAMES: Tuple[str, ...] = (
+    "canonical_config.yaml",
+    "synthesis_config.yaml",
+    "linelist_manifest.json",
+    "atmosphere_manifest.json",
+    "software_manifest.json",
+    "environment.txt",
+)
+
 
 def _zarr_store(path: str):
     if hasattr(zarr, "DirectoryStore"):
@@ -240,6 +249,101 @@ def _collect_unique_strings(values: np.ndarray) -> List[str]:
     return sorted(v for v in unique if v)
 
 
+def _collect_attrs(root) -> Dict[str, str]:
+    try:
+        return {str(k): str(root.attrs[k]) for k in root.attrs.keys()}
+    except Exception:
+        try:
+            return {str(k): str(v) for k, v in dict(root.attrs).items()}
+        except Exception:
+            return {}
+
+
+def _read_string_scalar_optional(root, name: str) -> str | None:
+    if name not in root:
+        return None
+    try:
+        arr = root[name]
+    except Exception:
+        return None
+
+    raw: Any = None
+    for reader in (
+        lambda a: a[...],
+        lambda a: a[:],
+        lambda a: a[0],
+    ):
+        try:
+            raw = reader(arr)
+            break
+        except Exception:
+            continue
+    if raw is None:
+        return None
+    if isinstance(raw, np.ndarray):
+        if raw.shape == ():
+            raw = raw.item()
+        elif raw.size:
+            raw = raw.reshape(-1)[0]
+        else:
+            return None
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", errors="ignore")
+    text = str(raw).strip()
+    return text or None
+
+
+def _meaningful_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() == "unknown":
+        return None
+    return text
+
+
+def _first_meaningful(values: Sequence[Any]) -> str | None:
+    for value in values:
+        text = _meaningful_text(value)
+        if text is not None:
+            return text
+    return None
+
+
+def _first_attr_value(attr_sources: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> str | None:
+    wanted = {str(k).lower() for k in keys}
+    for attrs in attr_sources:
+        for key in keys:
+            if key in attrs:
+                text = _meaningful_text(attrs[key])
+                if text is not None:
+                    return text
+        for key, value in attrs.items():
+            if str(key).lower() in wanted:
+                text = _meaningful_text(value)
+                if text is not None:
+                    return text
+    return None
+
+
+def _attrs_with_tokens(attr_sources: Sequence[Mapping[str, Any]], tokens: Sequence[str]) -> Dict[str, str]:
+    wanted = [str(t).lower() for t in tokens]
+    out: Dict[str, str] = {}
+    for attrs in attr_sources:
+        for key, value in attrs.items():
+            key_s = str(key)
+            if not any(tok in key_s.lower() for tok in wanted):
+                continue
+            text = _meaningful_text(value)
+            if text is None:
+                continue
+            if key_s not in out:
+                out[key_s] = text
+    return out
+
+
 def _physics_relevant_grid_attrs(attrs: Mapping[str, Any]) -> Dict[str, str]:
     tokens = (
         "physics",
@@ -288,6 +392,138 @@ def _compute_merge_physics_hash(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), payload
 
 
+def _build_merge_provenance_payload(
+    *,
+    shard_paths: Sequence[str],
+    grid_zarr: str | None,
+    args_generator: str,
+    chunk_rows: int,
+    compressor_cfg: Mapping[str, Any],
+    allow_missing: bool,
+    expected_models: int,
+    merged_models: int,
+    physics_hash: str,
+    physics_payload: Mapping[str, Any],
+    output_mode_values: Sequence[str],
+    calculation_mode_values: Sequence[str],
+    mu_sampling_values: Sequence[str],
+    grid_attrs: Mapping[str, Any],
+    grid_provenance: Mapping[str, str],
+    shard_attrs: Sequence[Mapping[str, str]],
+    shard_provenance: Mapping[str, Sequence[str]],
+    git_commit: str,
+) -> Dict[str, str]:
+    provenance: Dict[str, str] = {}
+
+    def _carry_forward(name: str) -> str | None:
+        values = []
+        if name in grid_provenance:
+            values.append(grid_provenance[name])
+        values.extend(shard_provenance.get(name, []))
+        return _first_meaningful(values)
+
+    attr_sources: List[Mapping[str, Any]] = [grid_attrs]
+    attr_sources.extend(shard_attrs)
+    grid_reference = os.path.abspath(grid_zarr) if grid_zarr else "not_provided"
+
+    canonical_payload = {
+        "physics_hash": physics_hash,
+        "physics_hash_payload": dict(physics_payload),
+        "grid_reference": grid_reference,
+        "source_shards": [os.path.abspath(p) for p in shard_paths],
+        "output_mode_values": [str(v) for v in output_mode_values],
+        "calculation_mode_values": [str(v) for v in calculation_mode_values],
+        "mu_sampling_values": [str(v) for v in mu_sampling_values],
+        "grid_physics_attrs": _physics_relevant_grid_attrs(grid_attrs),
+    }
+    synthesis_payload = {
+        "merge_tool": "scripts/merge_spectra_shards.py",
+        "generator": args_generator,
+        "grid_reference": grid_reference,
+        "source_shards": [os.path.abspath(p) for p in shard_paths],
+        "chunk_rows": int(chunk_rows),
+        "compressor": dict(compressor_cfg),
+        "allow_missing": bool(allow_missing),
+        "expected_models": int(expected_models),
+        "merged_models": int(merged_models),
+        "mu_sampling_values": [str(v) for v in mu_sampling_values],
+    }
+
+    linelist_source = _first_attr_value(
+        attr_sources,
+        keys=("linelist_path", "linelist_files", "linelist_file_path", "linelist"),
+    )
+    linelist_version = _first_attr_value(
+        attr_sources,
+        keys=("linelist_version", "line_version", "linelist_rev"),
+    )
+    linelist_manifest = {
+        "source": linelist_source or "not_recorded",
+        "version": linelist_version or "not_recorded",
+        "attrs": _attrs_with_tokens(attr_sources, tokens=("linelist", "line")),
+    }
+
+    atmosphere_source = _first_attr_value(
+        attr_sources,
+        keys=("model_atmosphere_path", "atmosphere_path", "atmosphere_grid", "atmosphere"),
+    )
+    atmosphere_geometry = _first_attr_value(attr_sources, keys=("geometry", "atmosphere_geometry"))
+    atmosphere_version = _first_attr_value(attr_sources, keys=("atmosphere_version", "model_version"))
+    atmosphere_manifest = {
+        "source": atmosphere_source or "not_recorded",
+        "geometry": atmosphere_geometry or "not_recorded",
+        "version": atmosphere_version or "not_recorded",
+        "attrs": _attrs_with_tokens(attr_sources, tokens=("atmos", "model")),
+    }
+
+    software_manifest = {
+        "generator": args_generator,
+        "git_commit": git_commit,
+        "python": sys.version.split()[0],
+        "compiler": _first_attr_value(attr_sources, keys=("compiler",)) or "not_recorded",
+        "nlte": _first_attr_value(attr_sources, keys=("nlte", "nlte_enabled")) or "not_recorded",
+        "attrs": _attrs_with_tokens(attr_sources, tokens=("version", "commit", "compiler", "software")),
+    }
+
+    environment_text = "\n".join(
+        [
+            f"python={sys.version}",
+            f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}",
+            f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS', '')}",
+            f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '')}",
+            f"VECLIB_MAXIMUM_THREADS={os.environ.get('VECLIB_MAXIMUM_THREADS', '')}",
+        ]
+    )
+
+    provenance["canonical_config.yaml"] = _carry_forward("canonical_config.yaml") or json.dumps(
+        canonical_payload,
+        indent=2,
+        sort_keys=True,
+    )
+    provenance["synthesis_config.yaml"] = _carry_forward("synthesis_config.yaml") or json.dumps(
+        synthesis_payload,
+        indent=2,
+        sort_keys=True,
+    )
+    provenance["linelist_manifest.json"] = _carry_forward("linelist_manifest.json") or json.dumps(
+        linelist_manifest,
+        indent=2,
+        sort_keys=True,
+    )
+    provenance["atmosphere_manifest.json"] = _carry_forward("atmosphere_manifest.json") or json.dumps(
+        atmosphere_manifest,
+        indent=2,
+        sort_keys=True,
+    )
+    provenance["software_manifest.json"] = _carry_forward("software_manifest.json") or json.dumps(
+        software_manifest,
+        indent=2,
+        sort_keys=True,
+    )
+    provenance["environment.txt"] = _carry_forward("environment.txt") or environment_text
+    return provenance
+
+
 def main() -> None:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     parser = argparse.ArgumentParser(description=__doc__)
@@ -304,6 +540,14 @@ def main() -> None:
     parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
     parser.add_argument("--generator", default="turbospectrum_nlte.merge", help="Generator string for metadata")
     parser.add_argument("--flux-definition", default="continuum_normalized", help="Flux definition metadata")
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help=(
+            "Allow partial merges when some shards are missing. "
+            "Output will contain only rows present in available shards."
+        ),
+    )
     args = parser.parse_args()
 
     shards = _list_shards(args.shard, args.shard_dir)
@@ -341,6 +585,7 @@ def main() -> None:
     # Open grid once for metadata/params if provided.
     grid_root = None
     grid_attrs: Dict[str, Any] = {}
+    grid_provenance: Dict[str, str] = {}
     if args.grid_zarr:
         grid_root = zarr.open_group(store=_zarr_store(os.path.abspath(args.grid_zarr)), mode="r")
         try:
@@ -350,13 +595,30 @@ def main() -> None:
                 grid_attrs = {str(k): v for k, v in dict(grid_root.attrs).items()}
             except Exception:
                 grid_attrs = {}
+        if "provenance" in grid_root:
+            grid_prov_group = grid_root["provenance"]
+            for name in PROVENANCE_FILENAMES:
+                value = _read_string_scalar_optional(grid_prov_group, name)
+                if value is not None:
+                    grid_provenance[name] = value
 
     # Preflight integrity checks: every row must be written exactly once.
     seen_rows = np.zeros(row_count, dtype=bool)
     mu_sampling_values: Set[str] = set()
+    shard_attr_snapshots: List[Dict[str, str]] = []
+    shard_provenance_candidates: Dict[str, List[str]] = {name: [] for name in PROVENANCE_FILENAMES}
     for p in shards:
         shard = _open_shard(p)
         _require_arrays(shard, ["global_index", "flux", "status", "message"])
+        shard_attrs = _collect_attrs(shard)
+        if shard_attrs:
+            shard_attr_snapshots.append(shard_attrs)
+        if "provenance" in shard:
+            shard_prov_group = shard["provenance"]
+            for name in PROVENANCE_FILENAMES:
+                value = _read_string_scalar_optional(shard_prov_group, name)
+                if value is not None:
+                    shard_provenance_candidates[name].append(value)
         gidx = np.asarray(shard["global_index"][:], dtype=np.int64)
         if gidx.ndim != 1:
             raise ValueError(f"Shard {p} global_index must be 1D, got shape={gidx.shape}")
@@ -392,25 +654,44 @@ def main() -> None:
 
     missing_rows = np.flatnonzero(~seen_rows)
     if missing_rows.size:
-        preview = missing_rows[:20].tolist()
-        suffix = " (truncated)" if missing_rows.size > 20 else ""
-        raise ValueError(
-            f"Merged dataset would be incomplete: missing {missing_rows.size} row(s), "
-            f"examples={preview}{suffix}"
+        if not args.allow_missing:
+            preview = missing_rows[:20].tolist()
+            suffix = " (truncated)" if missing_rows.size > 20 else ""
+            raise ValueError(
+                f"Merged dataset would be incomplete: missing {missing_rows.size} row(s), "
+                f"examples={preview}{suffix}"
+            )
+        print(
+            f"WARNING: partial merge enabled; omitting {missing_rows.size} missing row(s) "
+            f"from output."
         )
+
+    selected_global_indices = np.flatnonzero(seen_rows).astype(np.int64) if args.allow_missing else np.arange(row_count, dtype=np.int64)
+    out_row_count = int(selected_global_indices.size)
+    if out_row_count <= 0:
+        raise ValueError("No valid shard rows available to merge")
+
+    global_to_out = np.full(row_count, -1, dtype=np.int64)
+    global_to_out[selected_global_indices] = np.arange(out_row_count, dtype=np.int64)
 
     # Create output store and base datasets.
     store = _zarr_store(out_path)
     root_out = zarr.group(store=store, overwrite=True, zarr_format=3)
-    chunk_shape = (min(int(args.chunk_rows), row_count), wl_count)
+    chunk_shape = (min(int(args.chunk_rows), out_row_count), wl_count)
     root_out.create_array("wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
-    flux_out = root_out.create_array("flux", shape=(row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
+    root_out.create_array(
+        "global_index",
+        data=selected_global_indices.astype(np.int64, copy=False),
+        chunks=(min(int(args.chunk_rows), out_row_count),),
+        **compression_kwargs,
+    )
+    flux_out = root_out.create_array("flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
 
     # Initialize to NaNs for missing rows.
     flux_out[:] = np.nan
 
-    statuses = ["missing"] * row_count
-    messages = [""] * row_count
+    statuses = ["missing"] * out_row_count
+    messages = [""] * out_row_count
 
     # Collect parameter metadata columns for schema-compliant params matrix.
     param_candidate_cols = [
@@ -433,10 +714,10 @@ def main() -> None:
     merged_meta_is_str: Dict[str, bool] = {}
     for name in param_candidate_cols:
         if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"}:
-            merged_meta[name] = np.full(row_count, np.nan, dtype=np.float32)
+            merged_meta[name] = np.full(out_row_count, np.nan, dtype=np.float32)
             merged_meta_is_str[name] = False
         else:
-            merged_meta[name] = np.array([""] * row_count, dtype=object)
+            merged_meta[name] = np.array([""] * out_row_count, dtype=object)
             merged_meta_is_str[name] = True
 
     for p in shards:
@@ -450,13 +731,18 @@ def main() -> None:
         if flux.shape != (gidx.size, wl_count):
             raise ValueError(f"Shard {p} has unexpected flux shape: {flux.shape}")
 
+        local_idx = global_to_out[gidx]
+        if np.any(local_idx < 0):
+            bad = gidx[local_idx < 0][:20].tolist()
+            raise ValueError(f"Shard {p} maps to rows excluded from partial merge: {bad}")
+
         # Write shard rows into the consolidated arrays.
         # Use oindex when available for correct fancy indexing.
         try:
-            flux_out.oindex[gidx, :] = flux  # type: ignore[attr-defined]
+            flux_out.oindex[local_idx, :] = flux  # type: ignore[attr-defined]
         except Exception:
-            for i, gi in enumerate(gidx.tolist()):
-                flux_out[int(gi), :] = flux[i]
+            for i, li in enumerate(local_idx.tolist()):
+                flux_out[int(li), :] = flux[i]
 
         shard_status = [str(x) for x in np.asarray(shard["status"][:]).tolist()]
         shard_msg = [str(x) for x in np.asarray(shard["message"][:]).tolist()]
@@ -465,9 +751,9 @@ def main() -> None:
                 f"Shard {p} has inconsistent status/message lengths: "
                 f"status={len(shard_status)} message={len(shard_msg)} rows={gidx.size}"
             )
-        for i, gi in enumerate(gidx.tolist()):
-            statuses[int(gi)] = shard_status[i]
-            messages[int(gi)] = shard_msg[i]
+        for i, li in enumerate(local_idx.tolist()):
+            statuses[int(li)] = shard_status[i]
+            messages[int(li)] = shard_msg[i]
 
         # Merge metadata columns if present.
         for name in param_candidate_cols:
@@ -483,12 +769,12 @@ def main() -> None:
             if merged_meta_is_str[name]:
                 # NumPy 2 may use StringDType, which can fail on astype(str).
                 vals = [str(x) for x in np.asarray(arr).tolist()]
-                for i, gi in enumerate(gidx.tolist()):
-                    merged_meta[name][int(gi)] = vals[i]
+                for i, li in enumerate(local_idx.tolist()):
+                    merged_meta[name][int(li)] = vals[i]
             else:
                 vals = _to_float32(np.asarray(arr))
-                for i, gi in enumerate(gidx.tolist()):
-                    merged_meta[name][int(gi)] = vals[i]
+                for i, li in enumerate(local_idx.tolist()):
+                    merged_meta[name][int(li)] = vals[i]
 
     missing_status_rows = [i for i, s in enumerate(statuses) if s == "missing"]
     if missing_status_rows:
@@ -504,11 +790,20 @@ def main() -> None:
         grid_cols: Dict[str, np.ndarray] = {}
         for name in ("teff", "logg", "feh", "a", "c", "n", "o", "r", "s"):
             if name in grid_root:
-                grid_cols[name] = np.asarray(grid_root[name][:])
+                values = np.asarray(grid_root[name][:])
+                if args.allow_missing:
+                    values = values[selected_global_indices]
+                grid_cols[name] = values
         if "turbvel" in grid_root:
-            grid_cols["turb"] = np.asarray(grid_root["turbvel"][:])
+            turb_vals = np.asarray(grid_root["turbvel"][:])
+            if args.allow_missing:
+                turb_vals = turb_vals[selected_global_indices]
+            grid_cols["turb"] = turb_vals
         elif "t_value" in grid_root:
-            grid_cols["turb"] = np.asarray(grid_root["t_value"][:])
+            turb_vals = np.asarray(grid_root["t_value"][:])
+            if args.allow_missing:
+                turb_vals = turb_vals[selected_global_indices]
+            grid_cols["turb"] = turb_vals
         params, param_names = _build_params_matrix(grid_cols)
     else:
         params_source: Dict[str, np.ndarray] = {}
@@ -527,12 +822,18 @@ def main() -> None:
     param_name_list = [str(x) for x in param_names.tolist()]
 
     if grid_root is not None and "output_mode" in grid_root:
-        output_mode_values = _collect_unique_strings(np.asarray(grid_root["output_mode"][:]))
+        output_mode_data = np.asarray(grid_root["output_mode"][:])
+        if args.allow_missing:
+            output_mode_data = output_mode_data[selected_global_indices]
+        output_mode_values = _collect_unique_strings(output_mode_data)
     else:
         output_mode_values = _collect_unique_strings(np.asarray(merged_meta["output_mode"]))
 
     if grid_root is not None and "calculation_mode" in grid_root:
-        calculation_mode_values = _collect_unique_strings(np.asarray(grid_root["calculation_mode"][:]))
+        calculation_mode_data = np.asarray(grid_root["calculation_mode"][:])
+        if args.allow_missing:
+            calculation_mode_data = calculation_mode_data[selected_global_indices]
+        calculation_mode_values = _collect_unique_strings(calculation_mode_data)
     else:
         calculation_mode_values = _collect_unique_strings(np.asarray(merged_meta["calculation_mode"]))
 
@@ -549,6 +850,7 @@ def main() -> None:
             mu_sampling_values=sorted(mu_sampling_values),
             grid_attrs=grid_attrs,
         )
+    git_commit = _git_commit(project_root)
 
     param_names_u32 = _to_u32_param_names(param_name_list)
     root_out.create_array(
@@ -560,7 +862,7 @@ def main() -> None:
     root_out.create_array(
         "params",
         data=params.astype(np.float32, copy=False),
-        chunks=(min(int(args.chunk_rows), row_count), params.shape[1]),
+        chunks=(min(int(args.chunk_rows), out_row_count), params.shape[1]),
         **compression_kwargs,
     )
     root_out.create_array(
@@ -572,46 +874,34 @@ def main() -> None:
     _write_fixed_string_scalar(root_out, "physics_hash", physics_hash, min_width=64, compression_kwargs=compression_kwargs)
     _write_fixed_string_scalar(root_out, "schema_version", args.schema_version, min_width=16, compression_kwargs=compression_kwargs)
 
+    provenance_payload = _build_merge_provenance_payload(
+        shard_paths=shards,
+        grid_zarr=args.grid_zarr,
+        args_generator=args.generator,
+        chunk_rows=int(args.chunk_rows),
+        compressor_cfg=compressor_cfg,
+        allow_missing=bool(args.allow_missing),
+        expected_models=int(row_count),
+        merged_models=int(out_row_count),
+        physics_hash=physics_hash,
+        physics_payload=physics_payload,
+        output_mode_values=output_mode_values,
+        calculation_mode_values=calculation_mode_values,
+        mu_sampling_values=sorted(mu_sampling_values),
+        grid_attrs=grid_attrs,
+        grid_provenance=grid_provenance,
+        shard_attrs=shard_attr_snapshots,
+        shard_provenance=shard_provenance_candidates,
+        git_commit=git_commit,
+    )
     prov = root_out.create_group("provenance")
-    _write_string_scalar(
-        prov,
-        "canonical_config.yaml",
-        json.dumps(
-            {
-                "physics_hash": physics_hash,
-                "physics_hash_payload": physics_payload,
-                "grid_reference": os.path.abspath(args.grid_zarr) if args.grid_zarr else "unknown",
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        compression_kwargs=compression_kwargs,
-    )
-    _write_string_scalar(prov, "synthesis_config.yaml", "unknown", compression_kwargs=compression_kwargs)
-    _write_string_scalar(
-        prov,
-        "linelist_manifest.json",
-        json.dumps({"source": "unknown", "version": "unknown"}, indent=2, sort_keys=True),
-        compression_kwargs=compression_kwargs,
-    )
-    _write_string_scalar(
-        prov,
-        "atmosphere_manifest.json",
-        json.dumps({"source": "unknown", "version": "unknown"}, indent=2, sort_keys=True),
-        compression_kwargs=compression_kwargs,
-    )
-    _write_string_scalar(
-        prov,
-        "software_manifest.json",
-        json.dumps({"generator": args.generator, "git_commit": _git_commit(project_root), "python": sys.version.split()[0]}, indent=2, sort_keys=True),
-        compression_kwargs=compression_kwargs,
-    )
-    _write_string_scalar(
-        prov,
-        "environment.txt",
-        f"python={sys.version}\nOMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}\n",
-        compression_kwargs=compression_kwargs,
-    )
+    for name in PROVENANCE_FILENAMES:
+        _write_string_scalar(
+            prov,
+            name,
+            provenance_payload[name],
+            compression_kwargs=compression_kwargs,
+        )
 
     status_counts: Dict[str, int] = {}
     for s in statuses:
@@ -638,10 +928,10 @@ def main() -> None:
             "flux_unit": "relative",
             "parameter_units": param_units,
             "physics_hash": physics_hash,
-            "git_commit": _git_commit(project_root),
+            "git_commit": git_commit,
             "contact": args.contact,
             "schema_version": args.schema_version,
-            "n_models": int(row_count),
+            "n_models": int(out_row_count),
             "n_lambda": int(wl_count),
             "n_params": int(params.shape[1]),
             "shards_merged": len(shards),
@@ -649,6 +939,9 @@ def main() -> None:
             "output_mode_values": output_mode_values,
             "calculation_mode_values": calculation_mode_values,
             "mu_sampling_values": sorted(mu_sampling_values),
+            "allow_missing": bool(args.allow_missing),
+            "expected_models": int(row_count),
+            "missing_models": int(row_count - out_row_count),
         }
     )
 
