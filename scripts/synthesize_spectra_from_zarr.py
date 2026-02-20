@@ -596,6 +596,8 @@ def _write_zarr_output(
     output_path: str,
     wavelengths: np.ndarray,
     fluxes: np.ndarray,
+    mu_selected: np.ndarray,
+    mu_selected_index: np.ndarray,
     params: np.ndarray,
     param_names: np.ndarray,
     model_id: np.ndarray,
@@ -626,6 +628,18 @@ def _write_zarr_output(
     # DATA_SCHEMA.md synthesis layout
     root.create_array("wavelength", data=wl, chunks=wl.shape if wl.size else (1,), **compression_kwargs)
     root.create_array("flux", data=fluxes, chunks=chunk_shape, **compression_kwargs)
+    root.create_array(
+        "mu_selected",
+        data=mu_selected.astype(np.float32, copy=False),
+        chunks=(min(chunk_rows, len(mu_selected)) if len(mu_selected) else 1,),
+        **compression_kwargs,
+    )
+    root.create_array(
+        "mu_selected_index",
+        data=mu_selected_index.astype(np.int16, copy=False),
+        chunks=(min(chunk_rows, len(mu_selected_index)) if len(mu_selected_index) else 1,),
+        **compression_kwargs,
+    )
     root.create_array("params", data=params.astype(np.float32, copy=False), chunks=param_chunk_shape, **compression_kwargs)
     root.create_array(
         "param_names",
@@ -757,6 +771,8 @@ def main() -> None:
     fluxes = np.full((row_count, expected_points), np.nan, dtype=np.float32)
     statuses: List[str] = ["pending"] * row_count
     messages: List[str] = [""] * row_count
+    mu_selected = np.full(row_count, np.nan, dtype=np.float32)
+    mu_selected_index = np.full(row_count, -1, dtype=np.int16)
 
     tasks = _build_tasks(row_count, column_data, config)
     worker_count = int(args.workers) if args.workers and args.workers > 0 else determine_worker_count(config)
@@ -782,6 +798,14 @@ def main() -> None:
 
             statuses[idx] = result["status"]
             messages[idx] = result["message"]
+            try:
+                mu_selected[idx] = float(result.get("mu_selected", np.nan))
+            except Exception:
+                mu_selected[idx] = np.nan
+            try:
+                mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
+            except Exception:
+                mu_selected_index[idx] = -1
             if result.get("spectrum"):
                 fluxes[idx] = result["spectrum"][0]
             logger.info(
@@ -929,6 +953,8 @@ def main() -> None:
         output_path=write_path,
         wavelengths=wavelengths,
         fluxes=fluxes,
+        mu_selected=mu_selected,
+        mu_selected_index=mu_selected_index,
         params=params,
         param_names=param_names,
         model_id=model_id,
