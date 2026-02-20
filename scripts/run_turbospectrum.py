@@ -83,15 +83,75 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["nlte_info_file"] = nlte_cfg.get("nlte_info_file", "")
 
     provenance_cfg = cfg_data.get("provenance", {}) or {}
-    flat["linelist_version"] = provenance_cfg.get("linelist_version", "")
-    flat["linelist_sha256"] = provenance_cfg.get("linelist_sha256", "")
-    flat["linelist_preprocessing"] = provenance_cfg.get("linelist_preprocessing", "")
-    flat["atmosphere_geometry"] = provenance_cfg.get("atmosphere_geometry", "")
-    flat["atmosphere_version"] = provenance_cfg.get("atmosphere_version", "")
-    flat["atmosphere_sha256"] = provenance_cfg.get("atmosphere_sha256", "")
-    flat["synthesis_code_version"] = provenance_cfg.get("synthesis_code_version", "")
-    flat["spice_version"] = provenance_cfg.get("spice_version", "")
-    flat["environment_capture"] = provenance_cfg.get("environment_capture", "pip_freeze")
+    model_atmosphere_cfg = cfg_data.get("model_atmosphere", {}) or {}
+
+    def _first_nonempty(*values, default: str = ""):
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    return text
+                continue
+            return value
+        return default
+
+    geometry_from_model_cfg = model_atmosphere_cfg.get("geometry")
+    if geometry_from_model_cfg in (None, "") and "spherical" in model_atmosphere_cfg:
+        try:
+            geometry_from_model_cfg = "spherical" if bool(model_atmosphere_cfg.get("spherical")) else "plane_parallel"
+        except Exception:
+            geometry_from_model_cfg = ""
+
+    # Prefer explicit provenance overrides, then direct config fields, then nearby
+    # sections (paths/model_atmosphere) to avoid duplicate provenance declarations.
+    flat["linelist_version"] = _first_nonempty(
+        provenance_cfg.get("linelist_version"),
+        cfg_data.get("linelist_version"),
+        paths.get("linelist_version"),
+    )
+    flat["linelist_sha256"] = _first_nonempty(
+        provenance_cfg.get("linelist_sha256"),
+        cfg_data.get("linelist_sha256"),
+        paths.get("linelist_sha256"),
+        paths.get("linelist_checksum"),
+    )
+    flat["linelist_preprocessing"] = _first_nonempty(
+        provenance_cfg.get("linelist_preprocessing"),
+        cfg_data.get("linelist_preprocessing"),
+        paths.get("linelist_preprocessing"),
+    )
+    flat["atmosphere_geometry"] = _first_nonempty(
+        provenance_cfg.get("atmosphere_geometry"),
+        cfg_data.get("atmosphere_geometry"),
+        geometry_from_model_cfg,
+    )
+    flat["atmosphere_version"] = _first_nonempty(
+        provenance_cfg.get("atmosphere_version"),
+        cfg_data.get("atmosphere_version"),
+        model_atmosphere_cfg.get("version"),
+        paths.get("model_atmosphere_version"),
+    )
+    flat["atmosphere_sha256"] = _first_nonempty(
+        provenance_cfg.get("atmosphere_sha256"),
+        cfg_data.get("atmosphere_sha256"),
+        model_atmosphere_cfg.get("sha256"),
+        paths.get("model_atmosphere_sha256"),
+    )
+    flat["synthesis_code_version"] = _first_nonempty(
+        provenance_cfg.get("synthesis_code_version"),
+        cfg_data.get("synthesis_code_version"),
+    )
+    flat["spice_version"] = _first_nonempty(
+        provenance_cfg.get("spice_version"),
+        cfg_data.get("spice_version"),
+    )
+    flat["environment_capture"] = _first_nonempty(
+        provenance_cfg.get("environment_capture"),
+        cfg_data.get("environment_capture"),
+        default="pip_freeze",
+    )
 
     # Grid points: accept either legacy [[teff, logg, feh, turb_str], ...]
     # or comprehensive objects [{teff, logg, feh, microturb_str}, ...]

@@ -686,12 +686,19 @@ def main() -> None:
         **compression_kwargs,
     )
     flux_out = root_out.create_array("flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
+    mu_chunk = (min(int(args.chunk_rows), out_row_count) if out_row_count else 1,)
+    mu_selected_out = root_out.create_array("mu_selected", shape=(out_row_count,), dtype=np.float32, chunks=mu_chunk, **compression_kwargs)
+    mu_selected_index_out = root_out.create_array("mu_selected_index", shape=(out_row_count,), dtype=np.int16, chunks=mu_chunk, **compression_kwargs)
 
     # Initialize to NaNs for missing rows.
     flux_out[:] = np.nan
+    mu_selected_out[:] = np.nan
+    mu_selected_index_out[:] = np.int16(-1)
 
     statuses = ["missing"] * out_row_count
     messages = [""] * out_row_count
+    saw_mu_selected = False
+    saw_mu_selected_index = False
 
     # Collect parameter metadata columns for schema-compliant params matrix.
     param_candidate_cols = [
@@ -754,6 +761,32 @@ def main() -> None:
         for i, li in enumerate(local_idx.tolist()):
             statuses[int(li)] = shard_status[i]
             messages[int(li)] = shard_msg[i]
+
+        if "mu_selected" in shard:
+            shard_mu = np.asarray(shard["mu_selected"][:], dtype=np.float32)
+            if shard_mu.ndim != 1 or shard_mu.shape[0] != gidx.size:
+                raise ValueError(
+                    f"Shard {p} mu_selected shape mismatch: expected ({gidx.size},), got {shard_mu.shape}"
+                )
+            try:
+                mu_selected_out.oindex[local_idx] = shard_mu  # type: ignore[attr-defined]
+            except Exception:
+                for i, li in enumerate(local_idx.tolist()):
+                    mu_selected_out[int(li)] = shard_mu[i]
+            saw_mu_selected = True
+
+        if "mu_selected_index" in shard:
+            shard_mu_idx = np.asarray(shard["mu_selected_index"][:], dtype=np.int16)
+            if shard_mu_idx.ndim != 1 or shard_mu_idx.shape[0] != gidx.size:
+                raise ValueError(
+                    f"Shard {p} mu_selected_index shape mismatch: expected ({gidx.size},), got {shard_mu_idx.shape}"
+                )
+            try:
+                mu_selected_index_out.oindex[local_idx] = shard_mu_idx  # type: ignore[attr-defined]
+            except Exception:
+                for i, li in enumerate(local_idx.tolist()):
+                    mu_selected_index_out[int(li)] = shard_mu_idx[i]
+            saw_mu_selected_index = True
 
         # Merge metadata columns if present.
         for name in param_candidate_cols:
@@ -939,6 +972,8 @@ def main() -> None:
             "output_mode_values": output_mode_values,
             "calculation_mode_values": calculation_mode_values,
             "mu_sampling_values": sorted(mu_sampling_values),
+            "mu_selected_present": bool(saw_mu_selected),
+            "mu_selected_index_present": bool(saw_mu_selected_index),
             "allow_missing": bool(args.allow_missing),
             "expected_models": int(row_count),
             "missing_models": int(row_count - out_row_count),

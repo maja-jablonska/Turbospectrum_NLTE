@@ -88,13 +88,14 @@
     },
 
     "provenance": {
-      "_note": "Optional metadata to fully populate provenance manifests (recommended for reproducibility).",
+      "_note": [
+        "Optional overrides only.",
+        "Linelist path/files and atmosphere path are read directly from turbospectrum.paths.",
+        "Checksums are auto-computed when files are accessible."
+      ],
       "linelist_version": "",
-      "linelist_sha256": "",
-      "linelist_preprocessing": "",
       "atmosphere_geometry": "",
       "atmosphere_version": "",
-      "atmosphere_sha256": "",
       "synthesis_code_version": "",
       "spice_version": "",
       "environment_capture": "pip_freeze"
