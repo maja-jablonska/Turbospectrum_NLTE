@@ -1,0 +1,23 @@
+{
+  "defaults": {
+    "epochs": 30,
+    "batch_size": 64,
+    "weight_decay": 0.0,
+    "lambda_hi": 0.1,
+    "lambda_lo": 0.0
+  },
+  "grid": {
+    "hidden_dims": [
+      [128, 256],
+      [256, 256]
+    ],
+    "learning_rate": [
+      0.001,
+      0.0003
+    ],
+    "batch_size": [
+      32,
+      64
+    ]
+  }
+}

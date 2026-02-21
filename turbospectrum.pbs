@@ -184,12 +184,25 @@ echo "[turbospec] Shards: ${SHARDS_DIR}"
 echo "[turbospec] Merged: ${MERGED_ZARR}"
 echo "[turbospec] Job config: ${CONFIG_PATH}"
 
-if [[ ! -d "${GRID_ZARR}" ]]; then
-    echo "[turbospec] Grid Zarr missing; generating grid from config..."
-    "${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
-        --config "${CONFIG_PATH}" \
-        --skip-synthesis
-fi
+CONFIG_NUM_SAMPLES=$(
+    "${PYTHON}" - <<PY
+import json
+with open(r"${CONFIG_PATH}", "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+print(int((cfg.get("grid") or {}).get("num_samples", 0)))
+PY
+)
+
+echo "[turbospec] Regenerating grid from config each run (num_samples=${CONFIG_NUM_SAMPLES})..."
+rm -rf "${GRID_ZARR}"
+"${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
+    --config "${CONFIG_PATH}" \
+    --skip-synthesis
+
+echo "[turbospec] Cleaning shard outputs and counter for a fresh run..."
+rm -rf "${SHARDS_DIR}"
+mkdir -p "${SHARDS_DIR}"
+rm -f "${NEXT_SHARD}"
 
 if [[ ! -d "${GRID_ZARR}" ]]; then
     echo "[turbospec] ERROR: grid zarr still not found after generation: ${GRID_ZARR}" >&2
@@ -209,7 +222,12 @@ JOBFS_BASE=${PBS_JOBFS:-${TMPDIR:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}}
 ROW_COUNT=$(${PYTHON} - <<PY
 import zarr
 root = zarr.open_group(r"${GRID_ZARR}", mode="r")
-print(int(root["teff"].shape[0]))
+for key in ("teff", "params", "global_index"):
+    if key in root and len(root[key].shape) >= 1:
+        print(int(root[key].shape[0]))
+        break
+else:
+    raise RuntimeError(f"Could not infer row count from {r'${GRID_ZARR}'}")
 PY
 )
 
