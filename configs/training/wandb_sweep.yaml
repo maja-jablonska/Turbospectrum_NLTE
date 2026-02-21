@@ -1,0 +1,72 @@
+method: bayes
+metric:
+  goal: minimize
+  name: Relative Time (Process)
+parameters:
+  axis_name:
+    distribution: categorical
+    values:
+      - log_wavelength
+  batch_size:
+    distribution: int_uniform
+    min: 16
+    max: 64
+  epochs:
+    distribution: int_uniform
+    min: 15
+    max: 60
+  include_mu:
+    distribution: categorical
+    values:
+      - true
+      - false
+  jax_platform:
+    distribution: categorical
+    values:
+      - cpu
+  lambda_hi:
+    distribution: uniform
+    min: 0.05
+    max: 0.2
+  learning_rate:
+    distribution: uniform
+    min: 0.0005
+    max: 0.002
+  mu_key:
+    distribution: categorical
+    values:
+      - auto
+  normalize_inputs:
+    distribution: categorical
+    values:
+      - true
+      - false
+  seed:
+    distribution: int_uniform
+    min: 4
+    max: 14
+  target_axis_max:
+    distribution: uniform
+    min: 4.4935984103309865
+    max: 17.974393641323946
+  target_axis_min:
+    distribution: uniform
+    min: 4.147024820051014
+    max: 16.588099280204055
+  target_points:
+    distribution: int_uniform
+    min: 512
+    max: 2048
+  train_fraction:
+    distribution: uniform
+    min: 0.4
+    max: 0.85
+  val_fraction:
+    distribution: uniform
+    min: 0.05
+    max: 0.14
+  zarr_path:
+    distribution: categorical
+    values:
+      - "/Users/mjablons/Documents/Documents - rsaa-080566/Turbospectrum_NLTE/spectra_tiny.zarr"
+program: scripts/train_mlp_wandb.py

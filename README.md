@@ -121,6 +121,38 @@ python3 scripts/sample_machine_learning_grid.py  # add --resume to append up to 
 
 The helper writes a compressed Zarr store at `runs/local-dev/outputs/grids/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the batch runners.
 
+#### JAX dataloader for spectra training
+
+For ML training in JAX, use the built-in dataloader helper on a synthesized spectra store:
+
+```bash
+python3 scripts/jax_spectra_dataloader.py runs/local-dev/outputs/zarr/synthesized_spectra.zarr \
+  --batch-size 64 \
+  --input-key params \
+  --target-key flux \
+  --normalize-inputs
+```
+
+Programmatic usage:
+
+```python
+from scripts.jax_spectra_dataloader import create_jax_spectra_dataloaders
+
+loaders = create_jax_spectra_dataloaders(
+    zarr_path="runs/local-dev/outputs/zarr/synthesized_spectra.zarr",
+    batch_size=64,
+    input_key="params",
+    target_key="flux",
+    normalize_inputs=True,
+)
+
+for batch in loaders["train"]:
+    x = batch["inputs"]   # jax.Array
+    y = batch["targets"]  # jax.Array
+```
+
+Install dependencies with `pip install zarr numpy "jax[cpu]"` (or your accelerator-specific JAX build).
+
 ### 2. Run The Pipeline (Single Command)
 
 Run from one config:

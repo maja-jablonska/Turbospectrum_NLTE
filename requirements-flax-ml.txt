@@ -1,0 +1,7 @@
+# Pinned stack for /Users/mjablons/Documents/Documents - rsaa-080566/Turbospectrum_NLTE/mlp.ipynb
+# Tested to avoid the JAX 0.8 + NumPy 1.26 and FLAX compatibility issues.
+numpy==1.26.4
+jax==0.4.28
+jaxlib==0.4.28
+flax==0.8.1
+optax==0.1.9
