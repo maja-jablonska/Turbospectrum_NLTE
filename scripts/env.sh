@@ -2,7 +2,11 @@
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)
-DEFAULT_RUN_ROOT="${PROJECT_ROOT}/runs/local-dev"
+
+# Default runtime location is scratch/system tmp to avoid filling project storage.
+SCRATCH_BASE="${SCRATCH:-${TMPDIR:-/tmp}}"
+SCRATCH_BASE="${SCRATCH_BASE%/}"
+DEFAULT_RUN_ROOT="${RUN_ROOT:-${SCRATCH_BASE}/turbospectrum_nlte/${USER:-user}}"
 
 # Directory for model atmospheres
 export MODEL_PATH="${MODEL_PATH:-${PROJECT_ROOT}/input_files/model_atmospheres/1D/marcs_standard_comp}"
@@ -33,3 +37,9 @@ export LOG_PATH="${LOG_PATH:-${DEFAULT_RUN_ROOT}/logs/shards}"
 
 # Temporary directory for pipeline files
 export TMP_PATH="${TMP_PATH:-${DEFAULT_RUN_ROOT}/tmp}"
+
+# Ensure mkstemp() and other tmp-file users write outside the project tree by default.
+mkdir -p "${TMP_PATH}"
+export TMPDIR="${TMP_PATH}"
+export TMP="${TMP_PATH}"
+export TEMP="${TMP_PATH}"

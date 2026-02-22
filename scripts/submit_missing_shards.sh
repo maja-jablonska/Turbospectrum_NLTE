@@ -20,6 +20,7 @@ Optional:
   --pbs-script <path>       PBS resume script (default: scripts/pbs_resume_missing_shards_array.pbs).
   --missing-file <path>     Output missing-id file (default: <run-root>/missing_shards.txt).
   --max-attempts <N>        Retries per shard task (default: 3).
+  --scratch-tmp-root <path> Scratch tmp root for rerun jobs (default: <run-root>/tmp).
   --qsub-extra "<args>"     Extra qsub arguments (quoted string), e.g. "-q normal -P mk27".
   --dry-run                 Print qsub command but do not submit.
 EOF
@@ -33,6 +34,7 @@ TS_CONFIG="configs/synthesis/config_sample_comprehensive.json"
 PBS_SCRIPT="scripts/pbs_resume_missing_shards_array.pbs"
 MISSING_FILE=""
 MAX_ATTEMPTS="3"
+SCRATCH_TMP_ROOT=""
 MAX_ARRAY_SIZE="20"
 PYTHON_BIN=""
 MAMBA_ENV_NAME="astro"
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     --pbs-script) PBS_SCRIPT="$2"; shift 2 ;;
     --missing-file) MISSING_FILE="$2"; shift 2 ;;
     --max-attempts) MAX_ATTEMPTS="$2"; shift 2 ;;
+    --scratch-tmp-root) SCRATCH_TMP_ROOT="$2"; shift 2 ;;
     --max-array-size) MAX_ARRAY_SIZE="$2"; shift 2 ;;
     --python-bin) PYTHON_BIN="$2"; shift 2 ;;
     --mamba-env) MAMBA_ENV_NAME="$2"; shift 2 ;;
@@ -146,6 +149,9 @@ echo "Max array size per submit: ${MAX_ARRAY_SIZE}"
 echo "Missing file: ${MISSING_FILE}"
 echo "PBS script: ${PBS_SCRIPT}"
 echo "Python bin: ${PYTHON_BIN}"
+if [[ -n "${SCRATCH_TMP_ROOT}" ]]; then
+  echo "Scratch tmp root: ${SCRATCH_TMP_ROOT}"
+fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "Dry run enabled: printing chunked qsub commands."
@@ -166,6 +172,9 @@ while (( START < MISSING_COUNT )); do
   CHUNK_COUNT=$(( END - START + 1 ))
   ARRAY_RANGE="0-$((CHUNK_COUNT - 1))"
   VARS="RUN_ROOT=${RUN_ROOT},SHARD_COUNT=${EXPECTED_SHARDS},GRID_ZARR=${GRID_ZARR},TS_CONFIG=${TS_CONFIG},OUT_DIR=${SHARDS_DIR},MISSING_IDS_FILE=${CHUNK_FILE},MAX_ATTEMPTS=${MAX_ATTEMPTS},MAMBA_ENV_NAME=${MAMBA_ENV_NAME}"
+  if [[ -n "${SCRATCH_TMP_ROOT}" ]]; then
+    VARS="${VARS},SCRATCH_TMP_ROOT=${SCRATCH_TMP_ROOT}"
+  fi
   if [[ -n "${PYTHON_BIN}" ]]; then
     VARS="${VARS},PYTHON_BIN=${PYTHON_BIN}"
   fi

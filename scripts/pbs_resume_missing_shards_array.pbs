@@ -50,7 +50,10 @@ OUT_DIR="${OUT_DIR:-${RUN_ROOT}/outputs/shards}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
-SCRATCH_BASE="${TMPDIR:-/tmp/${USER}/pbs_${PBS_JOBID}}"
+SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
+TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
+TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
+TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
 
 ############################################
 # Safe threading defaults
@@ -117,7 +120,13 @@ then
   exit 1
 fi
 
-mkdir -p "${OUT_DIR}" "${RUN_ROOT}/logs/pbs" "logs/pbs" "${SCRATCH_BASE}" "${RUN_ROOT}/logs/shards_resume"
+mkdir -p "${OUT_DIR}" "${RUN_ROOT}/logs/pbs" "logs/pbs" "${RUN_ROOT}/logs/shards_resume" \
+  "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
+
+# Force mkstemp()/tempfile users to write under designated scratch temp.
+export TMPDIR="${TMP_SYSTEM_DIR}"
+export TMP="${TMP_SYSTEM_DIR}"
+export TEMP="${TMP_SYSTEM_DIR}"
 
 TASK_ORDINAL="${PBS_ARRAY_INDEX:-0}"
 LINE_NO=$((TASK_ORDINAL + 1))
@@ -132,7 +141,7 @@ if ! [[ "${SHARD_INDEX}" =~ ^[0-9]+$ ]]; then
 fi
 
 OUT="${OUT_DIR}/spectra_shard_${SHARD_INDEX}.zarr"
-SCRATCH="${SCRATCH_BASE}/shard_${SHARD_INDEX}"
+SCRATCH="${TMP_WORK_DIR}/shard_${SHARD_INDEX}"
 LOG_FILE="${RUN_ROOT}/logs/shards_resume/shard_${SHARD_INDEX}.log"
 mkdir -p "${SCRATCH}"
 
@@ -141,6 +150,7 @@ echo "[resume-missing] PYTHON_BIN(env)=${PYTHON_BIN}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] grid=${GRID_ZARR}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] config=${TS_CONFIG}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] output=${OUT}" | tee -a "${LOG_FILE}"
+echo "[resume-missing] scratch_tmp_root=${SCRATCH_TMP_ROOT}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] python=${PYTHON_BIN}" | tee -a "${LOG_FILE}"
 
 if "${PYTHON_BIN}" - <<PY >/dev/null 2>&1
@@ -154,7 +164,7 @@ then
 fi
 
 for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
-  TMP_OUT="${OUT}.tmp.${PBS_JOBID}.${attempt}"
+  TMP_OUT="${TMP_OUTPUT_DIR}/spectra_shard_${SHARD_INDEX}.a${attempt}.tmp.zarr"
   rm -rf "${TMP_OUT}" || true
   echo "[resume-missing] attempt ${attempt}/${MAX_ATTEMPTS}" | tee -a "${LOG_FILE}"
 

@@ -21,7 +21,7 @@ mkdir -p "$TMP_PATH"
 mkdir -p "$OPAC_PATH"
 mkdir -p "$SPECTRA_PATH"
 
-DEFAULT_GRID_CSV="runs/local-dev/outputs/grids/parameter_grid.csv"
+DEFAULT_GRID_CSV="${DEFAULT_RUN_ROOT}/outputs/grids/parameter_grid.csv"
 LEGACY_GRID_CSV="scripts/parameter_grid.csv"
 PARAMETER_GRID_CSV="${PARAMETER_GRID_CSV:-$DEFAULT_GRID_CSV}"
 if [ ! -f "$PARAMETER_GRID_CSV" ] && [ -f "$LEGACY_GRID_CSV" ]; then
