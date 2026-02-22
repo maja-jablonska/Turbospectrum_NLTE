@@ -140,6 +140,31 @@ def _infer_row_count_from_shards(shards: Sequence[str]) -> int:
     return max_idx + 1
 
 
+def _filter_nonexistent_shards(shards: Sequence[str], *, skip_nonexistent: bool) -> tuple[List[str], List[str]]:
+    if not skip_nonexistent:
+        return list(shards), []
+
+    kept: List[str] = []
+    skipped: List[str] = []
+    for path in shards:
+        try:
+            # Validate store existence/readability once up front so later passes don't fail fast.
+            _open_shard(path)
+        except FileNotFoundError:
+            skipped.append(path)
+            continue
+        kept.append(path)
+
+    if skipped:
+        preview = skipped[:10]
+        suffix = " (truncated)" if len(skipped) > 10 else ""
+        print(
+            f"WARNING: skipping {len(skipped)} non-existent shard(s): {preview}{suffix}",
+            file=sys.stderr,
+        )
+    return kept, skipped
+
+
 def _write_string_scalar(root, name: str, value: str, compression_kwargs: Mapping[str, Any]) -> None:
     import zarr.codecs as zc  # type: ignore
     from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
@@ -569,6 +594,14 @@ def main() -> None:
             "Output will contain only rows present in available shards."
         ),
     )
+    parser.add_argument(
+        "--skip-nonexistent-shards",
+        action="store_true",
+        help=(
+            "Skip shard paths that do not exist at merge time (e.g. stale shard lists "
+            "or interrupted reruns)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.tmp_dir:
@@ -580,6 +613,22 @@ def main() -> None:
         tempfile.tempdir = tmp_dir
 
     shards = _list_shards(args.shard, args.shard_dir)
+    shards, skipped_nonexistent_shards = _filter_nonexistent_shards(
+        shards,
+        skip_nonexistent=bool(args.skip_nonexistent_shards),
+    )
+    if not shards:
+        raise FileNotFoundError(
+            "No readable shard stores remain after filtering. "
+            "Either point --shard-dir to existing shard outputs or disable --skip-nonexistent-shards."
+        )
+    effective_allow_missing = bool(args.allow_missing or args.skip_nonexistent_shards)
+    if args.skip_nonexistent_shards and not args.allow_missing:
+        print(
+            "WARNING: --skip-nonexistent-shards enables partial merge semantics "
+            "(missing rows will be omitted).",
+            file=sys.stderr,
+        )
     out_path = _norm(args.output_zarr)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -683,7 +732,7 @@ def main() -> None:
 
     missing_rows = np.flatnonzero(~seen_rows)
     if missing_rows.size:
-        if not args.allow_missing:
+        if not effective_allow_missing:
             preview = missing_rows[:20].tolist()
             suffix = " (truncated)" if missing_rows.size > 20 else ""
             raise ValueError(
@@ -695,7 +744,11 @@ def main() -> None:
             f"from output."
         )
 
-    selected_global_indices = np.flatnonzero(seen_rows).astype(np.int64) if args.allow_missing else np.arange(row_count, dtype=np.int64)
+    selected_global_indices = (
+        np.flatnonzero(seen_rows).astype(np.int64)
+        if effective_allow_missing
+        else np.arange(row_count, dtype=np.int64)
+    )
     out_row_count = int(selected_global_indices.size)
     if out_row_count <= 0:
         raise ValueError("No valid shard rows available to merge")
@@ -853,17 +906,17 @@ def main() -> None:
         for name in ("teff", "logg", "feh", "a", "c", "n", "o", "r", "s"):
             if name in grid_root:
                 values = np.asarray(grid_root[name][:])
-                if args.allow_missing:
+                if effective_allow_missing:
                     values = values[selected_global_indices]
                 grid_cols[name] = values
         if "turbvel" in grid_root:
             turb_vals = np.asarray(grid_root["turbvel"][:])
-            if args.allow_missing:
+            if effective_allow_missing:
                 turb_vals = turb_vals[selected_global_indices]
             grid_cols["turb"] = turb_vals
         elif "t_value" in grid_root:
             turb_vals = np.asarray(grid_root["t_value"][:])
-            if args.allow_missing:
+            if effective_allow_missing:
                 turb_vals = turb_vals[selected_global_indices]
             grid_cols["turb"] = turb_vals
         params, param_names = _build_params_matrix(grid_cols)
@@ -885,7 +938,7 @@ def main() -> None:
 
     if grid_root is not None and "output_mode" in grid_root:
         output_mode_data = np.asarray(grid_root["output_mode"][:])
-        if args.allow_missing:
+        if effective_allow_missing:
             output_mode_data = output_mode_data[selected_global_indices]
         output_mode_values = _collect_unique_strings(output_mode_data)
     else:
@@ -893,7 +946,7 @@ def main() -> None:
 
     if grid_root is not None and "calculation_mode" in grid_root:
         calculation_mode_data = np.asarray(grid_root["calculation_mode"][:])
-        if args.allow_missing:
+        if effective_allow_missing:
             calculation_mode_data = calculation_mode_data[selected_global_indices]
         calculation_mode_values = _collect_unique_strings(calculation_mode_data)
     else:
@@ -942,7 +995,7 @@ def main() -> None:
         args_generator=args.generator,
         chunk_rows=int(args.chunk_rows),
         compressor_cfg=compressor_cfg,
-        allow_missing=bool(args.allow_missing),
+        allow_missing=bool(effective_allow_missing),
         expected_models=int(row_count),
         merged_models=int(out_row_count),
         physics_hash=physics_hash,
@@ -1003,7 +1056,10 @@ def main() -> None:
             "mu_sampling_values": sorted(mu_sampling_values),
             "mu_selected_present": bool(saw_mu_selected),
             "mu_selected_index_present": bool(saw_mu_selected_index),
-            "allow_missing": bool(args.allow_missing),
+            "allow_missing": bool(effective_allow_missing),
+            "allow_missing_requested": bool(args.allow_missing),
+            "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
+            "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
             "expected_models": int(row_count),
             "missing_models": int(row_count - out_row_count),
         }
