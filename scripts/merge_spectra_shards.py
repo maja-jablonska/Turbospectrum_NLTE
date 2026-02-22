@@ -29,6 +29,7 @@ import sys
 import time
 import hashlib
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple
 
@@ -535,6 +536,11 @@ def main() -> None:
 
     parser.add_argument("--chunk-rows", type=int, default=32, help="Chunking along the sample dimension")
     parser.add_argument("--compressor", default=None, help="JSON string describing compressor options (cname, clevel, shuffle)")
+    parser.add_argument(
+        "--tmp-dir",
+        default=os.environ.get("TMPDIR"),
+        help="Optional tmp directory to force mkstemp/tempfile writes (also sets TMPDIR/TMP/TEMP).",
+    )
     parser.add_argument("--schema-version", default="1.0.0", help="DATA_SCHEMA.md schema version")
     parser.add_argument("--physics-hash", default=None, help="Optional override for physics hash")
     parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
@@ -549,6 +555,14 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    if args.tmp_dir:
+        tmp_dir = os.path.abspath(args.tmp_dir)
+        os.makedirs(tmp_dir, exist_ok=True)
+        os.environ["TMPDIR"] = tmp_dir
+        os.environ["TMP"] = tmp_dir
+        os.environ["TEMP"] = tmp_dir
+        tempfile.tempdir = tmp_dir
 
     shards = _list_shards(args.shard, args.shard_dir)
     out_path = os.path.abspath(args.output_zarr)

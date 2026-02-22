@@ -26,6 +26,14 @@ DEFAULT_PARAMETER_CONFIG = {
 }
 
 
+def _default_run_root() -> str:
+    run_root = os.environ.get("RUN_ROOT")
+    if run_root:
+        return run_root
+    scratch_base = (os.environ.get("SCRATCH") or os.environ.get("TMPDIR") or "/tmp").rstrip("/")
+    return os.path.join(scratch_base, "turbospectrum_nlte", os.environ.get("USER", "user"))
+
+
 def _format_abundance_value(value):
     if isinstance(value, (int, float, np.floating)):
         return f"{value:+.2f}"
@@ -404,15 +412,18 @@ def _write_zarr_from_columns(columns: Mapping[str, np.ndarray], zarr_path: str, 
 
 def generate_grid(
     config_path='configs/sampling/grid_config.yml',
-    output_path='runs/local-dev/outputs/grids/parameter_grid.csv',
+    output_path=None,
 ):
     """
     Generates a CSV parameter grid based on a YAML configuration file.
 
     Args:
         config_path (str): Path to the YAML configuration file.
-        output_path (str): Path to the output CSV file.
+        output_path (str | None): Path to the output CSV file.
     """
+    if output_path is None:
+        output_path = os.path.join(_default_run_root(), "outputs", "grids", "parameter_grid.csv")
+
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
@@ -508,6 +519,7 @@ if __name__ == '__main__':
 
     config_path = os.path.abspath(args.config)
     config_dir = os.path.dirname(config_path)
+    default_csv_out = os.path.join(_default_run_root(), "outputs", "grids", "parameter_grid.csv")
 
     if config_path.lower().endswith(".json"):
         with open(config_path, "r", encoding="utf-8") as handle:
@@ -517,7 +529,7 @@ if __name__ == '__main__':
             args.csv_output
             or args.output
             or cfg.get("output_csv")
-            or os.path.join(repo_root, "runs", "local-dev", "outputs", "grids", "parameter_grid.csv")
+            or default_csv_out
         )
         csv_out_abs = _abs_from(config_dir, csv_out) or os.path.abspath(csv_out)
         zarr_cfg = cfg.get("zarr") or {}
@@ -544,7 +556,5 @@ if __name__ == '__main__':
             print(f"Successfully wrote Zarr store at {zarr_out_abs}")
     else:
         # Legacy YAML config path.
-        out = args.csv_output or args.output or os.path.join(
-            repo_root, "runs", "local-dev", "outputs", "grids", "parameter_grid.csv"
-        )
+        out = args.csv_output or args.output or default_csv_out
         generate_grid(config_path=config_path, output_path=_abs_from(config_dir, out) or out)

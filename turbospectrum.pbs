@@ -175,13 +175,24 @@ fi
 NEXT_SHARD="${NEXT_SHARD:-${RUN_ROOT}/next_shard.txt}"
 LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
-mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_SHARD}")" "$(dirname "${LOCK_FILE}")"
+SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
+TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
+TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
+TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
+mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_SHARD}")" "$(dirname "${LOCK_FILE}")" \
+         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
+
+# Force mkstemp()/tempfile users to write under designated scratch temp.
+export TMPDIR="${TMP_SYSTEM_DIR}"
+export TMP="${TMP_SYSTEM_DIR}"
+export TEMP="${TMP_SYSTEM_DIR}"
 
 echo "[turbospec] Repo: ${REPO}"
 echo "[turbospec] Config: ${CONFIG_PATH}"
 echo "[turbospec] Grid: ${GRID_ZARR}"
 echo "[turbospec] Shards: ${SHARDS_DIR}"
 echo "[turbospec] Merged: ${MERGED_ZARR}"
+echo "[turbospec] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[turbospec] Job config: ${CONFIG_PATH}"
 
 CONFIG_NUM_SAMPLES=$(
@@ -208,12 +219,6 @@ if [[ ! -d "${GRID_ZARR}" ]]; then
     echo "[turbospec] ERROR: grid zarr still not found after generation: ${GRID_ZARR}" >&2
     exit 1
 fi
-
-############################################
-# Node-local scratch
-############################################
-
-JOBFS_BASE=${PBS_JOBFS:-${TMPDIR:-/tmp/${USER_ID}/pbs_${PBS_JOBID}}}
 
 ############################################
 # Grid sanity check
@@ -278,7 +283,7 @@ run_shard_attempts () {
     local sleep_base="$5"
 
     local out="${SHARDS_DIR}/spectra_shard_${shard}.zarr"
-    local tmp_out="${out}.tmp"
+    local tmp_out="${TMP_OUTPUT_DIR}/spectra_shard_${shard}.a$$.tmp.zarr"
 
     for ((attempt=1; attempt<=max_attempts; attempt++)); do
         local start end attempt_scratch
@@ -311,7 +316,7 @@ run_shard_attempts () {
 }
 
 resubmit_self () {
-    qsub -v "PYTHON_BIN=${PYTHON_BIN},MAMBA_ENV_NAME=${MAMBA_ENV_NAME},PROJECT=${PROJECT},USER_ID=${USER_ID},RUN_ROOT=${RUN_ROOT},REPO=${REPO},CONFIG_PATH=${CONFIG_PATH},GRID_ZARR=${GRID_ZARR},SHARDS_DIR=${SHARDS_DIR},MERGED_ZARR=${MERGED_ZARR},NEXT_SHARD=${NEXT_SHARD},LOCK_FILE=${LOCK_FILE},LOG_DIR=${LOG_DIR},WORKERS=${WORKERS},SAFETY_BUFFER=${SAFETY_BUFFER},EST_RUNTIME=${EST_RUNTIME},SHARD_RETRY_ATTEMPTS=${SHARD_RETRY_ATTEMPTS},RECOVERY_PASSES=${RECOVERY_PASSES},RECOVERY_RETRY_ATTEMPTS=${RECOVERY_RETRY_ATTEMPTS},RECOVERY_JITTER_BASE=${RECOVERY_JITTER_BASE},MISSING_FILE=${MISSING_FILE}" "$0"
+    qsub -v "PYTHON_BIN=${PYTHON_BIN},MAMBA_ENV_NAME=${MAMBA_ENV_NAME},PROJECT=${PROJECT},USER_ID=${USER_ID},RUN_ROOT=${RUN_ROOT},REPO=${REPO},CONFIG_PATH=${CONFIG_PATH},GRID_ZARR=${GRID_ZARR},SHARDS_DIR=${SHARDS_DIR},MERGED_ZARR=${MERGED_ZARR},NEXT_SHARD=${NEXT_SHARD},LOCK_FILE=${LOCK_FILE},LOG_DIR=${LOG_DIR},WORKERS=${WORKERS},SAFETY_BUFFER=${SAFETY_BUFFER},EST_RUNTIME=${EST_RUNTIME},SHARD_RETRY_ATTEMPTS=${SHARD_RETRY_ATTEMPTS},RECOVERY_PASSES=${RECOVERY_PASSES},RECOVERY_RETRY_ATTEMPTS=${RECOVERY_RETRY_ATTEMPTS},RECOVERY_JITTER_BASE=${RECOVERY_JITTER_BASE},MISSING_FILE=${MISSING_FILE},SCRATCH_TMP_ROOT=${SCRATCH_TMP_ROOT},TMP_SYSTEM_DIR=${TMP_SYSTEM_DIR},TMP_WORK_DIR=${TMP_WORK_DIR},TMP_OUTPUT_DIR=${TMP_OUTPUT_DIR}" "$0"
 }
 
 ############################################
@@ -320,7 +325,7 @@ resubmit_self () {
 
 worker() {
 
-    JOBFS_DIR=${JOBFS_BASE}/worker_$RANDOM
+    JOBFS_DIR=${TMP_WORK_DIR}/worker_${RANDOM}
     mkdir -p $JOBFS_DIR
 
     while true; do
@@ -385,7 +390,7 @@ worker() {
 }
 
 export -f worker
-export NEXT_SHARD LOCK_FILE ROW_COUNT LOG_DIR REPO PYTHON PBS_JOBID JOBFS_BASE CONFIG_PATH
+export NEXT_SHARD LOCK_FILE ROW_COUNT LOG_DIR REPO PYTHON PBS_JOBID CONFIG_PATH TMP_OUTPUT_DIR
 
 ############################################
 # Launch workers (start conservative!)
@@ -447,7 +452,7 @@ else
                 continue
             fi
 
-            if ! run_shard_attempts "${shard}" "${RECOVERY_RETRY_ATTEMPTS}" "${JOBFS_BASE}/recovery_pass${pass}" "${SHARD_LOG}" "${RECOVERY_JITTER_BASE}"; then
+            if ! run_shard_attempts "${shard}" "${RECOVERY_RETRY_ATTEMPTS}" "${TMP_WORK_DIR}/recovery_pass${pass}" "${SHARD_LOG}" "${RECOVERY_JITTER_BASE}"; then
                 echo "Shard ${shard} still failed after recovery pass ${pass}." >> "${SHARD_LOG}"
             fi
         done < "${MISSING_FILE}"
@@ -478,6 +483,7 @@ else
         --shard-dir "${SHARDS_DIR}" \
         --grid-zarr "${GRID_ZARR}" \
         --output-zarr "${MERGED_ZARR}" \
+        --tmp-dir "${TMP_SYSTEM_DIR}" \
         "${MERGE_EXTRA[@]}" \
         > "${LOG_DIR}/merge.log" 2>&1
 fi
