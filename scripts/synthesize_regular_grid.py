@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""Generate and synthesize a regular Cartesian stellar grid.
+
+This script is intended for interpolation-ready datasets where parameter axes
+must be uniformly spaced (linear interpolation assumptions).
+
+Workflow:
+1. Build a regular grid over (teff, logg, feh, turbvel).
+2. Write grid CSV/Zarr in the same schema expected by synthesis scripts.
+3. Optionally synthesize spectra from the generated grid.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from typing import Any, Dict, List, Sequence
+
+import numpy as np
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+
+
+def _default_run_root() -> str:
+    run_root = os.environ.get("RUN_ROOT")
+    if run_root:
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(run_root)))
+    scratch_base = (os.environ.get("SCRATCH") or os.environ.get("TMPDIR") or "/tmp").rstrip("/")
+    return os.path.join(scratch_base, "turbospectrum_nlte", os.environ.get("USER", "user"))
+
+
+def _as_abspath(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
+
+def _abs_from(base_dir: str, path: str) -> str:
+    expanded = os.path.expanduser(os.path.expandvars(str(path)))
+    if os.path.isabs(expanded):
+        return os.path.abspath(expanded)
+    return os.path.abspath(os.path.join(base_dir, expanded))
+
+
+def _load_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _cfg_get(cfg: Dict[str, Any], keys: Sequence[str], default: Any = None) -> Any:
+    cur: Any = cfg
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _coalesce(cli_value: Any, cfg: Dict[str, Any], cfg_keys: Sequence[str], default: Any) -> Any:
+    if cli_value is not None:
+        return cli_value
+    cfg_value = _cfg_get(cfg, cfg_keys, None)
+    if cfg_value is not None:
+        return cfg_value
+    return default
+
+
+def _parse_numeric_axis(raw: str, name: str, *, integer: bool) -> np.ndarray:
+    text = str(raw).strip()
+    if not text:
+        raise ValueError(f"{name} axis spec cannot be empty")
+
+    if ":" in text:
+        parts = [p.strip() for p in text.split(":")]
+        if len(parts) != 3:
+            raise ValueError(f"{name} axis range must be start:end:step, got {text!r}")
+        start = float(parts[0])
+        stop = float(parts[1])
+        step = float(parts[2])
+        if step <= 0:
+            raise ValueError(f"{name} axis step must be positive, got {step}")
+        if stop < start:
+            raise ValueError(f"{name} axis stop must be >= start, got {start}..{stop}")
+        values = np.arange(start, stop + 0.5 * step, step, dtype=np.float64)
+    else:
+        tokens = [t.strip() for t in text.split(",") if t.strip()]
+        if not tokens:
+            raise ValueError(f"{name} axis list is empty")
+        values = np.asarray([float(t) for t in tokens], dtype=np.float64)
+        values = np.sort(np.unique(values))
+
+    if values.size < 2:
+        raise ValueError(f"{name} axis must contain at least two points for linear interpolation")
+
+    diffs = np.diff(values)
+    ref = float(diffs[0])
+    tol = max(1e-10, abs(ref) * 1e-8)
+    if not np.allclose(diffs, ref, rtol=0.0, atol=tol):
+        raise ValueError(
+            f"{name} axis is not uniformly spaced; got steps like {diffs[:5].tolist()}"
+        )
+
+    if integer:
+        ints = np.rint(values).astype(np.int64)
+        if not np.allclose(values, ints.astype(np.float64), rtol=0.0, atol=1e-8):
+            raise ValueError(f"{name} axis requires integer values; got {values[:5].tolist()}")
+        return ints
+    return values.astype(np.float64)
+
+
+def _parse_turbvel_values(raw: str) -> np.ndarray:
+    tokens = [t.strip() for t in str(raw).split(",") if t.strip()]
+    if not tokens:
+        raise ValueError("turbvel axis cannot be empty")
+    out: List[str] = []
+    seen = set()
+    for token in tokens:
+        if token.lstrip("+-").isdigit():
+            token = f"{int(token):02d}"
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return np.asarray(out, dtype=object)
+
+
+def _build_regular_columns(
+    *,
+    teff_axis: np.ndarray,
+    logg_axis: np.ndarray,
+    feh_axis: np.ndarray,
+    turbvel_axis: np.ndarray,
+    grid_version: str,
+    lam_min: float,
+    lam_max: float,
+    lam_step: float,
+    output_mode: str,
+    mode: str,
+    calculation_mode: str,
+    abundances: Dict[str, str],
+    max_rows: int,
+) -> Dict[str, np.ndarray]:
+    nt = int(teff_axis.size)
+    ng = int(logg_axis.size)
+    nf = int(feh_axis.size)
+    nu = int(turbvel_axis.size)
+    row_count = nt * ng * nf * nu
+    if row_count <= 0:
+        raise ValueError("Computed row_count is zero")
+    if row_count > max_rows:
+        raise ValueError(
+            f"Grid would create {row_count:,} rows (> max_rows={max_rows:,}). "
+            "Lower axis resolutions or increase --max-rows."
+        )
+
+    teff = np.repeat(teff_axis.astype(np.int64), ng * nf * nu)
+    logg = np.tile(np.repeat(logg_axis.astype(np.float64), nf * nu), nt)
+    feh = np.tile(np.repeat(feh_axis.astype(np.float64), nu), nt * ng)
+    turbvel = np.tile(turbvel_axis.astype(object), nt * ng * nf)
+
+    columns: Dict[str, np.ndarray] = {
+        "grid_version": np.full(row_count, str(grid_version), dtype=object),
+        "teff": teff,
+        "logg": logg,
+        "feh": feh,
+        "lam_min": np.full(row_count, float(lam_min), dtype=np.float64),
+        "lam_max": np.full(row_count, float(lam_max), dtype=np.float64),
+        "lam_step": np.full(row_count, float(lam_step), dtype=np.float64),
+        "turbvel": turbvel,
+        # Keep t_value aligned with turbvel for compatibility with older readers.
+        "t_value": turbvel.copy(),
+        "a": np.full(row_count, abundances["a"], dtype=object),
+        "c": np.full(row_count, abundances["c"], dtype=object),
+        "n": np.full(row_count, abundances["n"], dtype=object),
+        "o": np.full(row_count, abundances["o"], dtype=object),
+        "r": np.full(row_count, abundances["r"], dtype=object),
+        "s": np.full(row_count, abundances["s"], dtype=object),
+        "output_mode": np.full(row_count, output_mode, dtype=object),
+        "mode": np.full(row_count, mode, dtype=object),
+        "calculation_mode": np.full(row_count, calculation_mode, dtype=object),
+    }
+    return columns
+
+
+def _run(cmd: Sequence[str]) -> None:
+    subprocess.run(list(cmd), check=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config-json", default=None, help="Optional regular-grid JSON config file")
+    parser.add_argument("--teff-axis", default=None, help="Teff axis (start:end:step or comma list)")
+    parser.add_argument("--logg-axis", default=None, help="logg axis (start:end:step or comma list)")
+    parser.add_argument("--feh-axis", default=None, help="feh axis (start:end:step or comma list)")
+    parser.add_argument("--turbvel-axis", default=None, help="Comma-separated turbvel identifiers")
+    parser.add_argument("--grid-version", default=None)
+
+    parser.add_argument("--lam-min", type=float, default=None)
+    parser.add_argument("--lam-max", type=float, default=None)
+    parser.add_argument("--lam-step", type=float, default=None)
+    parser.add_argument("--output-mode", default=None, choices=("Flux", "Intensity"))
+    parser.add_argument("--mode", default=None)
+    parser.add_argument("--calculation-mode", default=None)
+
+    parser.add_argument("--a", default=None, help="Fixed [alpha/Fe] value stored in grid column 'a'")
+    parser.add_argument("--c", default=None)
+    parser.add_argument("--n", default=None)
+    parser.add_argument("--o", default=None)
+    parser.add_argument("--r", default=None)
+    parser.add_argument("--s", default=None)
+
+    parser.add_argument("--run-root", default=None, help="Runtime root (defaults to RUN_ROOT/scratch)")
+    parser.add_argument("--grid-zarr", default=None, help="Output grid Zarr path")
+    parser.add_argument("--grid-csv", default=None, help="Optional grid CSV path")
+    parser.add_argument("--csv-compression", default=None, choices=("none", "gzip", "zstd"))
+    parser.add_argument("--csv-compression-level", type=int, default=None)
+    parser.add_argument("--zarr-chunks", type=int, default=None)
+    parser.add_argument("--zarr-compressor", default=None, help="JSON compressor config")
+
+    parser.add_argument("--max-rows", type=int, default=None, help="Safety cap for total grid rows")
+    parser.add_argument("--skip-synthesis", action="store_true", default=None, help="Only generate the regular grid")
+
+    parser.add_argument("--config", default=None, help="Turbospectrum synthesis config JSON path")
+    parser.add_argument("--spectra-zarr", default=None, help="Output synthesized spectra Zarr path")
+    parser.add_argument("--scratch", default=None, help="Optional scratch directory passed to synthesis")
+    parser.add_argument("--workers", type=int, default=None, help="Worker count passed to synthesis")
+    parser.add_argument("--chunk-rows", type=int, default=None, help="Output Zarr chunk_rows for synthesis output")
+    parser.add_argument("--output-tmp", default=None, help="Atomic tmp output path passed as --output-tmp")
+    parser.add_argument("--log-level", default=None, help="Logging level for synthesis script")
+    parser.add_argument("--log-file", default=None, help="Optional synthesis log file path")
+    args = parser.parse_args()
+
+    cfg: Dict[str, Any] = {}
+    cfg_dir = REPO_ROOT
+    if args.config_json:
+        cfg_path = _as_abspath(args.config_json)
+        cfg_dir = os.path.dirname(cfg_path)
+        cfg = _load_json(cfg_path)
+
+    teff_axis_spec = str(_coalesce(args.teff_axis, cfg, ("grid", "axes", "teff"), "4000:7000:250"))
+    logg_axis_spec = str(_coalesce(args.logg_axis, cfg, ("grid", "axes", "logg"), "0.0:5.0:0.5"))
+    feh_axis_spec = str(_coalesce(args.feh_axis, cfg, ("grid", "axes", "feh"), "-2.5:0.5:0.25"))
+    turbvel_axis_spec = str(_coalesce(args.turbvel_axis, cfg, ("grid", "axes", "turbvel"), "01,02,03"))
+    grid_version = str(_coalesce(args.grid_version, cfg, ("grid", "grid_version"), "regular-linear-v1"))
+
+    lam_min = float(_coalesce(args.lam_min, cfg, ("grid", "synthesis", "lam_min"), 8400.0))
+    lam_max = float(_coalesce(args.lam_max, cfg, ("grid", "synthesis", "lam_max"), 8800.0))
+    lam_step = float(_coalesce(args.lam_step, cfg, ("grid", "synthesis", "lam_step"), 0.01))
+    output_mode = str(_coalesce(args.output_mode, cfg, ("grid", "synthesis", "output_mode"), "Flux"))
+    mode = str(_coalesce(args.mode, cfg, ("grid", "synthesis", "mode"), "1D"))
+    calculation_mode = str(_coalesce(args.calculation_mode, cfg, ("grid", "synthesis", "calculation_mode"), "LTE"))
+    if output_mode not in {"Flux", "Intensity"}:
+        raise ValueError(f"output_mode must be Flux or Intensity, got {output_mode!r}")
+
+    csv_compression = str(_coalesce(args.csv_compression, cfg, ("grid", "io", "csv_compression"), "zstd")).lower()
+    if csv_compression not in {"none", "gzip", "zstd"}:
+        raise ValueError(f"csv_compression must be one of none/gzip/zstd, got {csv_compression!r}")
+    csv_compression_level = int(_coalesce(args.csv_compression_level, cfg, ("grid", "io", "csv_compression_level"), 5))
+    zarr_chunks = int(_coalesce(args.zarr_chunks, cfg, ("grid", "io", "zarr_chunks"), 2048))
+    max_rows = int(_coalesce(args.max_rows, cfg, ("grid", "limits", "max_rows"), 2_000_000))
+
+    zarr_compressor_raw = _coalesce(
+        args.zarr_compressor,
+        cfg,
+        ("grid", "io", "zarr_compressor"),
+        {"cname": "zstd", "clevel": 5, "shuffle": True},
+    )
+    if isinstance(zarr_compressor_raw, str):
+        try:
+            zarr_compressor = json.loads(zarr_compressor_raw) if zarr_compressor_raw else {}
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid --zarr-compressor JSON: {exc}") from exc
+    elif isinstance(zarr_compressor_raw, dict):
+        zarr_compressor = zarr_compressor_raw
+    else:
+        raise ValueError("zarr_compressor must be a JSON string or object mapping")
+
+    run_root_cfg = _cfg_get(cfg, ("outputs", "run_root"), None)
+    if args.run_root is not None:
+        run_root = _as_abspath(args.run_root)
+    elif run_root_cfg is not None:
+        run_root = _abs_from(cfg_dir, str(run_root_cfg))
+    else:
+        run_root = _default_run_root()
+
+    def _resolve_path(cli_value: Any, cfg_keys: Sequence[str], default_path: str) -> str:
+        if cli_value is not None:
+            return _as_abspath(str(cli_value))
+        cfg_value = _cfg_get(cfg, cfg_keys, None)
+        if cfg_value is not None:
+            return _abs_from(cfg_dir, str(cfg_value))
+        return os.path.abspath(default_path)
+
+    grid_zarr = _resolve_path(
+        args.grid_zarr,
+        ("outputs", "grid_zarr"),
+        os.path.join(run_root, "outputs", "grids", "regular_parameter_grid.zarr"),
+    )
+    grid_csv = _resolve_path(
+        args.grid_csv,
+        ("outputs", "grid_csv"),
+        os.path.join(run_root, "outputs", "grids", "regular_parameter_grid.csv"),
+    )
+    spectra_zarr = _resolve_path(
+        args.spectra_zarr,
+        ("outputs", "spectra_zarr"),
+        os.path.join(run_root, "outputs", "zarr", "regular_synthesized_spectra.zarr"),
+    )
+
+    synthesis_cfg_default = os.path.join(REPO_ROOT, "configs", "synthesis", "config_sample_comprehensive.json")
+    synthesis_cfg_from_template = _cfg_get(cfg, ("turbospectrum", "config"), None)
+    if synthesis_cfg_from_template is None:
+        synthesis_cfg_from_template = _cfg_get(cfg, ("runtime", "config"), None)
+    if args.config is not None:
+        config_path = _as_abspath(args.config)
+    elif synthesis_cfg_from_template is not None:
+        config_path = _abs_from(cfg_dir, str(synthesis_cfg_from_template))
+    else:
+        config_path = synthesis_cfg_default
+
+    workers_raw = _coalesce(args.workers, cfg, ("runtime", "workers"), None)
+    workers = int(workers_raw) if workers_raw not in (None, "") else None
+    chunk_rows = int(_coalesce(args.chunk_rows, cfg, ("runtime", "chunk_rows"), 32))
+    scratch_raw = _coalesce(args.scratch, cfg, ("runtime", "scratch"), None)
+    scratch = _abs_from(cfg_dir, str(scratch_raw)) if scratch_raw not in (None, "") else None
+    output_tmp_raw = _coalesce(args.output_tmp, cfg, ("runtime", "output_tmp"), None)
+    output_tmp = _abs_from(cfg_dir, str(output_tmp_raw)) if output_tmp_raw not in (None, "") else None
+    log_level = str(_coalesce(args.log_level, cfg, ("runtime", "log_level"), "INFO"))
+    log_file_raw = _coalesce(args.log_file, cfg, ("runtime", "log_file"), None)
+    log_file = _abs_from(cfg_dir, str(log_file_raw)) if log_file_raw not in (None, "") else None
+
+    skip_synthesis_cfg = _cfg_get(cfg, ("runtime", "skip_synthesis"), False)
+    skip_synthesis = bool(args.skip_synthesis) if args.skip_synthesis is not None else bool(skip_synthesis_cfg)
+
+    teff_axis = _parse_numeric_axis(teff_axis_spec, "teff", integer=True)
+    logg_axis = _parse_numeric_axis(logg_axis_spec, "logg", integer=False)
+    feh_axis = _parse_numeric_axis(feh_axis_spec, "feh", integer=False)
+    turbvel_axis = _parse_turbvel_values(turbvel_axis_spec)
+
+    if lam_step <= 0:
+        raise ValueError("lam-step must be positive")
+    if lam_max <= lam_min:
+        raise ValueError("lam-max must be greater than lam-min")
+
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Synthesis config not found: {config_path}")
+
+    abundances = {
+        "a": str(_coalesce(args.a, cfg, ("grid", "abundances", "a"), "+0.00")),
+        "c": str(_coalesce(args.c, cfg, ("grid", "abundances", "c"), "+0.00")),
+        "n": str(_coalesce(args.n, cfg, ("grid", "abundances", "n"), "+0.00")),
+        "o": str(_coalesce(args.o, cfg, ("grid", "abundances", "o"), "+0.00")),
+        "r": str(_coalesce(args.r, cfg, ("grid", "abundances", "r"), "+0.00")),
+        "s": str(_coalesce(args.s, cfg, ("grid", "abundances", "s"), "+0.00")),
+    }
+    columns = _build_regular_columns(
+        teff_axis=teff_axis,
+        logg_axis=logg_axis,
+        feh_axis=feh_axis,
+        turbvel_axis=turbvel_axis,
+        grid_version=grid_version,
+        lam_min=lam_min,
+        lam_max=lam_max,
+        lam_step=lam_step,
+        output_mode=output_mode,
+        mode=mode,
+        calculation_mode=calculation_mode,
+        abundances=abundances,
+        max_rows=max_rows,
+    )
+
+    print(
+        "[regular-grid] axes: "
+        f"teff={teff_axis.size} logg={logg_axis.size} feh={feh_axis.size} turbvel={turbvel_axis.size} "
+        f"rows={len(columns['teff']):,}"
+    )
+    print(f"[regular-grid] writing CSV: {grid_csv}")
+    print(f"[regular-grid] writing Zarr: {grid_zarr}")
+
+    sys.path.insert(0, SCRIPT_DIR)
+    import generate_grid as gg  # type: ignore
+
+    csv_compression_opt = None if csv_compression == "none" else csv_compression
+    gg._write_csv_outputs(columns, grid_csv, compression=csv_compression_opt, level=csv_compression_level)  # type: ignore[attr-defined]
+    gg._write_zarr_from_columns(columns, grid_zarr, chunks=zarr_chunks, compressor_cfg=zarr_compressor)  # type: ignore[attr-defined]
+
+    if skip_synthesis:
+        print("[regular-grid] skip-synthesis requested; done.")
+        return
+
+    cmd: List[str] = [
+        sys.executable,
+        os.path.join(SCRIPT_DIR, "synthesize_spectra_from_zarr.py"),
+        "--grid-zarr",
+        grid_zarr,
+        "--config",
+        config_path,
+        "--output-zarr",
+        spectra_zarr,
+        "--chunk-rows",
+        str(chunk_rows),
+        "--log-level",
+        log_level,
+        "--generator",
+        "turbospectrum_nlte.regular_grid",
+    ]
+    if workers and workers > 0:
+        cmd.extend(["--workers", str(workers)])
+    if scratch:
+        cmd.extend(["--scratch", scratch])
+    if output_tmp:
+        cmd.extend(["--output-tmp", output_tmp])
+    if log_file:
+        cmd.extend(["--log-file", log_file])
+
+    print("[regular-grid] launching synthesis...")
+    _run(cmd)
+    print(f"[regular-grid] wrote synthesized spectra Zarr: {spectra_zarr}")
+
+
+if __name__ == "__main__":
+    main()
