@@ -87,14 +87,26 @@ def _zarr_compression_kwargs(zarr_compressor_cfg: Mapping[str, Any]):
 
 
 def _list_shards(shard_paths: Sequence[str] | None, shard_dir: str | None) -> List[str]:
+    def _norm(path: str) -> str:
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
     if shard_paths:
-        return [os.path.abspath(p) for p in shard_paths]
+        return [_norm(p) for p in shard_paths]
     if not shard_dir:
         raise ValueError("Provide either --shard or --shard-dir")
-    shard_dir = os.path.abspath(shard_dir)
+    raw_shard_dir = shard_dir
+    shard_dir = _norm(shard_dir)
+    if not os.path.isdir(shard_dir):
+        raise FileNotFoundError(
+            f"Shard directory does not exist: {shard_dir} "
+            f"(input='{raw_shard_dir}', cwd='{os.getcwd()}')."
+        )
     paths = sorted(str(p) for p in Path(shard_dir).glob("*.zarr"))
     if not paths:
-        raise FileNotFoundError(f"No *.zarr shards found in {shard_dir}")
+        raise FileNotFoundError(
+            f"No *.zarr shards found in {shard_dir}. "
+            "If this came from $RUN_ROOT, ensure RUN_ROOT is an absolute path under /scratch."
+        )
     return paths
 
 
@@ -526,6 +538,9 @@ def _build_merge_provenance_payload(
 
 
 def main() -> None:
+    def _norm(path: str) -> str:
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
+
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-zarr", required=True, help="Consolidated output Zarr path")
@@ -557,7 +572,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.tmp_dir:
-        tmp_dir = os.path.abspath(args.tmp_dir)
+        tmp_dir = _norm(args.tmp_dir)
         os.makedirs(tmp_dir, exist_ok=True)
         os.environ["TMPDIR"] = tmp_dir
         os.environ["TMP"] = tmp_dir
@@ -565,7 +580,7 @@ def main() -> None:
         tempfile.tempdir = tmp_dir
 
     shards = _list_shards(args.shard, args.shard_dir)
-    out_path = os.path.abspath(args.output_zarr)
+    out_path = _norm(args.output_zarr)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     compressor_cfg: Dict[str, Any] = {}
@@ -575,7 +590,7 @@ def main() -> None:
 
     # Determine row_count.
     if args.grid_zarr:
-        row_count = _infer_row_count_from_grid(os.path.abspath(args.grid_zarr))
+        row_count = _infer_row_count_from_grid(_norm(args.grid_zarr))
     else:
         row_count = _infer_row_count_from_shards(shards)
     if row_count <= 0:
@@ -601,7 +616,7 @@ def main() -> None:
     grid_attrs: Dict[str, Any] = {}
     grid_provenance: Dict[str, str] = {}
     if args.grid_zarr:
-        grid_root = zarr.open_group(store=_zarr_store(os.path.abspath(args.grid_zarr)), mode="r")
+        grid_root = zarr.open_group(store=_zarr_store(_norm(args.grid_zarr)), mode="r")
         try:
             grid_attrs = {str(k): grid_root.attrs[k] for k in grid_root.attrs.keys()}
         except Exception:
