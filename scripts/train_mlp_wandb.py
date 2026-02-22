@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -531,6 +532,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-group", default=None, help="Weights & Biases group name")
     parser.add_argument("--wandb-tags", default="", help="Comma-separated W&B tags")
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
+    parser.add_argument(
+        "--wandb-sync-after-run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run `wandb sync` at the end (useful for offline runs on nodes with internet access).",
+    )
+    parser.add_argument(
+        "--wandb-sync-dir",
+        default=None,
+        help="Directory passed to `wandb sync` (default: --output-dir).",
+    )
+    parser.add_argument(
+        "--wandb-sync-include-offline",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include offline runs when syncing (`wandb sync --include-offline`).",
+    )
+    parser.add_argument(
+        "--wandb-sync-best-effort",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Do not fail the job if `wandb sync` fails.",
+    )
     parser.add_argument("--save-checkpoints", action="store_true", help="Save best params for each run")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser
@@ -974,6 +998,23 @@ def main() -> None:
             wb_run.finish()
 
     logger.info("Completed %d run(s)", len(indexed_specs))
+
+    if args.wandb_sync_after_run and args.wandb_mode != "disabled":
+        sync_dir = Path(args.wandb_sync_dir) if args.wandb_sync_dir else output_dir
+        cmd = [sys.executable, "-m", "wandb", "sync"]
+        if args.wandb_sync_include_offline:
+            cmd.append("--include-offline")
+        cmd.append(str(sync_dir))
+        logger.info("Running W&B sync: %s", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+            logger.info("W&B sync completed for %s", sync_dir)
+        except subprocess.CalledProcessError as exc:
+            msg = f"W&B sync failed (exit code {exc.returncode}) for {sync_dir}"
+            if args.wandb_sync_best_effort:
+                logger.warning(msg)
+            else:
+                raise RuntimeError(msg) from exc
 
 
 if __name__ == "__main__":
