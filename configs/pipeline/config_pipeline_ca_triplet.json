@@ -1,0 +1,97 @@
+{
+  "_comment": "Calcium triplet-focused pipeline config (8498, 8542, 8662 A).",
+  "_howto": [
+    "Run with: python scripts/pipeline_from_config.py --config configs/pipeline/config_pipeline_ca_triplet.json",
+    "For PBS runs, turbospectrum.pbs will override outputs to RUN_ROOT."
+  ],
+  "grid": {
+    "grid_version": "ca-triplet-v1",
+    "num_samples": 3000,
+    "seed": 20260222,
+    "bounds": {
+      "teff": { "min": 3500, "max": 7000 },
+      "logg": { "min": 0.0, "max": 5.0 },
+      "feh": { "min": -3.0, "max": 0.5 }
+    },
+    "sample_turbvel": true,
+    "turbvel_options": ["01", "02", "03"],
+    "t_value_options": ["01"],
+    "abundances": {
+      "a": { "min": -0.20, "max": 0.60 },
+      "c": "+0.00",
+      "n": "+0.00",
+      "o": "+0.00",
+      "r": "+0.00",
+      "s": "+0.00"
+    },
+    "synthesis": {
+      "lam_min": 8450,
+      "lam_max": 8700,
+      "lam_step": 0.01,
+      "output_mode": "Flux"
+    },
+    "mode": "1D",
+    "calculation_mode": "LTE",
+    "csv_compression": "zstd",
+    "csv_compression_level": 5,
+    "zarr": {
+      "chunks": 1024,
+      "compressor": { "cname": "zstd", "clevel": 5, "shuffle": true }
+    }
+  },
+  "turbospectrum": {
+    "project_root": "",
+    "compiler": "gf",
+    "force": false,
+    "max_workers": null,
+    "executables": {
+      "babsma_exec": "babsma_lu",
+      "bsyn_exec": "bsyn_lu",
+      "interpol_exec": "interpol_modeles"
+    },
+    "paths": {
+      "model_atmosphere_path": "",
+      "linelist_path": "",
+      "linelist_files": ["nlte_ges_linelist_jmg6may2025_I_II"],
+      "output_dir": "",
+      "log_dir": "",
+      "tmp_dir": "",
+      "model_opac_dir": "COM/contopac"
+    },
+    "synthesis_parameters": {
+      "calculate_intensity": false,
+      "mu_angles": [],
+      "mu_sampling": {
+        "mode": "none",
+        "count": 1,
+        "seed": 0,
+        "min": 0.0,
+        "max": 1.0,
+        "reduce": "first"
+      }
+    },
+    "nlte": {
+      "enabled": false,
+      "nlte_info_file": ""
+    },
+    "provenance": {
+      "linelist_version": "",
+      "atmosphere_geometry": "",
+      "atmosphere_version": "",
+      "synthesis_code_version": "",
+      "spice_version": "",
+      "environment_capture": "pip_freeze"
+    }
+  },
+  "outputs": {
+    "grid_csv": "../../runs/ca_triplet/outputs/grids/parameter_grid.csv",
+    "grid_zarr": "../../runs/ca_triplet/outputs/grids/parameter_grid.zarr",
+    "spectra_zarr": "../../runs/ca_triplet/outputs/zarr/synthesized_spectra.zarr",
+    "spectra_shard_template": "../../runs/ca_triplet/outputs/shards/spectra_shard_{shard_index}.zarr"
+  },
+  "runtime": {
+    "workers": null,
+    "scratch": null,
+    "chunk_rows": 32
+  }
+}
