@@ -1,0 +1,65 @@
+{
+  "_comment": "Regular Cartesian grid template for linear interpolation workflows.",
+  "_note": [
+    "Use with: python scripts/synthesize_regular_grid.py --config-json configs/pipeline/config_regular_grid.example.json",
+    "For HPC, use turbospectrum_regular_grid.pbs which rewrites outputs to RUN_ROOT on scratch."
+  ],
+  "grid": {
+    "grid_version": "regular-linear-v1",
+    "axes": {
+      "teff": "4000:7000:250",
+      "logg": "0.0:5.0:0.5",
+      "feh": "-2.5:0.5:0.25",
+      "turbvel": "01,02,03"
+    },
+    "abundances": {
+      "a": "+0.00",
+      "c": "+0.00",
+      "n": "+0.00",
+      "o": "+0.00",
+      "r": "+0.00",
+      "s": "+0.00"
+    },
+    "synthesis": {
+      "lam_min": 8400.0,
+      "lam_max": 8800.0,
+      "lam_step": 0.01,
+      "output_mode": "Flux",
+      "mode": "1D",
+      "calculation_mode": "LTE"
+    },
+    "limits": {
+      "max_rows": 2000000
+    },
+    "io": {
+      "csv_compression": "zstd",
+      "csv_compression_level": 5,
+      "zarr_chunks": 2048,
+      "zarr_compressor": {
+        "cname": "zstd",
+        "clevel": 5,
+        "shuffle": true
+      }
+    }
+  },
+  "turbospectrum": {
+    "_note": "Path to synthesis runtime config used by synthesize_spectra_from_zarr.py",
+    "config": "../synthesis/config_sample_comprehensive.json"
+  },
+  "outputs": {
+    "_note": "Paths resolved relative to this config unless absolute.",
+    "run_root": "../../runs/regular-grid",
+    "grid_csv": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.csv",
+    "grid_zarr": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.zarr",
+    "spectra_zarr": "../../runs/regular-grid/outputs/zarr/regular_synthesized_spectra.zarr"
+  },
+  "runtime": {
+    "workers": 16,
+    "scratch": null,
+    "chunk_rows": 32,
+    "output_tmp": null,
+    "log_level": "INFO",
+    "log_file": null,
+    "skip_synthesis": false
+  }
+}

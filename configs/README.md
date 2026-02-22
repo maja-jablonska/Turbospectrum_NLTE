@@ -10,6 +10,7 @@ Current canonical files:
 
 - `configs/pipeline/config_pipeline.example.json`: template.
 - `configs/pipeline/config_pipeline.json`: active pipeline config.
+- `configs/pipeline/config_regular_grid.example.json`: regular Cartesian grid template (linear interpolation workflows).
 - `configs/sampling/config_ml_sampling.json`: sampling-only config.
 - `configs/synthesis/config_sample_comprehensive.json`: full nested synthesis schema.
 - `configs/synthesis/config_sample.json`: compact flat synthesis schema (legacy-compatible).
