@@ -129,16 +129,29 @@ export TMP="${TMP_SYSTEM_DIR}"
 export TEMP="${TMP_SYSTEM_DIR}"
 
 TASK_ORDINAL="${PBS_ARRAY_INDEX:-0}"
-LINE_NO=$((TASK_ORDINAL + 1))
-SHARD_INDEX="$(sed -n "${LINE_NO}p" "${MISSING_IDS_FILE}" | tr -d '[:space:]')"
-if [[ -z "${SHARD_INDEX}" ]]; then
-  echo "[resume-missing] ERROR: no shard ID at line ${LINE_NO} in ${MISSING_IDS_FILE}" >&2
+if ! [[ "${TASK_ORDINAL}" =~ ^[0-9]+$ ]]; then
+  echo "[resume-missing] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${TASK_ORDINAL}'." >&2
   exit 2
 fi
-if ! [[ "${SHARD_INDEX}" =~ ^[0-9]+$ ]]; then
-  echo "[resume-missing] ERROR: invalid shard ID '${SHARD_INDEX}' at line ${LINE_NO}" >&2
+mapfile -t SHARD_IDS < <(
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+      gsub(/[[:space:]]/, "", $0)
+      print $0
+    }
+  ' "${MISSING_IDS_FILE}"
+)
+MISSING_COUNT="${#SHARD_IDS[@]}"
+if (( MISSING_COUNT == 0 )); then
+  echo "[resume-missing] INFO: no valid shard IDs found in ${MISSING_IDS_FILE}. Nothing to resume." >&2
+  exit 0
+fi
+if (( TASK_ORDINAL >= MISSING_COUNT )); then
+  echo "[resume-missing] ERROR: task index ${TASK_ORDINAL} out of range for ${MISSING_COUNT} shard IDs in ${MISSING_IDS_FILE}." >&2
   exit 2
 fi
+SHARD_INDEX="${SHARD_IDS[TASK_ORDINAL]}"
 
 OUT="${OUT_DIR}/spectra_shard_${SHARD_INDEX}.zarr"
 SCRATCH="${TMP_WORK_DIR}/shard_${SHARD_INDEX}"

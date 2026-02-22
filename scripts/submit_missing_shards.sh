@@ -73,6 +73,7 @@ GRID_ZARR="${GRID_ZARR:-${RUN_ROOT}/outputs/grids/parameter_grid.zarr}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 PBS_LOG_DIR="${RUN_ROOT}/logs/pbs"
 CHUNK_DIR="${RUN_ROOT}/missing_shards_chunks"
+SANITIZED_MISSING_FILE="${CHUNK_DIR}/missing_shards.numeric.txt"
 
 if [[ ! -d "${SHARDS_DIR}" ]]; then
   echo "ERROR: shard directory not found: ${SHARDS_DIR}" >&2
@@ -138,7 +139,15 @@ fi
   --expected-shards "${EXPECTED_SHARDS}" \
   --output "${MISSING_FILE}"
 
-MISSING_COUNT="$(wc -l < "${MISSING_FILE}" | tr -d '[:space:]')"
+awk '
+  /^[[:space:]]*#/ { next }
+  /^[[:space:]]*[0-9]+[[:space:]]*$/ {
+    gsub(/[[:space:]]/, "", $0)
+    print $0
+  }
+' "${MISSING_FILE}" > "${SANITIZED_MISSING_FILE}"
+
+MISSING_COUNT="$(wc -l < "${SANITIZED_MISSING_FILE}" | tr -d '[:space:]')"
 if (( MISSING_COUNT == 0 )); then
   echo "No missing shards detected. Nothing to submit."
   exit 0
@@ -147,6 +156,7 @@ fi
 echo "Missing shards: ${MISSING_COUNT}"
 echo "Max array size per submit: ${MAX_ARRAY_SIZE}"
 echo "Missing file: ${MISSING_FILE}"
+echo "Sanitized missing file: ${SANITIZED_MISSING_FILE}"
 echo "PBS script: ${PBS_SCRIPT}"
 echo "Python bin: ${PYTHON_BIN}"
 if [[ -n "${SCRATCH_TMP_ROOT}" ]]; then
@@ -167,7 +177,7 @@ while (( START < MISSING_COUNT )); do
   fi
 
   CHUNK_FILE="${CHUNK_DIR}/missing_chunk_${CHUNK_ID}.txt"
-  sed -n "$((START + 1)),$((END + 1))p" "${MISSING_FILE}" > "${CHUNK_FILE}"
+  sed -n "$((START + 1)),$((END + 1))p" "${SANITIZED_MISSING_FILE}" > "${CHUNK_FILE}"
 
   CHUNK_COUNT=$(( END - START + 1 ))
   ARRAY_RANGE="0-$((CHUNK_COUNT - 1))"
