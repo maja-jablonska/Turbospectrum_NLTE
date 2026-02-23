@@ -76,7 +76,7 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   fi
 fi
 
-RUN_ROOT="/scratch/${PROJECT}/${USER}/turbospec_smoke/${PBS_JOBID}"
+RUN_ROOT="/scratch/${PROJECT}/${USER}/Turbospectrum_NLTE_smoke/${PBS_JOBID}"
 
 echo "[gadi-smoke] repo=${PBS_O_WORKDIR}"
 echo "[gadi-smoke] run_root=${RUN_ROOT}"
