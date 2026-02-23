@@ -153,6 +153,36 @@ for batch in loaders["train"]:
 
 Install dependencies with `pip install zarr numpy "jax[cpu]"` (or your accelerator-specific JAX build).
 
+#### Lazy spectrum lookup by parameter combination
+
+To fetch one spectrum lazily (without loading the full `flux` array), use:
+
+```bash
+python3 scripts/lazy_spectrum_loader.py spectra_tiny.zarr \
+  --param teff=5000 \
+  --param logg=4.0 \
+  --param feh=-1.0 \
+  --param vmicro=2.0 \
+  --param a=0.0 \
+  --param c=0.0 \
+  --param n=0.0 \
+  --param o=0.0 \
+  --param r=0.0 \
+  --param s=0.0
+```
+
+Programmatic usage:
+
+```python
+from scripts.lazy_spectrum_loader import LazySpectrumLoader
+
+loader = LazySpectrumLoader("spectra_tiny.zarr")
+match = loader.fetch_spectrum(
+    {"teff": 5000.0, "logg": 4.0, "feh": -1.0, "vmicro": 2.0, "a": 0.0, "c": 0.0, "n": 0.0, "o": 0.0, "r": 0.0, "s": 0.0}
+)
+print(match.row_index, match.spectrum.shape)
+```
+
 ### 2. Run The Pipeline (Single Command)
 
 Run from one config:

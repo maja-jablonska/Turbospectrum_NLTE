@@ -7,6 +7,7 @@
 #PBS -l jobfs=20GB
 #PBS -l walltime=12:00:00
 #PBS -j oe
+#PBS -r y
 #PBS -l storage=scratch/mk27+scratch/y89
 
 set -euo pipefail
