@@ -431,8 +431,16 @@ def _load_config(config_path: str, project_root: str) -> TurbospectrumConfig:
     cfg_data = _normalize_config_dict(cfg_data, default_project_root=project_root)
     accepted_fields = {fld.name for fld in dataclasses.fields(TurbospectrumConfig)}
     cfg_data = {k: v for k, v in cfg_data.items() if k in accepted_fields}
-    if "project_root" not in cfg_data:
+    cfg_project_root = cfg_data.get("project_root")
+    cfg_project_root_abs = ""
+    if cfg_project_root not in (None, ""):
+        cfg_project_root_abs = str(cfg_project_root).strip()
+        if cfg_project_root_abs and not os.path.isabs(cfg_project_root_abs):
+            cfg_project_root_abs = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(config_path)), cfg_project_root_abs))
+    if not cfg_project_root_abs or not os.path.isdir(cfg_project_root_abs):
         cfg_data["project_root"] = project_root
+    else:
+        cfg_data["project_root"] = cfg_project_root_abs
     return TurbospectrumConfig(**cfg_data)
 
 
