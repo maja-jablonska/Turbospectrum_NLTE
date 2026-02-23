@@ -83,7 +83,7 @@ echo "[regular-grid] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 
 PROJECT="${PROJECT:-mk27}"
 USER_ID="${USER_ID:-$(whoami)}"
-RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/turbospec_regular}"
+RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE_regular}"
 REPO="${REPO:-${PBS_O_WORKDIR}}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_regular_grid.example.json}"
 WORKERS="${WORKERS:-${PBS_NCPUS:-32}}"
