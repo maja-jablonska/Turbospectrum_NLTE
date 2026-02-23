@@ -44,12 +44,15 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
         key in cfg_data for key in ("paths", "executables", "synthesis_parameters", "nlte")
     )
     if not has_nested_sections:
-        if "project_root" not in cfg_data:
+        if not cfg_data.get("project_root"):
             cfg_data["project_root"] = default_project_root
         return cfg_data
 
     flat: dict = {}
-    flat["project_root"] = cfg_data.get("project_root", default_project_root)
+    cfg_project_root = cfg_data.get("project_root", default_project_root)
+    if not cfg_project_root:
+        cfg_project_root = default_project_root
+    flat["project_root"] = cfg_project_root
     flat["compiler"] = cfg_data.get("compiler", "gf")
     flat["force"] = cfg_data.get("force", False)
     flat["max_workers"] = cfg_data.get("max_workers", None)
