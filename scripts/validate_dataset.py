@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
 
 import numpy as np
 import zarr
+from provenance_contract import (
+    REQUIRED_PROVENANCE_FIELDS,
+    is_meaningful_provenance_value,
+)
 
 
 ############################################
@@ -14,6 +19,14 @@ import zarr
 ############################################
 
 SHARD_REGEX = re.compile(r"spectra_shard_(\d+)\.zarr")
+PROVENANCE_FILENAMES = (
+    "canonical_config.yaml",
+    "synthesis_config.yaml",
+    "linelist_manifest.json",
+    "atmosphere_manifest.json",
+    "software_manifest.json",
+    "environment.txt",
+)
 
 
 def extract_shard_id(path: Path):
@@ -29,11 +42,31 @@ def is_valid_zarr(path: Path):
         return False
 
 
+def _contract_fields_from_attrs(root) -> dict[str, str]:
+    attrs = dict(root.attrs)
+    out = {
+        "config_hash": str(attrs.get("config_hash", "")),
+        "grid_definition_hash": str(attrs.get("grid_definition_hash", "")),
+        "git_commit": str(attrs.get("git_commit") or attrs.get("git_sha") or ""),
+        "turbospectrum_version": str(attrs.get("turbospectrum_version") or attrs.get("synthesis_code_version") or ""),
+        "linelist_identifier": str(attrs.get("linelist_identifier") or attrs.get("linelist_path") or attrs.get("linelist_files") or ""),
+        "linelist_version": str(attrs.get("linelist_version", "")),
+        "atmosphere_model_identifier": str(attrs.get("atmosphere_model_identifier") or attrs.get("model_atmosphere_path") or ""),
+        "synthesis_timestamp": str(attrs.get("synthesis_timestamp") or attrs.get("created_utc") or ""),
+        "pipeline_version": str(attrs.get("pipeline_version") or attrs.get("spice_version") or ""),
+    }
+    return out
+
+
+def _missing_contract_fields(fields: dict[str, str]) -> list[str]:
+    return [key for key in REQUIRED_PROVENANCE_FIELDS if not is_meaningful_provenance_value(fields.get(key))]
+
+
 ############################################
 # Shard Validation
 ############################################
 
-def validate_shard(path: Path, reference_wavelength=None):
+def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance: bool = True):
 
     info = {
         "spectra": 0,
@@ -91,6 +124,31 @@ def validate_shard(path: Path, reference_wavelength=None):
             if not np.array_equal(wavelength[:], reference_wavelength):
                 return False, {"wavelength_mismatch": True}
 
+        if enforce_provenance:
+            contract_fields = _contract_fields_from_attrs(root)
+            missing_contract = _missing_contract_fields(contract_fields)
+            if missing_contract:
+                return False, {"missing_provenance_fields": missing_contract}
+
+            if "provenance" not in root:
+                return False, {"missing_provenance_group": True}
+            provenance = root["provenance"]
+            missing_files = [name for name in PROVENANCE_FILENAMES if name not in provenance]
+            if missing_files:
+                return False, {"missing_provenance_files": missing_files}
+
+            # Basic payload sanity: manifests should be non-empty and JSON parseable.
+            for name in ("canonical_config.yaml", "synthesis_config.yaml", "linelist_manifest.json", "atmosphere_manifest.json", "software_manifest.json"):
+                try:
+                    raw = provenance[name][...]
+                    text = str(raw.item() if hasattr(raw, "item") else raw).strip()
+                    if not text:
+                        return False, {"empty_provenance_file": name}
+                    if name.endswith(".json"):
+                        json.loads(text)
+                except Exception as exc:  # noqa: BLE001
+                    return False, {"invalid_provenance_file": {name: str(exc)}}
+
         return True, info
 
     except Exception as e:
@@ -134,7 +192,7 @@ def check_completeness(shards, expected_count):
 # Main Validator
 ############################################
 
-def validate_dataset(shard_dir: Path, expected_shards: int):
+def validate_dataset(shard_dir: Path, expected_shards: int, *, allow_incomplete_provenance: bool):
 
     shards = sorted(shard_dir.glob("spectra_shard_*.zarr"))
 
@@ -180,7 +238,11 @@ def validate_dataset(shard_dir: Path, expected_shards: int):
 
     for shard in shards:
 
-        ok, info = validate_shard(shard, reference_wavelength)
+        ok, info = validate_shard(
+            shard,
+            reference_wavelength,
+            enforce_provenance=not allow_incomplete_provenance,
+        )
 
         if not ok:
             failures.append((shard.name, info))
@@ -231,10 +293,16 @@ if __name__ == "__main__":
         required=True,
         help="Total shard count from grid definition"
     )
+    parser.add_argument(
+        "--allow-incomplete-provenance",
+        action="store_true",
+        help="Allow shards that do not satisfy provenance/hash contract fields.",
+    )
 
     args = parser.parse_args()
 
     validate_dataset(
         Path(args.shard_dir),
-        args.expected_shards
+        args.expected_shards,
+        allow_incomplete_provenance=bool(args.allow_incomplete_provenance),
     )
