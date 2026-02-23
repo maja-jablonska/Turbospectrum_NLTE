@@ -286,3 +286,21 @@ Behavior summary:
 - reads default grid/shard/merged output paths from `outputs` in the pipeline config
 - uses `RUN_ROOT` for queue state/log/tmp directories (and as a fallback when output paths are missing)
 - validates shard completeness with `scripts/validate_dataset.py` before merge
+
+## W&B on Gadi/HPC (MLP)
+
+W&B defaults for `wandb_agent.pbs` and `wandb_sync.pbs` are now centralized in:
+
+`configs/training/wandb_hpc.env`
+
+Edit that file once to set:
+- `WANDB_PROJECT` / `WANDB_ENTITY` / `WANDB_GROUP` / `WANDB_TAGS`
+- `RUN_DIR` (MLP run outputs)
+- `WANDB_LOCAL_DIR` (where local W&B files are written)
+- `WANDB_SYNC_DIR` (directory used by sync job)
+
+Default local W&B files are easy to find at:
+
+`runs/mlp_wandb/wandb/`
+
+You can still override any setting per job with `qsub -v`.

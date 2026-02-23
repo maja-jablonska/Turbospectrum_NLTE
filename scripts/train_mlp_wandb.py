@@ -111,6 +111,16 @@ def _split_csv(raw: str) -> list[str]:
     return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
+def _env_or_default(name: str, default: str | None = None) -> str | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if value == "":
+        return default if default is not None else None
+    return value
+
+
 def _parse_float_grid(raw: str) -> list[float]:
     values = [float(v) for v in _split_csv(raw)]
     if not values:
@@ -495,7 +505,11 @@ class BatchAdapter:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zarr-path", "--zarr_path", default=None, help="Path to synthesized spectra Zarr store")
-    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Output directory for run artifacts")
+    parser.add_argument(
+        "--output-dir",
+        default=_env_or_default("RUN_DIR", str(DEFAULT_OUTPUT_DIR)),
+        help="Output directory for run artifacts",
+    )
     parser.add_argument("--sweep-config", default=None, help="JSON file with either 'runs' or 'grid' definitions")
     parser.add_argument("--example-sweep-config", action="store_true", help="Print example sweep config path and exit")
 
@@ -535,10 +549,31 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-index-env", default="", help="Read run index from env var (e.g. PBS_ARRAY_INDEX)")
     parser.add_argument("--run-index-offset", type=int, default=0, help="Subtract this offset from env run index")
 
-    parser.add_argument("--wandb-project", default="turbospectrum-mlp", help="Weights & Biases project")
-    parser.add_argument("--wandb-entity", default=None, help="Weights & Biases entity/user/team")
-    parser.add_argument("--wandb-group", default=None, help="Weights & Biases group name")
-    parser.add_argument("--wandb-tags", default="", help="Comma-separated W&B tags")
+    parser.add_argument(
+        "--wandb-project",
+        default=_env_or_default("WANDB_PROJECT", "turbospectrum-mlp"),
+        help="Weights & Biases project",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        default=_env_or_default("WANDB_ENTITY", None),
+        help="Weights & Biases entity/user/team",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        default=_env_or_default("WANDB_GROUP", None),
+        help="Weights & Biases group name",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        default=_env_or_default("WANDB_TAGS", ""),
+        help="Comma-separated W&B tags",
+    )
+    parser.add_argument(
+        "--wandb-dir",
+        default=_env_or_default("WANDB_LOCAL_DIR", _env_or_default("WANDB_DIR", None)),
+        help="Directory for local W&B run files (default: <output-dir>/wandb)",
+    )
     parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
     parser.add_argument(
         "--wandb-sync-after-run",
@@ -548,8 +583,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--wandb-sync-dir",
-        default=None,
-        help="Directory passed to `wandb sync` (default: --output-dir).",
+        default=_env_or_default("WANDB_SYNC_DIR", None),
+        help="Directory passed to `wandb sync` (default: --wandb-dir).",
     )
     parser.add_argument(
         "--wandb-sync-include-offline",
@@ -752,9 +787,13 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    wandb_dir = Path(args.wandb_dir) if args.wandb_dir else (output_dir / "wandb")
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["WANDB_DIR"] = str(wandb_dir)
 
     logger.info("Dataset: %s", zarr_path)
     logger.info("Rows: %d | Flux dim: %d | Target axis points: %d | Axis: %s", int(root["flux"].shape[0]), int(root["flux"].shape[1]), int(resampler.target_axis.size), axis_name)
+    logger.info("W&B local dir: %s", wandb_dir)
     logger.info("Generated %d run specs; executing %d run(s)", len(specs), len(indexed_specs))
 
     loader_cache: dict[int, Mapping[str, Any]] = {}
@@ -895,7 +934,7 @@ def main() -> None:
                 tags=[t for t in _split_csv(args.wandb_tags) if t],
                 mode=args.wandb_mode,
                 name=run_name,
-                dir=str(run_dir),
+                dir=str(wandb_dir),
                 config=run_cfg,
                 reinit=True,
             )
@@ -1022,7 +1061,7 @@ def main() -> None:
     logger.info("Completed %d run(s)", len(indexed_specs))
 
     if args.wandb_sync_after_run and args.wandb_mode != "disabled":
-        sync_dir = Path(args.wandb_sync_dir) if args.wandb_sync_dir else output_dir
+        sync_dir = Path(args.wandb_sync_dir) if args.wandb_sync_dir else wandb_dir
         cmd = [sys.executable, "-m", "wandb", "sync"]
         if args.wandb_sync_include_offline:
             cmd.append("--include-offline")
