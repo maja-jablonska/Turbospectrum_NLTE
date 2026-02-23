@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib.metadata
 import itertools
 import json
 import logging
@@ -83,6 +84,13 @@ def _zarr_store(path: str):
     if hasattr(zstorage, "LocalStore"):
         return zstorage.LocalStore(path)  # type: ignore[attr-defined]
     raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+
+
+def _installed_version(package_name: str) -> str:
+    try:
+        return importlib.metadata.version(package_name)
+    except Exception:  # noqa: BLE001
+        return "not installed"
 
 
 def _open_zarr_root(path: Path):
@@ -627,12 +635,26 @@ def main() -> None:
             raise ImportError("wandb is required unless --wandb-mode=disabled") from exc
         wandb = _wandb
 
+    versions = {
+        "numpy": _installed_version("numpy"),
+        "jax": _installed_version("jax"),
+        "jaxlib": _installed_version("jaxlib"),
+        "flax": _installed_version("flax"),
+        "optax": _installed_version("optax"),
+    }
+
     try:
+        # Basic runtime math preflight.
         _ = (jnp.asarray([1.0], dtype=jnp.float32) + 1.0).block_until_ready()
+        # RNG preflight catches common JAX/NumPy mismatches early (before starting W&B runs).
+        key = jax.random.PRNGKey(0)
+        _ = jax.random.normal(key, shape=(1,), dtype=jnp.float32).block_until_ready()
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             f"JAX runtime failed for platform '{args.jax_platform}'. "
-            "Set --jax-platform cpu or fix the local JAX backend setup."
+            f"Installed versions: {versions}. "
+            "Set --jax-platform cpu or fix the local JAX/NumPy stack. "
+            "Recommended: `pip install --upgrade --force-reinstall -r requirements-flax-ml.txt`."
         ) from exc
 
     root = _open_zarr_root(zarr_path)
