@@ -26,7 +26,9 @@
       "lam_step": 0.01,
       "output_mode": "Flux",
       "mode": "1D",
-      "calculation_mode": "LTE"
+      "calculation_mode": "LTE",
+      "_mu_range_note": "Optional mu sampling range for intensity post-processing (start:end:step or comma list).",
+      "mu_range": null
     },
     "limits": {
       "max_rows": 2000000

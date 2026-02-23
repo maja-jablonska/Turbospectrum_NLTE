@@ -188,6 +188,39 @@ def _run(cmd: Sequence[str]) -> None:
     subprocess.run(list(cmd), check=True)
 
 
+def _write_mu_range_config(
+    *,
+    base_config_path: str,
+    run_root: str,
+    mu_axis: np.ndarray,
+) -> str:
+    mu_min = float(np.min(mu_axis))
+    mu_max = float(np.max(mu_axis))
+    if mu_min < -1e-8 or mu_max > 1.0 + 1e-8:
+        raise ValueError(f"mu range must stay within [0, 1], got {mu_min}..{mu_max}")
+
+    cfg = _load_json(base_config_path)
+    synthesis = cfg.setdefault("synthesis_parameters", {})
+    if not isinstance(synthesis, dict):
+        raise ValueError("synthesis_parameters must be a JSON object in synthesis config")
+    mu_sampling = synthesis.setdefault("mu_sampling", {})
+    if not isinstance(mu_sampling, dict):
+        raise ValueError("synthesis_parameters.mu_sampling must be a JSON object in synthesis config")
+    mode = str(mu_sampling.get("mode", "none")).strip().lower()
+    if mode in {"", "none"}:
+        mu_sampling["mode"] = "random"
+    mu_sampling.setdefault("count", 1)
+    mu_sampling["min"] = mu_min
+    mu_sampling["max"] = mu_max
+
+    cfg_dir = os.path.join(run_root, "config")
+    os.makedirs(cfg_dir, exist_ok=True)
+    dst = os.path.join(cfg_dir, "synthesis_config.mu_range.json")
+    with open(dst, "w", encoding="utf-8") as handle:
+        json.dump(cfg, handle, indent=2, sort_keys=True)
+    return dst
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-json", default=None, help="Optional regular-grid JSON config file")
@@ -243,6 +276,8 @@ def main() -> None:
     logg_axis_spec = str(_coalesce(args.logg_axis, cfg, ("grid", "axes", "logg"), "0.0:5.0:0.5"))
     feh_axis_spec = str(_coalesce(args.feh_axis, cfg, ("grid", "axes", "feh"), "-2.5:0.5:0.25"))
     turbvel_axis_spec = str(_coalesce(args.turbvel_axis, cfg, ("grid", "axes", "turbvel"), "01,02,03"))
+    mu_range_spec_raw = _cfg_get(cfg, ("grid", "synthesis", "mu_range"), None)
+    mu_range_spec = None if mu_range_spec_raw in (None, "") else str(mu_range_spec_raw)
     grid_version = str(_coalesce(args.grid_version, cfg, ("grid", "grid_version"), "regular-linear-v1"))
 
     lam_min = float(_coalesce(args.lam_min, cfg, ("grid", "synthesis", "lam_min"), 8400.0))
@@ -338,6 +373,7 @@ def main() -> None:
     logg_axis = _parse_numeric_axis(logg_axis_spec, "logg", integer=False)
     feh_axis = _parse_numeric_axis(feh_axis_spec, "feh", integer=False)
     turbvel_axis = _parse_turbvel_values(turbvel_axis_spec)
+    mu_axis = _parse_numeric_axis(mu_range_spec, "mu", integer=False) if mu_range_spec is not None else None
 
     if lam_step <= 0:
         raise ValueError("lam-step must be positive")
@@ -346,6 +382,8 @@ def main() -> None:
 
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"Synthesis config not found: {config_path}")
+    if mu_axis is not None:
+        config_path = _write_mu_range_config(base_config_path=config_path, run_root=run_root, mu_axis=mu_axis)
 
     abundances = {
         "a": str(_coalesce(args.a, cfg, ("grid", "abundances", "a"), "+0.00")),
@@ -376,6 +414,12 @@ def main() -> None:
         f"teff={teff_axis.size} logg={logg_axis.size} feh={feh_axis.size} turbvel={turbvel_axis.size} "
         f"rows={len(columns['teff']):,}"
     )
+    if mu_axis is not None:
+        print(
+            "[regular-grid] mu range: "
+            f"{float(np.min(mu_axis)):.6f}..{float(np.max(mu_axis)):.6f} "
+            f"({mu_axis.size} points -> mu_sampling min/max)"
+        )
     print(f"[regular-grid] writing CSV: {grid_csv}")
     print(f"[regular-grid] writing Zarr: {grid_zarr}")
 
