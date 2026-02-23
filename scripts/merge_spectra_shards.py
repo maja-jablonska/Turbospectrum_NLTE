@@ -35,6 +35,12 @@ from typing import Any, Dict, List, Mapping, Sequence, Set, Tuple
 
 import numpy as np
 import zarr
+from provenance_contract import (
+    assert_required_provenance_fields,
+    canonical_json_sha256,
+    compute_grid_definition_hash,
+    is_meaningful_provenance_value,
+)
 
 PROVENANCE_FILENAMES: Tuple[str, ...] = (
     "canonical_config.yaml",
@@ -272,7 +278,7 @@ def _git_commit(project_root: str) -> str:
         out = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_root, stderr=subprocess.DEVNULL, timeout=3)
         return out.decode("utf-8").strip()
     except Exception:
-        return "unknown"
+        return ""
 
 
 def _stable_numeric_digest(values: np.ndarray, dtype: str) -> str:
@@ -406,6 +412,33 @@ def _physics_relevant_grid_attrs(attrs: Mapping[str, Any]) -> Dict[str, str]:
     return out
 
 
+def _grid_columns_for_hash(grid_root) -> Dict[str, np.ndarray]:
+    keys = (
+        "teff",
+        "logg",
+        "feh",
+        "turbvel",
+        "t_value",
+        "lam_min",
+        "lam_max",
+        "lam_step",
+        "a",
+        "c",
+        "n",
+        "o",
+        "r",
+        "s",
+        "output_mode",
+        "calculation_mode",
+        "grid_version",
+    )
+    out: Dict[str, np.ndarray] = {}
+    for key in keys:
+        if key in grid_root:
+            out[key] = np.asarray(grid_root[key][:])
+    return out
+
+
 def _compute_merge_physics_hash(
     *,
     wavelengths: np.ndarray,
@@ -496,8 +529,8 @@ def _build_merge_provenance_payload(
         keys=("linelist_version", "line_version", "linelist_rev"),
     )
     linelist_manifest = {
-        "source": linelist_source or "not_recorded",
-        "version": linelist_version or "not_recorded",
+        "source": linelist_source or "",
+        "version": linelist_version or "",
         "attrs": _attrs_with_tokens(attr_sources, tokens=("linelist", "line")),
     }
 
@@ -508,9 +541,9 @@ def _build_merge_provenance_payload(
     atmosphere_geometry = _first_attr_value(attr_sources, keys=("geometry", "atmosphere_geometry"))
     atmosphere_version = _first_attr_value(attr_sources, keys=("atmosphere_version", "model_version"))
     atmosphere_manifest = {
-        "source": atmosphere_source or "not_recorded",
-        "geometry": atmosphere_geometry or "not_recorded",
-        "version": atmosphere_version or "not_recorded",
+        "source": atmosphere_source or "",
+        "geometry": atmosphere_geometry or "",
+        "version": atmosphere_version or "",
         "attrs": _attrs_with_tokens(attr_sources, tokens=("atmos", "model")),
     }
 
@@ -518,8 +551,8 @@ def _build_merge_provenance_payload(
         "generator": args_generator,
         "git_commit": git_commit,
         "python": sys.version.split()[0],
-        "compiler": _first_attr_value(attr_sources, keys=("compiler",)) or "not_recorded",
-        "nlte": _first_attr_value(attr_sources, keys=("nlte", "nlte_enabled")) or "not_recorded",
+        "compiler": _first_attr_value(attr_sources, keys=("compiler",)) or "",
+        "nlte": _first_attr_value(attr_sources, keys=("nlte", "nlte_enabled")) or "",
         "attrs": _attrs_with_tokens(attr_sources, tokens=("version", "commit", "compiler", "software")),
     }
 
@@ -586,6 +619,11 @@ def main() -> None:
     parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
     parser.add_argument("--generator", default="turbospectrum_nlte.merge", help="Generator string for metadata")
     parser.add_argument("--flux-definition", default="continuum_normalized", help="Flux definition metadata")
+    parser.add_argument(
+        "--allow-incomplete-provenance",
+        action="store_true",
+        help="Allow writing merged outputs even when required provenance contract fields are missing.",
+    )
     parser.add_argument(
         "--allow-missing",
         action="store_true",
@@ -966,6 +1004,7 @@ def main() -> None:
             grid_attrs=grid_attrs,
         )
     git_commit = _git_commit(project_root)
+    created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     param_names_u32 = _to_u32_param_names(param_name_list)
     root_out.create_array(
@@ -1018,6 +1057,81 @@ def main() -> None:
             compression_kwargs=compression_kwargs,
         )
 
+    attr_sources: List[Mapping[str, Any]] = [grid_attrs]
+    attr_sources.extend(shard_attr_snapshots)
+    try:
+        linelist_manifest = json.loads(provenance_payload.get("linelist_manifest.json", "{}"))
+    except Exception:
+        linelist_manifest = {}
+    try:
+        atmosphere_manifest = json.loads(provenance_payload.get("atmosphere_manifest.json", "{}"))
+    except Exception:
+        atmosphere_manifest = {}
+    try:
+        software_manifest = json.loads(provenance_payload.get("software_manifest.json", "{}"))
+    except Exception:
+        software_manifest = {}
+
+    config_hash = _first_attr_value(attr_sources, keys=("config_hash",))
+    if not is_meaningful_provenance_value(config_hash):
+        config_hash = canonical_json_sha256({"synthesis_config.yaml": provenance_payload.get("synthesis_config.yaml", "")})
+
+    grid_definition_hash = _first_attr_value(attr_sources, keys=("grid_definition_hash",))
+    if (not is_meaningful_provenance_value(grid_definition_hash)) and grid_root is not None:
+        grid_definition_hash = compute_grid_definition_hash(_grid_columns_for_hash(grid_root))
+    if not is_meaningful_provenance_value(grid_definition_hash):
+        grid_definition_hash = canonical_json_sha256(
+            {
+                "grid_reference": args.grid_zarr or "not_provided",
+                "row_count": int(row_count),
+                "physics_hash": physics_hash,
+            }
+        )
+
+    turbospectrum_version = _first_attr_value(attr_sources, keys=("turbospectrum_version", "synthesis_code_version"))
+    if not is_meaningful_provenance_value(turbospectrum_version):
+        turbospectrum_version = str(software_manifest.get("synthesis_code_version", "")).strip()
+
+    linelist_identifier = _first_attr_value(
+        attr_sources,
+        keys=("linelist_identifier", "linelist_path", "linelist_files", "linelist"),
+    )
+    if not is_meaningful_provenance_value(linelist_identifier):
+        linelist_identifier = str(linelist_manifest.get("source", "")).strip()
+
+    linelist_version = _first_attr_value(attr_sources, keys=("linelist_version", "line_version", "linelist_rev"))
+    if not is_meaningful_provenance_value(linelist_version):
+        linelist_version = str(linelist_manifest.get("version", "")).strip()
+
+    atmosphere_model_identifier = _first_attr_value(
+        attr_sources,
+        keys=("atmosphere_model_identifier", "model_atmosphere_path", "atmosphere_path", "atmosphere_grid", "atmosphere"),
+    )
+    if not is_meaningful_provenance_value(atmosphere_model_identifier):
+        atmosphere_model_identifier = str(
+            atmosphere_manifest.get("path") or atmosphere_manifest.get("source") or ""
+        ).strip()
+
+    pipeline_version = _first_attr_value(attr_sources, keys=("pipeline_version", "spice_version"))
+    if not is_meaningful_provenance_value(pipeline_version):
+        pipeline_version = str(software_manifest.get("pipeline_version") or software_manifest.get("spice_version") or "").strip()
+    if (not is_meaningful_provenance_value(pipeline_version)) and is_meaningful_provenance_value(git_commit):
+        pipeline_version = f"git:{git_commit[:12]}"
+
+    contract_provenance: Dict[str, str] = {
+        "config_hash": str(config_hash or ""),
+        "grid_definition_hash": str(grid_definition_hash or ""),
+        "git_commit": str(git_commit or ""),
+        "turbospectrum_version": str(turbospectrum_version or ""),
+        "linelist_identifier": str(linelist_identifier or ""),
+        "linelist_version": str(linelist_version or ""),
+        "atmosphere_model_identifier": str(atmosphere_model_identifier or ""),
+        "synthesis_timestamp": created_utc,
+        "pipeline_version": str(pipeline_version or ""),
+    }
+    if not args.allow_incomplete_provenance:
+        assert_required_provenance_fields(contract_provenance, context="merge_spectra_shards.py")
+
     status_counts: Dict[str, int] = {}
     for s in statuses:
         status_counts[s] = status_counts.get(s, 0) + 1
@@ -1033,37 +1147,39 @@ def main() -> None:
         else:
             param_units[name] = ""
 
-    root_out.attrs.update(
-        {
-            "title": "SPICE Synthetic Spectral Grid",
-            "generator": args.generator,
-            "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "flux_definition": args.flux_definition,
-            "wavelength_unit": "angstrom",
-            "flux_unit": "relative",
-            "parameter_units": param_units,
-            "physics_hash": physics_hash,
-            "git_commit": git_commit,
-            "contact": args.contact,
-            "schema_version": args.schema_version,
-            "n_models": int(out_row_count),
-            "n_lambda": int(wl_count),
-            "n_params": int(params.shape[1]),
-            "shards_merged": len(shards),
-            "status_counts": status_counts,
-            "output_mode_values": output_mode_values,
-            "calculation_mode_values": calculation_mode_values,
-            "mu_sampling_values": sorted(mu_sampling_values),
-            "mu_selected_present": bool(saw_mu_selected),
-            "mu_selected_index_present": bool(saw_mu_selected_index),
-            "allow_missing": bool(effective_allow_missing),
-            "allow_missing_requested": bool(args.allow_missing),
-            "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
-            "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
-            "expected_models": int(row_count),
-            "missing_models": int(row_count - out_row_count),
-        }
-    )
+    attrs_payload: Dict[str, Any] = {
+        "title": "SPICE Synthetic Spectral Grid",
+        "generator": args.generator,
+        "created_utc": created_utc,
+        "synthesis_timestamp": created_utc,
+        "flux_definition": args.flux_definition,
+        "wavelength_unit": "angstrom",
+        "flux_unit": "relative",
+        "parameter_units": param_units,
+        "physics_hash": physics_hash,
+        "git_commit": git_commit,
+        "git_sha": git_commit,
+        "contact": args.contact,
+        "schema_version": args.schema_version,
+        "n_models": int(out_row_count),
+        "n_lambda": int(wl_count),
+        "n_params": int(params.shape[1]),
+        "shards_merged": len(shards),
+        "status_counts": status_counts,
+        "output_mode_values": output_mode_values,
+        "calculation_mode_values": calculation_mode_values,
+        "mu_sampling_values": sorted(mu_sampling_values),
+        "mu_selected_present": bool(saw_mu_selected),
+        "mu_selected_index_present": bool(saw_mu_selected_index),
+        "allow_missing": bool(effective_allow_missing),
+        "allow_missing_requested": bool(args.allow_missing),
+        "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
+        "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
+        "expected_models": int(row_count),
+        "missing_models": int(row_count - out_row_count),
+    }
+    attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
+    root_out.attrs.update(attrs_payload)
 
     print(f"Wrote merged spectra Zarr: {out_path}")
 

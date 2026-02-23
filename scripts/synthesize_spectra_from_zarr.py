@@ -41,6 +41,15 @@ from run_turbospectrum import (  # noqa: E402
     get_model_filename,
     run_single_synthesis,
 )
+from provenance_contract import (  # noqa: E402
+    assert_required_provenance_fields,
+    canonical_json_sha256,
+    compute_binary_manifest_hash,
+    compute_grid_definition_hash,
+    directory_manifest_sha256,
+    file_sha256,
+    is_meaningful_provenance_value,
+)
 
 
 def _read_mu_points(spec_path: str) -> np.ndarray:
@@ -252,15 +261,7 @@ def _git_commit(project_root: str) -> str:
         out = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_root, stderr=subprocess.DEVNULL, timeout=3)
         return out.decode("utf-8").strip()
     except Exception:
-        return "unknown"
-
-
-def _sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        return ""
 
 
 def _resolve_linelist_paths(config: TurbospectrumConfig) -> List[str]:
@@ -272,6 +273,23 @@ def _resolve_linelist_paths(config: TurbospectrumConfig) -> List[str]:
             continue
         path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(str(config.linelist_path), raw))
         if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _resolve_synthesis_binary_paths(config: TurbospectrumConfig, project_root: str) -> List[str]:
+    candidates = [config.babsma_exec, config.bsyn_exec, config.interpol_exec]
+    exec_root = os.path.join(project_root, f"exec-{config.compiler}")
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(exec_root, raw))
+        if path in seen or not os.path.isfile(path):
             continue
         seen.add(path)
         out.append(path)
@@ -609,6 +627,7 @@ def _write_zarr_output(
     generator: str,
     flux_definition: str,
     provenance_payload: Mapping[str, str],
+    contract_provenance: Mapping[str, str],
     status_counts: Mapping[str, int],
     compression_cfg: Mapping,
     chunk_rows: int,
@@ -672,26 +691,28 @@ def _write_zarr_output(
         else:
             param_units[name] = ""
 
-    root.attrs.update(
-        {
-            "title": "SPICE Synthetic Spectral Grid",
-            "generator": generator,
-            "created_utc": created_utc,
-            "flux_definition": flux_definition,
-            "wavelength_unit": "angstrom",
-            "flux_unit": "relative",
-            "parameter_units": param_units,
-            "physics_hash": physics_hash,
-            "git_commit": git_commit,
-            "contact": contact,
-            "schema_version": schema_version,
-            "n_models": int(fluxes.shape[0]),
-            "n_lambda": int(fluxes.shape[1]) if fluxes.ndim == 2 else 0,
-            "n_params": int(params.shape[1]) if params.ndim == 2 else 0,
-            # Keep diagnostics in attrs (not top-level arrays) to preserve schema shape.
-            "status_counts": dict(status_counts),
-        }
-    )
+    attrs_payload: Dict[str, Any] = {
+        "title": "SPICE Synthetic Spectral Grid",
+        "generator": generator,
+        "created_utc": created_utc,
+        "synthesis_timestamp": created_utc,
+        "flux_definition": flux_definition,
+        "wavelength_unit": "angstrom",
+        "flux_unit": "relative",
+        "parameter_units": param_units,
+        "physics_hash": physics_hash,
+        "git_commit": git_commit,
+        "git_sha": git_commit,
+        "contact": contact,
+        "schema_version": schema_version,
+        "n_models": int(fluxes.shape[0]),
+        "n_lambda": int(fluxes.shape[1]) if fluxes.ndim == 2 else 0,
+        "n_params": int(params.shape[1]) if params.ndim == 2 else 0,
+        # Keep diagnostics in attrs (not top-level arrays) to preserve schema shape.
+        "status_counts": dict(status_counts),
+    }
+    attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
+    root.attrs.update(attrs_payload)
     logger.info("Wrote spectra to %s (shape=%s)", os.path.abspath(output_path), fluxes.shape)
 
 
@@ -736,6 +757,11 @@ def main() -> None:
     parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
     parser.add_argument("--generator", default="turbospectrum_nlte", help="Generator string for metadata")
     parser.add_argument("--flux-definition", default="continuum_normalized", help="Flux definition metadata")
+    parser.add_argument(
+        "--allow-incomplete-provenance",
+        action="store_true",
+        help="Allow writing datasets even when required provenance contract fields are missing.",
+    )
     args = parser.parse_args()
 
     logger = _configure_logging(args.log_level, args.log_file)
@@ -831,6 +857,9 @@ def main() -> None:
     physics_hash = args.physics_hash or _compute_physics_hash(config, column_data)
     created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     git_commit = _git_commit(project_root)
+    config_payload = dataclasses.asdict(config)
+    config_hash = canonical_json_sha256(config_payload)
+    grid_definition_hash = compute_grid_definition_hash(column_data)
     status_counts: Dict[str, int] = {}
     for s in statuses:
         status_counts[s] = status_counts.get(s, 0) + 1
@@ -842,7 +871,7 @@ def main() -> None:
         entry: Dict[str, Any] = {"path": path, "exists": bool(os.path.isfile(path))}
         if entry["exists"]:
             try:
-                sha = _sha256_file(path)
+                sha = file_sha256(path)
                 entry["sha256"] = sha
                 entry["size_bytes"] = int(os.path.getsize(path))
                 linelist_digest_tokens.append(f"{path}:{sha}")
@@ -860,33 +889,69 @@ def main() -> None:
     atmosphere_sha = configured_atmosphere_sha
     if not atmosphere_sha and os.path.isfile(atmosphere_path):
         try:
-            atmosphere_sha = _sha256_file(atmosphere_path)
+            atmosphere_sha = file_sha256(atmosphere_path)
         except Exception:
             atmosphere_sha = ""
+    if not atmosphere_sha and os.path.isdir(atmosphere_path):
+        atmosphere_sha = directory_manifest_sha256(atmosphere_path, suffixes=(".mod",), hash_contents=False)
 
     linelist_version = str(getattr(config, "linelist_version", "") or "").strip()
-    linelist_sha = str(getattr(config, "linelist_sha256", "") or "").strip() or computed_linelist_sha or "not_recorded"
+    linelist_sha = str(getattr(config, "linelist_sha256", "") or "").strip() or computed_linelist_sha
     linelist_preprocessing = str(getattr(config, "linelist_preprocessing", "") or "").strip()
     atmosphere_geometry = str(getattr(config, "atmosphere_geometry", "") or "").strip()
     atmosphere_version = str(getattr(config, "atmosphere_version", "") or "").strip()
     synthesis_code_version = str(getattr(config, "synthesis_code_version", "") or "").strip()
     spice_version = str(getattr(config, "spice_version", "") or "").strip()
     environment_capture = str(getattr(config, "environment_capture", "pip_freeze") or "pip_freeze")
+    binary_manifest_hash = compute_binary_manifest_hash(_resolve_synthesis_binary_paths(config, project_root))
+
+    linelist_identifier = str(config.linelist_path).strip() or ",".join(str(x) for x in (config.linelist_files or []))
+    if not linelist_identifier and linelist_files_abs:
+        linelist_identifier = ",".join(linelist_files_abs)
+    atmosphere_model_identifier = atmosphere_path
+
+    if (not is_meaningful_provenance_value(linelist_version)) and is_meaningful_provenance_value(linelist_sha):
+        linelist_version = f"sha256:{linelist_sha[:16]}"
+    if (not is_meaningful_provenance_value(atmosphere_version)) and is_meaningful_provenance_value(atmosphere_sha):
+        atmosphere_version = f"sha256:{atmosphere_sha[:16]}"
+
+    turbospectrum_version = synthesis_code_version
+    if (not is_meaningful_provenance_value(turbospectrum_version)) and is_meaningful_provenance_value(binary_manifest_hash):
+        turbospectrum_version = f"binary_sha256:{binary_manifest_hash}"
+
+    pipeline_version = spice_version
+    if (not is_meaningful_provenance_value(pipeline_version)) and is_meaningful_provenance_value(git_commit):
+        pipeline_version = f"git:{git_commit[:12]}"
+
+    contract_provenance: Dict[str, str] = {
+        "config_hash": config_hash,
+        "grid_definition_hash": grid_definition_hash,
+        "git_commit": git_commit,
+        "turbospectrum_version": turbospectrum_version,
+        "linelist_identifier": linelist_identifier,
+        "linelist_version": linelist_version,
+        "atmosphere_model_identifier": atmosphere_model_identifier,
+        "synthesis_timestamp": created_utc,
+        "pipeline_version": pipeline_version,
+    }
+    if not args.allow_incomplete_provenance:
+        assert_required_provenance_fields(contract_provenance, context="synthesize_spectra_from_zarr.py")
 
     canonical_config_payload = {
+        "contract_fields": contract_provenance,
         "physics_hash": physics_hash,
         "linelist": {
-            "path": str(config.linelist_path),
+            "path": linelist_identifier,
             "files": [str(x) for x in (config.linelist_files or [])],
-            "version": linelist_version or "not_recorded",
+            "version": linelist_version,
             "sha256": linelist_sha,
-            "preprocessing": linelist_preprocessing or "not_recorded",
+            "preprocessing": linelist_preprocessing,
         },
         "atmospheres": {
             "path": atmosphere_path,
-            "geometry": atmosphere_geometry or "not_recorded",
-            "version": atmosphere_version or "not_recorded",
-            "sha256": atmosphere_sha or "not_recorded",
+            "geometry": atmosphere_geometry,
+            "version": atmosphere_version,
+            "sha256": atmosphere_sha,
             "model_file_count": atmosphere_model_count,
         },
         "physics": {
@@ -898,9 +963,10 @@ def main() -> None:
         },
         "synthesis": {
             "code": str(args.generator),
-            "version": synthesis_code_version or "not_recorded",
-            "spice_version": spice_version or "not_recorded",
+            "version": turbospectrum_version,
+            "spice_version": pipeline_version,
             "git_commit": git_commit,
+            "binaries_hash": binary_manifest_hash,
         },
         "wavelength": {
             "lam_min": sorted({str(x) for x in np.asarray(column_data["lam_min"]).tolist()}),
@@ -911,13 +977,13 @@ def main() -> None:
 
     provenance_payload = {
         "canonical_config.yaml": json.dumps(canonical_config_payload, sort_keys=True, indent=2),
-        "synthesis_config.yaml": json.dumps(dataclasses.asdict(config), sort_keys=True, indent=2, default=str),
+        "synthesis_config.yaml": json.dumps(config_payload, sort_keys=True, indent=2, default=str),
         "linelist_manifest.json": json.dumps(
             {
-                "source": str(config.linelist_path),
-                "version": linelist_version or "not_recorded",
+                "source": linelist_identifier,
+                "version": linelist_version,
                 "sha256": linelist_sha,
-                "preprocessing": linelist_preprocessing or "not_recorded",
+                "preprocessing": linelist_preprocessing,
                 "files": linelist_files_manifest,
             },
             sort_keys=True,
@@ -926,9 +992,9 @@ def main() -> None:
         "atmosphere_manifest.json": json.dumps(
             {
                 "path": atmosphere_path,
-                "geometry": atmosphere_geometry or "not_recorded",
-                "version": atmosphere_version or "not_recorded",
-                "sha256": atmosphere_sha or "not_recorded",
+                "geometry": atmosphere_geometry,
+                "version": atmosphere_version,
+                "sha256": atmosphere_sha,
                 "model_file_count": atmosphere_model_count,
             },
             sort_keys=True,
@@ -940,8 +1006,9 @@ def main() -> None:
                 "git_commit": git_commit,
                 "python": sys.version.split()[0],
                 "compiler": str(config.compiler),
-                "synthesis_code_version": synthesis_code_version or "not_recorded",
-                "spice_version": spice_version or "not_recorded",
+                "synthesis_code_version": turbospectrum_version,
+                "spice_version": pipeline_version,
+                "binaries_hash": binary_manifest_hash,
             },
             sort_keys=True,
             indent=2,
@@ -966,6 +1033,7 @@ def main() -> None:
         generator=args.generator,
         flux_definition=args.flux_definition,
         provenance_payload=provenance_payload,
+        contract_provenance=contract_provenance,
         status_counts=status_counts,
         compression_cfg=compressor_cfg,
         chunk_rows=args.chunk_rows,

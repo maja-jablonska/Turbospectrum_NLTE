@@ -10,6 +10,7 @@ import sys
 import time
 import copy
 import re
+import subprocess
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -29,6 +30,15 @@ from run_turbospectrum import (  # noqa: E402
     ensure_directories,
     get_model_filename,
     run_single_synthesis,
+)
+from provenance_contract import (  # noqa: E402
+    assert_required_provenance_fields,
+    canonical_json_sha256,
+    compute_binary_manifest_hash,
+    compute_grid_definition_hash,
+    directory_manifest_sha256,
+    file_sha256,
+    is_meaningful_provenance_value,
 )
 
 
@@ -206,6 +216,111 @@ def _write_string_1d(root, name: str, values, chunks: int = 128):
             root.create_dataset(name, data=arr)
         except TypeError:
             root.create_dataset(name, shape=arr.shape, dtype=arr.dtype, data=arr)
+
+
+def _write_string_scalar(root, name: str, value: str) -> None:
+    if hasattr(root, "create_array"):
+        import zarr.codecs as zc  # type: ignore
+        from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
+
+        try:
+            arr = root.create_array(
+                name,
+                shape=(),
+                dtype=VariableLengthUTF8(),
+                serializer=zc.VLenUTF8Codec(),
+            )
+            arr[...] = str(value)
+            return
+        except Exception:
+            arr = root.create_array(
+                name,
+                shape=(1,),
+                dtype=VariableLengthUTF8(),
+                serializer=zc.VLenUTF8Codec(),
+                chunks=1,
+            )
+            arr[0] = str(value)
+            return
+    _write_string_1d(root, name, [str(value)], chunks=1)
+
+
+def _git_commit(project_root: str) -> str:
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project_root, stderr=subprocess.DEVNULL, timeout=3)
+        return out.decode("utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _resolve_linelist_paths(config: TurbospectrumConfig) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in (config.linelist_files or []):
+        raw = str(item).strip()
+        if not raw:
+            continue
+        path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(str(config.linelist_path), raw))
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _resolve_synthesis_binary_paths(config: TurbospectrumConfig, project_root: str) -> List[str]:
+    exec_root = os.path.join(project_root, f"exec-{config.compiler}")
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in (config.babsma_exec, config.bsyn_exec, config.interpol_exec):
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(exec_root, raw))
+        if path in seen or not os.path.isfile(path):
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _capture_environment_text() -> str:
+    return "\n".join(
+        [
+            f"python={sys.version}",
+            f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '')}",
+            f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS', '')}",
+            f"MKL_NUM_THREADS={os.environ.get('MKL_NUM_THREADS', '')}",
+            f"VECLIB_MAXIMUM_THREADS={os.environ.get('VECLIB_MAXIMUM_THREADS', '')}",
+        ]
+    )
+
+
+def _grid_columns_for_hash(grid_root) -> Dict[str, np.ndarray]:
+    keys = (
+        "teff",
+        "logg",
+        "feh",
+        "turbvel",
+        "t_value",
+        "lam_min",
+        "lam_max",
+        "lam_step",
+        "a",
+        "c",
+        "n",
+        "o",
+        "r",
+        "s",
+        "output_mode",
+        "calculation_mode",
+        "grid_version",
+    )
+    out: Dict[str, np.ndarray] = {}
+    for key in keys:
+        if key in grid_root:
+            out[key] = np.asarray(grid_root[key][:])
+    return out
 
 
 def _init_worker(config):
@@ -444,6 +559,11 @@ def main():
 
     parser.add_argument("--scratch", default=None)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--allow-incomplete-provenance",
+        action="store_true",
+        help="Allow writing shards even when required provenance contract fields are missing.",
+    )
 
     args = parser.parse_args()
 
@@ -558,6 +678,127 @@ def main():
     grid = zarr.open_group(args.grid_zarr, mode="r")
 
     row_count = grid["teff"].shape[0]
+    created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    git_commit = _git_commit(project_root)
+    config_payload = dataclasses.asdict(config)
+    config_hash = canonical_json_sha256(config_payload)
+    grid_definition_hash = compute_grid_definition_hash(_grid_columns_for_hash(grid))
+
+    linelist_files_abs = _resolve_linelist_paths(config)
+    linelist_manifest_files: List[Dict[str, Any]] = []
+    linelist_digest_tokens: List[str] = []
+    for path in linelist_files_abs:
+        entry: Dict[str, Any] = {"path": path, "exists": bool(os.path.isfile(path))}
+        if entry["exists"]:
+            try:
+                sha = file_sha256(path)
+                entry["sha256"] = sha
+                entry["size_bytes"] = int(os.path.getsize(path))
+                linelist_digest_tokens.append(f"{path}:{sha}")
+            except Exception as exc:  # noqa: BLE001
+                entry["sha256_error"] = str(exc)
+        linelist_manifest_files.append(entry)
+    computed_linelist_sha = ""
+    if linelist_digest_tokens:
+        computed_linelist_sha = canonical_json_sha256(sorted(linelist_digest_tokens))
+
+    atmosphere_path = os.path.abspath(str(config.model_atmosphere_path))
+    atmosphere_sha = str(getattr(config, "atmosphere_sha256", "") or "").strip()
+    if not atmosphere_sha and os.path.isfile(atmosphere_path):
+        try:
+            atmosphere_sha = file_sha256(atmosphere_path)
+        except Exception:
+            atmosphere_sha = ""
+    if not atmosphere_sha and os.path.isdir(atmosphere_path):
+        atmosphere_sha = directory_manifest_sha256(atmosphere_path, suffixes=(".mod",), hash_contents=False)
+
+    linelist_identifier = str(config.linelist_path).strip() or ",".join(str(x) for x in (config.linelist_files or []))
+    if not linelist_identifier and linelist_files_abs:
+        linelist_identifier = ",".join(linelist_files_abs)
+    linelist_sha = str(getattr(config, "linelist_sha256", "") or "").strip() or computed_linelist_sha
+    linelist_version = str(getattr(config, "linelist_version", "") or "").strip()
+    if (not is_meaningful_provenance_value(linelist_version)) and is_meaningful_provenance_value(linelist_sha):
+        linelist_version = f"sha256:{linelist_sha[:16]}"
+
+    atmosphere_geometry = str(getattr(config, "atmosphere_geometry", "") or "").strip()
+    atmosphere_version = str(getattr(config, "atmosphere_version", "") or "").strip()
+    if (not is_meaningful_provenance_value(atmosphere_version)) and is_meaningful_provenance_value(atmosphere_sha):
+        atmosphere_version = f"sha256:{atmosphere_sha[:16]}"
+    atmosphere_model_identifier = atmosphere_path
+
+    synthesis_code_version = str(getattr(config, "synthesis_code_version", "") or "").strip()
+    binary_manifest_hash = compute_binary_manifest_hash(_resolve_synthesis_binary_paths(config, project_root))
+    turbospectrum_version = synthesis_code_version
+    if (not is_meaningful_provenance_value(turbospectrum_version)) and is_meaningful_provenance_value(binary_manifest_hash):
+        turbospectrum_version = f"binary_sha256:{binary_manifest_hash}"
+
+    pipeline_version = str(getattr(config, "spice_version", "") or "").strip()
+    if (not is_meaningful_provenance_value(pipeline_version)) and is_meaningful_provenance_value(git_commit):
+        pipeline_version = f"git:{git_commit[:12]}"
+
+    contract_provenance: Dict[str, str] = {
+        "config_hash": config_hash,
+        "grid_definition_hash": grid_definition_hash,
+        "git_commit": git_commit,
+        "turbospectrum_version": turbospectrum_version,
+        "linelist_identifier": linelist_identifier,
+        "linelist_version": linelist_version,
+        "atmosphere_model_identifier": atmosphere_model_identifier,
+        "synthesis_timestamp": created_utc,
+        "pipeline_version": pipeline_version,
+    }
+    if not args.allow_incomplete_provenance:
+        assert_required_provenance_fields(contract_provenance, context="run_turbospectrum_shard.py")
+
+    provenance_payload = {
+        "canonical_config.yaml": json.dumps(
+            {
+                "contract_fields": contract_provenance,
+                "physics": {
+                    "nlte": bool(getattr(config, "nlte", False)),
+                    "mu_sampling": getattr(config, "mu_sampling", {}) or {},
+                },
+                "wavelength": {
+                    "row_count": int(row_count),
+                },
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "synthesis_config.yaml": json.dumps(config_payload, sort_keys=True, indent=2, default=str),
+        "linelist_manifest.json": json.dumps(
+            {
+                "source": linelist_identifier,
+                "version": linelist_version,
+                "sha256": linelist_sha,
+                "files": linelist_manifest_files,
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "atmosphere_manifest.json": json.dumps(
+            {
+                "path": atmosphere_path,
+                "geometry": atmosphere_geometry,
+                "version": atmosphere_version,
+                "sha256": atmosphere_sha,
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "software_manifest.json": json.dumps(
+            {
+                "git_commit": git_commit,
+                "compiler": str(config.compiler),
+                "synthesis_code_version": turbospectrum_version,
+                "pipeline_version": pipeline_version,
+                "binaries_hash": binary_manifest_hash,
+            },
+            sort_keys=True,
+            indent=2,
+        ),
+        "environment.txt": _capture_environment_text(),
+    }
 
     indices = np.arange(row_count)[
         args.shard_index::args.shard_count
@@ -605,12 +846,33 @@ def main():
         _write_string_1d(root, "status", [], chunks=1)
         _write_string_1d(root, "message", [], chunks=1)
 
-        root.attrs.update({
+        attrs_payload: Dict[str, Any] = {
             "shard_index": args.shard_index,
             "shard_count": args.shard_count,
             "grid": os.path.abspath(args.grid_zarr),
             "note": "empty shard (no rows assigned)",
-        })
+            "created_utc": created_utc,
+            "git_sha": git_commit,
+            "synthesis_timestamp": created_utc,
+            "linelist_path": str(getattr(config, "linelist_path", "")),
+            "linelist_files": json.dumps([str(x) for x in (getattr(config, "linelist_files", []) or [])], sort_keys=True),
+            "linelist_version": linelist_version,
+            "linelist_sha256": linelist_sha,
+            "linelist_preprocessing": str(getattr(config, "linelist_preprocessing", "")),
+            "model_atmosphere_path": str(getattr(config, "model_atmosphere_path", "")),
+            "atmosphere_geometry": atmosphere_geometry,
+            "atmosphere_version": atmosphere_version,
+            "atmosphere_sha256": atmosphere_sha,
+            "synthesis_code_version": turbospectrum_version,
+            "spice_version": pipeline_version,
+            "compiler": str(getattr(config, "compiler", "")),
+            "nlte": bool(getattr(config, "nlte", False)),
+        }
+        attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
+        root.attrs.update(attrs_payload)
+        prov = root.create_group("provenance")
+        for name, value in provenance_payload.items():
+            _write_string_scalar(prov, name, str(value))
         if write_path != final_path:
             os.rename(write_path, final_path)
             logger.info("Empty shard written to %s (atomic rename)", final_path)
@@ -782,25 +1044,33 @@ def main():
             except Exception:
                 pass
 
-    root.attrs.update({
+    attrs_payload: Dict[str, Any] = {
         "shard_index": args.shard_index,
         "shard_count": args.shard_count,
         "grid": os.path.abspath(args.grid_zarr),
         "mu_sampling": json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
+        "created_utc": created_utc,
+        "git_sha": git_commit,
+        "synthesis_timestamp": created_utc,
         "linelist_path": str(getattr(config, "linelist_path", "")),
         "linelist_files": json.dumps([str(x) for x in (getattr(config, "linelist_files", []) or [])], sort_keys=True),
-        "linelist_version": str(getattr(config, "linelist_version", "")),
-        "linelist_sha256": str(getattr(config, "linelist_sha256", "")),
+        "linelist_version": linelist_version,
+        "linelist_sha256": linelist_sha,
         "linelist_preprocessing": str(getattr(config, "linelist_preprocessing", "")),
         "model_atmosphere_path": str(getattr(config, "model_atmosphere_path", "")),
-        "atmosphere_geometry": str(getattr(config, "atmosphere_geometry", "")),
-        "atmosphere_version": str(getattr(config, "atmosphere_version", "")),
-        "atmosphere_sha256": str(getattr(config, "atmosphere_sha256", "")),
-        "synthesis_code_version": str(getattr(config, "synthesis_code_version", "")),
-        "spice_version": str(getattr(config, "spice_version", "")),
+        "atmosphere_geometry": atmosphere_geometry,
+        "atmosphere_version": atmosphere_version,
+        "atmosphere_sha256": atmosphere_sha,
+        "synthesis_code_version": turbospectrum_version,
+        "spice_version": pipeline_version,
         "compiler": str(getattr(config, "compiler", "")),
         "nlte": bool(getattr(config, "nlte", False)),
-    })
+    }
+    attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
+    root.attrs.update(attrs_payload)
+    prov = root.create_group("provenance")
+    for name, value in provenance_payload.items():
+        _write_string_scalar(prov, name, str(value))
 
     if write_path != final_path:
         os.rename(write_path, final_path)
