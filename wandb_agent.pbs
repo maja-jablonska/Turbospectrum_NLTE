@@ -73,6 +73,13 @@ export JAX_PLATFORMS="${JAX_PLATFORM}"
 ############################################
 # W&B / sweep settings
 ############################################
+# Shared defaults file for Gadi/HPC W&B settings.
+WANDB_SETTINGS_FILE="${WANDB_SETTINGS_FILE:-${PBS_O_WORKDIR}/configs/training/wandb_hpc.env}"
+if [[ -f "${WANDB_SETTINGS_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${WANDB_SETTINGS_FILE}"
+fi
+
 # WANDB_MODE:
 # - online: run `wandb agent` (requires internet)
 # - offline: run one local sweep config index and save offline logs for later sync
@@ -80,6 +87,8 @@ export JAX_PLATFORMS="${JAX_PLATFORM}"
 WANDB_MODE="${WANDB_MODE:-online}"   # online | offline | disabled
 AGENT_COUNT="${AGENT_COUNT:-1}"       # runs handled per PBS job (online mode only)
 RUN_DIR="${RUN_DIR:-${PBS_O_WORKDIR}/runs/mlp_wandb}"
+WANDB_LOCAL_DIR="${WANDB_LOCAL_DIR:-${RUN_DIR}/wandb}"
+WANDB_SYNC_DIR="${WANDB_SYNC_DIR:-${WANDB_LOCAL_DIR}}"
 
 # Online mode: required sweep id like "entity/project/sweepid".
 SWEEP_ID="${SWEEP_ID:-}"
@@ -98,14 +107,16 @@ TRAIN_FRACTION="${TRAIN_FRACTION:-0.8}"
 VAL_FRACTION="${VAL_FRACTION:-0.1}"
 NORMALIZE_INPUTS="${NORMALIZE_INPUTS:-true}"
 
-mkdir -p "${RUN_DIR}"
+mkdir -p "${RUN_DIR}" "${WANDB_LOCAL_DIR}"
 export WANDB_MODE
-export WANDB_DIR="${RUN_DIR}"
+export WANDB_DIR="${WANDB_LOCAL_DIR}"
 
 echo "[wandb-agent] Python: ${PYTHON}"
 echo "[wandb-agent] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 echo "[wandb-agent] Mode: ${WANDB_MODE}"
 echo "[wandb-agent] Run dir: ${RUN_DIR}"
+echo "[wandb-agent] W&B local dir: ${WANDB_LOCAL_DIR}"
+echo "[wandb-agent] W&B sync dir: ${WANDB_SYNC_DIR}"
 echo "[wandb-agent] PBS job: ${PBS_JOBID} array index: ${PBS_ARRAY_INDEX:-<none>}"
 
 ############################################
@@ -178,6 +189,7 @@ else
       --wandb-entity "${WANDB_ENTITY}" \
       --wandb-group "${WANDB_GROUP}" \
       --wandb-tags "${WANDB_TAGS}" \
+      --wandb-dir "${WANDB_LOCAL_DIR}" \
       --wandb-mode "${WANDB_MODE}" \
       --jax-platform "${JAX_PLATFORM}" \
       --target-points "${TARGET_POINTS}" \
@@ -190,6 +202,6 @@ else
     echo "[wandb-agent] Completed local run index ${RUN_INDEX} in ${WANDB_MODE} mode."
     if [[ "${WANDB_MODE}" == "offline" ]]; then
         echo "[wandb-agent] Later sync on internet-enabled node:"
-        echo "  python -m wandb sync --include-offline ${RUN_DIR}"
+        echo "  python -m wandb sync --include-offline ${WANDB_SYNC_DIR}"
     fi
 fi

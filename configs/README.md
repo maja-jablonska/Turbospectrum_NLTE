@@ -14,6 +14,7 @@ Current canonical files:
 - `configs/sampling/config_ml_sampling.json`: sampling-only config.
 - `configs/synthesis/config_sample_comprehensive.json`: full nested synthesis schema.
 - `configs/synthesis/config_sample.json`: compact flat synthesis schema (legacy-compatible).
+- `configs/training/wandb_hpc.env`: shared Gadi/HPC defaults for W&B project/entity and local sync paths.
 
 Why this exists:
 

@@ -18,11 +18,22 @@ unset PYTHONPATH || true
 
 MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
 PYTHON_BIN="${PYTHON_BIN:-}"
-SYNC_DIR="${SYNC_DIR:-${PBS_O_WORKDIR}/runs/mlp_wandb}"
 INCLUDE_OFFLINE="${INCLUDE_OFFLINE:-1}"   # 1/0
 SYNC_ALL="${SYNC_ALL:-0}"                 # 1/0 -> wandb sync --sync-all
 BEST_EFFORT="${BEST_EFFORT:-1}"           # 1/0
 MARK_SYNCED="${MARK_SYNCED:-1}"           # 1/0
+
+# Shared defaults file for Gadi/HPC W&B settings.
+WANDB_SETTINGS_FILE="${WANDB_SETTINGS_FILE:-${PBS_O_WORKDIR}/configs/training/wandb_hpc.env}"
+if [[ -f "${WANDB_SETTINGS_FILE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${WANDB_SETTINGS_FILE}"
+fi
+
+RUN_DIR="${RUN_DIR:-${PBS_O_WORKDIR}/runs/mlp_wandb}"
+WANDB_LOCAL_DIR="${WANDB_LOCAL_DIR:-${RUN_DIR}/wandb}"
+WANDB_SYNC_DIR="${WANDB_SYNC_DIR:-${WANDB_LOCAL_DIR}}"
+SYNC_DIR="${SYNC_DIR:-${WANDB_SYNC_DIR}}"
 WANDB_PROJECT="${WANDB_PROJECT:-}"        # optional filter
 WANDB_ENTITY="${WANDB_ENTITY:-}"          # optional for login context
 
@@ -70,6 +81,8 @@ fi
 echo "[wandb-sync] Python: ${PYTHON}"
 echo "[wandb-sync] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 echo "[wandb-sync] Sync dir: ${SYNC_DIR}"
+echo "[wandb-sync] Run dir: ${RUN_DIR}"
+echo "[wandb-sync] W&B local dir: ${WANDB_LOCAL_DIR}"
 echo "[wandb-sync] Include offline: ${INCLUDE_OFFLINE}"
 echo "[wandb-sync] Sync all: ${SYNC_ALL}"
 echo "[wandb-sync] Mark synced: ${MARK_SYNCED}"
@@ -104,4 +117,3 @@ else
 fi
 
 echo "[wandb-sync] Sync completed."
-
