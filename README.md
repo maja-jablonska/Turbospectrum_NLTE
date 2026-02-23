@@ -254,4 +254,5 @@ qsub -v MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json,R
 Behavior summary:
 - uses the one-config pipeline (`pipeline_from_config.py --synthesis-mode sharded`) for shard generation
 - reads default grid/shard/merged output paths from `outputs` in the pipeline config
+- uses `RUN_ROOT` for queue state/log/tmp directories (and as a fallback when output paths are missing)
 - validates shard completeness with `scripts/validate_dataset.py` before merge

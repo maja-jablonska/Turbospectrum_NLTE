@@ -3,7 +3,7 @@
   "_howto": [
     "Edit this file, then run via scripts/pipeline_from_config.py or turbospectrum.pbs.",
     "For sharded runs (no PBS arrays), submit multiple jobs or use the manual shard queue in turbospectrum.pbs.",
-    "turbospectrum.pbs will rewrite outputs + project_root into a job-local config under $BASE."
+    "turbospectrum.pbs reads outputs/runtime from this config; use env vars only for explicit overrides."
   ],
 
   "grid": {
@@ -48,7 +48,7 @@
     "csv_compression_level": 5,
 
     "zarr": {
-      "_note": "Zarr grid chunking/compression; output path is controlled by outputs.grid_zarr (and overridden by turbospectrum.pbs).",
+      "_note": "Zarr grid chunking/compression; output path is controlled by outputs.grid_zarr.",
       "chunks": 2048,
       "compressor": { "cname": "zstd", "clevel": 5, "shuffle": true }
     }
@@ -125,7 +125,7 @@
   },
 
   "outputs": {
-    "_note": "These are sensible local defaults. turbospectrum.pbs will override these to write under $BASE.",
+    "_note": "Primary output paths. turbospectrum.pbs reads these directly unless explicit env overrides are provided.",
 
     "grid_csv": "../../runs/local-dev/outputs/grids/parameter_grid.csv",
     "grid_zarr": "../../runs/local-dev/outputs/grids/parameter_grid.zarr",
@@ -136,7 +136,7 @@
   },
 
   "runtime": {
-    "_note": "Optional runtime knobs; turbospectrum.pbs passes workers/scratch explicitly.",
+    "_note": "Optional runtime knobs consumed by pipeline scripts; PBS env vars can still override when explicitly set.",
     "workers": null,
     "scratch": null,
     "chunk_rows": 32
