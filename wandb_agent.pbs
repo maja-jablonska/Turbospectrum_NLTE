@@ -1,0 +1,194 @@
+#!/bin/bash
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -N wandb-agent
+#PBS -l ncpus=8
+#PBS -l mem=32GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -l storage=scratch/mk27+scratch/y89
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+############################################
+# Thread caps
+############################################
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+############################################
+# Environment
+############################################
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+
+MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+JAX_PLATFORM="${JAX_PLATFORM:-cpu}"
+
+activate_mamba() {
+    if [[ -n "${MAMBA_EXE:-}" && -x "${MAMBA_EXE}" ]]; then
+        eval "$("${MAMBA_EXE}" shell hook --shell bash)"
+    elif command -v mamba >/dev/null 2>&1; then
+        eval "$(mamba shell hook --shell bash)"
+    elif [[ -f "${HOME}/miniforge/etc/profile.d/conda.sh" ]]; then
+        source "${HOME}/miniforge/etc/profile.d/conda.sh"
+    else
+        return 1
+    fi
+
+    if command -v mamba >/dev/null 2>&1; then
+        mamba activate "${MAMBA_ENV_NAME}"
+    elif command -v conda >/dev/null 2>&1; then
+        conda activate "${MAMBA_ENV_NAME}"
+    else
+        return 1
+    fi
+}
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if ! activate_mamba; then
+        echo "[wandb-agent] WARN: could not activate env '${MAMBA_ENV_NAME}', using PATH python." >&2
+    fi
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    else
+        echo "[wandb-agent] ERROR: python not found." >&2
+        exit 1
+    fi
+fi
+
+PYTHON="${PYTHON_BIN}"
+export JAX_PLATFORMS="${JAX_PLATFORM}"
+
+############################################
+# W&B / sweep settings
+############################################
+# WANDB_MODE:
+# - online: run `wandb agent` (requires internet)
+# - offline: run one local sweep config index and save offline logs for later sync
+# - disabled: run one local sweep config index with W&B fully disabled
+WANDB_MODE="${WANDB_MODE:-online}"   # online | offline | disabled
+AGENT_COUNT="${AGENT_COUNT:-1}"       # runs handled per PBS job (online mode only)
+RUN_DIR="${RUN_DIR:-${PBS_O_WORKDIR}/runs/mlp_wandb}"
+
+# Online mode: required sweep id like "entity/project/sweepid".
+SWEEP_ID="${SWEEP_ID:-}"
+
+# Offline/disabled mode: required local sweep config file for train script.
+SWEEP_CONFIG="${SWEEP_CONFIG:-${PBS_O_WORKDIR}/configs/training/mlp_wandb_sweep.example.json}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-${PBS_O_WORKDIR}/scripts/train_mlp_wandb.py}"
+ZARR_PATH="${ZARR_PATH:-${PBS_O_WORKDIR}/spectra_tiny.zarr}"
+WANDB_PROJECT="${WANDB_PROJECT:-turbospectrum-mlp}"
+WANDB_ENTITY="${WANDB_ENTITY:-}"
+WANDB_GROUP="${WANDB_GROUP:-gadi-offline}"
+WANDB_TAGS="${WANDB_TAGS:-gadi,pbs}"
+TARGET_POINTS="${TARGET_POINTS:-1024}"
+USE_LOG_WAVELENGTH="${USE_LOG_WAVELENGTH:-true}"
+TRAIN_FRACTION="${TRAIN_FRACTION:-0.8}"
+VAL_FRACTION="${VAL_FRACTION:-0.1}"
+NORMALIZE_INPUTS="${NORMALIZE_INPUTS:-true}"
+
+mkdir -p "${RUN_DIR}"
+export WANDB_MODE
+export WANDB_DIR="${RUN_DIR}"
+
+echo "[wandb-agent] Python: ${PYTHON}"
+echo "[wandb-agent] Conda prefix: ${CONDA_PREFIX:-<unset>}"
+echo "[wandb-agent] Mode: ${WANDB_MODE}"
+echo "[wandb-agent] Run dir: ${RUN_DIR}"
+echo "[wandb-agent] PBS job: ${PBS_JOBID} array index: ${PBS_ARRAY_INDEX:-<none>}"
+
+############################################
+# Optional preflight (non-fatal)
+############################################
+"${PYTHON}" - <<'PY' || true
+import importlib
+mods = ["wandb", "jax", "flax", "optax"]
+for m in mods:
+    try:
+        mod = importlib.import_module(m)
+        print(f"[wandb-agent] {m}: {getattr(mod, '__version__', 'unknown')}")
+    except Exception as exc:
+        print(f"[wandb-agent] WARN: failed to import {m}: {exc}")
+PY
+
+############################################
+# Launch mode
+############################################
+
+if [[ "${WANDB_MODE}" == "online" ]]; then
+    if [[ -z "${SWEEP_ID}" ]]; then
+        echo "[wandb-agent] ERROR: SWEEP_ID is required in online mode." >&2
+        exit 1
+    fi
+    echo "[wandb-agent] Sweep: ${SWEEP_ID}"
+    echo "[wandb-agent] Agent count: ${AGENT_COUNT}"
+    if [[ "${AGENT_COUNT}" -gt 0 ]]; then
+        "${PYTHON}" -m wandb agent --count "${AGENT_COUNT}" "${SWEEP_ID}"
+    else
+        # AGENT_COUNT<=0 means run unbounded until walltime kills job.
+        "${PYTHON}" -m wandb agent "${SWEEP_ID}"
+    fi
+else
+    if [[ ! -f "${TRAIN_SCRIPT}" ]]; then
+        echo "[wandb-agent] ERROR: train script not found: ${TRAIN_SCRIPT}" >&2
+        exit 1
+    fi
+    if [[ ! -f "${SWEEP_CONFIG}" ]]; then
+        echo "[wandb-agent] ERROR: sweep config not found: ${SWEEP_CONFIG}" >&2
+        exit 1
+    fi
+    if [[ ! -d "${ZARR_PATH}" ]]; then
+        echo "[wandb-agent] ERROR: zarr dataset not found: ${ZARR_PATH}" >&2
+        exit 1
+    fi
+
+    if [[ -z "${PBS_ARRAY_INDEX:-}" ]]; then
+        RUN_INDEX=0
+    else
+        RUN_INDEX=$((PBS_ARRAY_INDEX - 1))
+    fi
+    if (( RUN_INDEX < 0 )); then
+        echo "[wandb-agent] ERROR: computed RUN_INDEX=${RUN_INDEX}; check PBS_ARRAY_INDEX." >&2
+        exit 1
+    fi
+
+    echo "[wandb-agent] Offline/disabled mode with local sweep config."
+    echo "[wandb-agent] Sweep config: ${SWEEP_CONFIG}"
+    echo "[wandb-agent] Train script: ${TRAIN_SCRIPT}"
+    echo "[wandb-agent] Zarr path: ${ZARR_PATH}"
+    echo "[wandb-agent] Run index: ${RUN_INDEX}"
+
+    "${PYTHON}" "${TRAIN_SCRIPT}" \
+      --zarr-path "${ZARR_PATH}" \
+      --sweep-config "${SWEEP_CONFIG}" \
+      --run-index "${RUN_INDEX}" \
+      --output-dir "${RUN_DIR}" \
+      --wandb-project "${WANDB_PROJECT}" \
+      --wandb-entity "${WANDB_ENTITY}" \
+      --wandb-group "${WANDB_GROUP}" \
+      --wandb-tags "${WANDB_TAGS}" \
+      --wandb-mode "${WANDB_MODE}" \
+      --jax-platform "${JAX_PLATFORM}" \
+      --target-points "${TARGET_POINTS}" \
+      --use_log_wavelength "${USE_LOG_WAVELENGTH}" \
+      --train_fraction "${TRAIN_FRACTION}" \
+      --val_fraction "${VAL_FRACTION}" \
+      --normalize_inputs "${NORMALIZE_INPUTS}" \
+      --log-level INFO
+
+    echo "[wandb-agent] Completed local run index ${RUN_INDEX} in ${WANDB_MODE} mode."
+    if [[ "${WANDB_MODE}" == "offline" ]]; then
+        echo "[wandb-agent] Later sync on internet-enabled node:"
+        echo "  python -m wandb sync --include-offline ${RUN_DIR}"
+    fi
+fi
