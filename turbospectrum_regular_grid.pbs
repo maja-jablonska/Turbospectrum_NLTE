@@ -86,8 +86,8 @@ USER_ID="${USER_ID:-$(whoami)}"
 RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE_regular}"
 REPO="${REPO:-${PBS_O_WORKDIR}}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_regular_grid.example.json}"
-WORKERS="${WORKERS:-${PBS_NCPUS:-32}}"
-SKIP_SYNTHESIS="${SKIP_SYNTHESIS:-0}"
+WORKERS_OVERRIDE="${WORKERS:-}"
+SKIP_SYNTHESIS_OVERRIDE="${SKIP_SYNTHESIS:-}"
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
@@ -102,82 +102,108 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
     exit 1
 fi
 
-RUN_CONFIG_DIR="${RUN_ROOT}/config"
+CONFIG_VALUES=$(
+    "${PYTHON}" - <<PY
+import json
+import os
+
+cfg_path = os.path.abspath(r"${CONFIG_PATH}")
+cfg_dir = os.path.dirname(cfg_path)
+with open(cfg_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+outputs = cfg.get("outputs", {}) or {}
+runtime = cfg.get("runtime", {}) or {}
+
+def _abs(p):
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.abspath(os.path.join(cfg_dir, p))
+
+cfg_run_root = _abs(outputs.get("run_root"))
+spectra_zarr = _abs(outputs.get("spectra_zarr"))
+workers = runtime.get("workers")
+workers_out = ""
+if workers not in (None, ""):
+    try:
+        workers_out = str(int(workers))
+    except Exception:
+        workers_out = ""
+
+def _boolish(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+skip_synthesis = "1" if _boolish(runtime.get("skip_synthesis", False)) else "0"
+
+print(cfg_run_root)
+print(spectra_zarr)
+print(workers_out)
+print(skip_synthesis)
+PY
+)
+mapfile -t _cfg_lines <<< "${CONFIG_VALUES}"
+CFG_RUN_ROOT="${_cfg_lines[0]:-}"
+CFG_SPECTRA_ZARR="${_cfg_lines[1]:-}"
+CFG_WORKERS="${_cfg_lines[2]:-}"
+CFG_SKIP_SYNTHESIS="${_cfg_lines[3]:-0}"
+
+if [[ -n "${CFG_RUN_ROOT}" ]]; then
+    RUN_ROOT="${CFG_RUN_ROOT}"
+fi
+WORKERS="${WORKERS_OVERRIDE:-${CFG_WORKERS:-${PBS_NCPUS:-32}}}"
+
+to_bool01() {
+    local val
+    val="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "${val}" in
+        1|true|yes|on) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+
+SKIP_SYNTHESIS_EFFECTIVE="${CFG_SKIP_SYNTHESIS:-0}"
+if [[ "$(to_bool01 "${SKIP_SYNTHESIS_OVERRIDE}")" == "1" ]]; then
+    SKIP_SYNTHESIS_EFFECTIVE="1"
+fi
+
 LOG_DIR="${RUN_ROOT}/logs"
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
 TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
-mkdir -p "${RUN_CONFIG_DIR}" "${LOG_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
+mkdir -p "${LOG_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
 
 # Force mkstemp()/tempfile users to write under designated scratch temp.
 export TMPDIR="${TMP_SYSTEM_DIR}"
 export TMP="${TMP_SYSTEM_DIR}"
 export TEMP="${TMP_SYSTEM_DIR}"
 
-JOB_CONFIG_PATH="${RUN_CONFIG_DIR}/config_regular_grid.${PBS_JOBID}.json"
-
-"${PYTHON}" - <<PY
-import json
-import os
-
-src = os.path.abspath(r"${CONFIG_PATH}")
-dst = os.path.abspath(r"${JOB_CONFIG_PATH}")
-repo = os.path.abspath(r"${REPO}")
-run_root = os.path.abspath(r"${RUN_ROOT}")
-workers = int(r"${WORKERS}")
-skip_synthesis = str(r"${SKIP_SYNTHESIS}").strip().lower() in {"1", "true", "yes", "on"}
-tmp_work = os.path.abspath(r"${TMP_WORK_DIR}")
-tmp_output = os.path.abspath(r"${TMP_OUTPUT_DIR}")
-log_dir = os.path.abspath(r"${LOG_DIR}")
-
-with open(src, "r", encoding="utf-8") as handle:
-    cfg = json.load(handle)
-
-cfg_dir = os.path.dirname(src)
-outputs = cfg.setdefault("outputs", {})
-outputs["run_root"] = run_root
-outputs["grid_csv"] = os.path.join(run_root, "outputs", "grids", "regular_parameter_grid.csv")
-outputs["grid_zarr"] = os.path.join(run_root, "outputs", "grids", "regular_parameter_grid.zarr")
-outputs["spectra_zarr"] = os.path.join(run_root, "outputs", "zarr", "regular_synthesized_spectra.zarr")
-
-runtime = cfg.setdefault("runtime", {})
-runtime["workers"] = workers
-runtime.setdefault("chunk_rows", 32)
-runtime["scratch"] = runtime.get("scratch") or os.path.join(tmp_work, "synthesis")
-runtime["output_tmp"] = runtime.get("output_tmp") or os.path.join(tmp_output, "regular_synthesized_spectra.tmp.zarr")
-runtime.setdefault("log_level", "INFO")
-runtime["log_file"] = runtime.get("log_file") or os.path.join(log_dir, "regular_grid.synthesis.log")
-runtime["skip_synthesis"] = skip_synthesis
-
-turb = cfg.setdefault("turbospectrum", {})
-turb_cfg = turb.get("config")
-if not turb_cfg:
-    turb_cfg = os.path.join(repo, "configs", "synthesis", "config_sample_comprehensive.json")
-elif not os.path.isabs(str(turb_cfg)):
-    turb_cfg = os.path.abspath(os.path.join(cfg_dir, str(turb_cfg)))
-turb["config"] = turb_cfg
-
-with open(dst, "w", encoding="utf-8") as handle:
-    json.dump(cfg, handle, indent=2, sort_keys=True)
-PY
-
 echo "[regular-grid] Repo: ${REPO}"
-echo "[regular-grid] Config template: ${CONFIG_PATH}"
-echo "[regular-grid] Job config: ${JOB_CONFIG_PATH}"
+echo "[regular-grid] Config: ${CONFIG_PATH}"
 echo "[regular-grid] Run root: ${RUN_ROOT}"
 echo "[regular-grid] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[regular-grid] Workers: ${WORKERS}"
-echo "[regular-grid] Skip synthesis: ${SKIP_SYNTHESIS}"
+echo "[regular-grid] Skip synthesis: ${SKIP_SYNTHESIS_EFFECTIVE}"
 
-"${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py" \
-    --config-json "${JOB_CONFIG_PATH}" \
-    --run-root "${RUN_ROOT}"
+SYNTH_CMD=(
+    "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
+    --config-json "${CONFIG_PATH}"
+)
+if [[ -n "${WORKERS_OVERRIDE}" ]]; then
+    SYNTH_CMD+=(--workers "${WORKERS_OVERRIDE}")
+fi
+if [[ "${SKIP_SYNTHESIS_EFFECTIVE}" == "1" ]]; then
+    SYNTH_CMD+=(--skip-synthesis)
+fi
+"${SYNTH_CMD[@]}"
 
-if [[ "${SKIP_SYNTHESIS}" == "1" || "${SKIP_SYNTHESIS}" == "true" ]]; then
+if [[ "${SKIP_SYNTHESIS_EFFECTIVE}" == "1" ]]; then
     echo "[regular-grid] Completed grid generation only."
 else
-    FINAL_ZARR="${RUN_ROOT}/outputs/zarr/regular_synthesized_spectra.zarr"
+    FINAL_ZARR="${FINAL_ZARR:-${CFG_SPECTRA_ZARR:-${RUN_ROOT}/outputs/zarr/regular_synthesized_spectra.zarr}}"
     if [[ ! -d "${FINAL_ZARR}" ]]; then
         echo "[regular-grid] ERROR: expected synthesized spectra Zarr not found: ${FINAL_ZARR}" >&2
         exit 1
