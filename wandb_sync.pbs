@@ -19,6 +19,7 @@ unset PYTHONPATH || true
 MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 INCLUDE_OFFLINE="${INCLUDE_OFFLINE:-1}"   # 1/0
+INCLUDE_SYNCED="${INCLUDE_SYNCED:-0}"    # 1/0 -> wandb sync --include-synced
 SYNC_ALL="${SYNC_ALL:-0}"                 # 1/0 -> wandb sync --sync-all
 BEST_EFFORT="${BEST_EFFORT:-1}"           # 1/0
 MARK_SYNCED="${MARK_SYNCED:-1}"           # 1/0
@@ -84,6 +85,7 @@ echo "[wandb-sync] Sync dir: ${SYNC_DIR}"
 echo "[wandb-sync] Run dir: ${RUN_DIR}"
 echo "[wandb-sync] W&B local dir: ${WANDB_LOCAL_DIR}"
 echo "[wandb-sync] Include offline: ${INCLUDE_OFFLINE}"
+echo "[wandb-sync] Include synced: ${INCLUDE_SYNCED}"
 echo "[wandb-sync] Sync all: ${SYNC_ALL}"
 echo "[wandb-sync] Mark synced: ${MARK_SYNCED}"
 echo "[wandb-sync] Best effort: ${BEST_EFFORT}"
@@ -91,6 +93,9 @@ echo "[wandb-sync] Best effort: ${BEST_EFFORT}"
 CMD=("${PYTHON}" -m wandb sync)
 if [[ "${INCLUDE_OFFLINE}" == "1" ]]; then
     CMD+=(--include-offline)
+fi
+if [[ "${INCLUDE_SYNCED}" == "1" ]]; then
+    CMD+=(--include-synced)
 fi
 if [[ "${SYNC_ALL}" == "1" ]]; then
     CMD+=(--sync-all)
