@@ -358,7 +358,9 @@ def main() -> None:
     workers_raw = _coalesce(args.workers, cfg, ("runtime", "workers"), None)
     workers = int(workers_raw) if workers_raw not in (None, "") else None
     chunk_rows = int(_coalesce(args.chunk_rows, cfg, ("runtime", "chunk_rows"), 32))
-    scratch_raw = _coalesce(args.scratch, cfg, ("runtime", "scratch"), None)
+    scratch_default_base = os.environ.get("TMPDIR") or os.path.join(run_root, "tmp")
+    scratch_default = os.path.join(scratch_default_base, "synthesis")
+    scratch_raw = _coalesce(args.scratch, cfg, ("runtime", "scratch"), scratch_default)
     scratch = _abs_from(cfg_dir, str(scratch_raw)) if scratch_raw not in (None, "") else None
     output_tmp_raw = _coalesce(args.output_tmp, cfg, ("runtime", "output_tmp"), None)
     output_tmp = _abs_from(cfg_dir, str(output_tmp_raw)) if output_tmp_raw not in (None, "") else None
@@ -420,6 +422,8 @@ def main() -> None:
             f"{float(np.min(mu_axis)):.6f}..{float(np.max(mu_axis)):.6f} "
             f"({mu_axis.size} points -> mu_sampling min/max)"
         )
+    if scratch:
+        print(f"[regular-grid] synthesis scratch: {scratch}")
     print(f"[regular-grid] writing CSV: {grid_csv}")
     print(f"[regular-grid] writing Zarr: {grid_zarr}")
 

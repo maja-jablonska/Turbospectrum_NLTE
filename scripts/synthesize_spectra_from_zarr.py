@@ -726,6 +726,7 @@ def _write_zarr_output(
 
 def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_config: TurbospectrumConfig):
     tasks = []
+    base_name_counts: Dict[str, int] = {}
     for idx in range(row_count):
         row_values = {
             "teff": column_data["teff"][idx],
@@ -739,7 +740,21 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
         for optional_key in ("output_mode", "calculation_mode"):
             if optional_key in column_data:
                 row_values[optional_key] = column_data[optional_key][idx]
+        base_name = get_model_filename(
+            int(row_values["teff"]),
+            float(row_values["logg"]),
+            float(row_values["feh"]),
+            str(row_values["turb"]).strip(),
+        )
+        base_name_counts[base_name] = base_name_counts.get(base_name, 0) + 1
         tasks.append((idx, row_values))
+    duplicate_base_names = [name for name, count in base_name_counts.items() if count > 1]
+    if duplicate_base_names:
+        sample = ", ".join(sorted(duplicate_base_names)[:3])
+        raise ValueError(
+            "Grid rows collapse to duplicate Turbospectrum base filenames, which can overwrite/reuse spectra "
+            f"(examples: {sample}). Coarsen grid precision (logg/feh) or adjust naming."
+        )
     return tasks
 
 
