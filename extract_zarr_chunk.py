@@ -76,7 +76,7 @@ def copy_provenance(src, dst):
 
     for k in psrc.array_keys():
         arr = psrc[k]
-        pdst.create_array(k, data=arr[()])
+        pdst.create_array(k, data=np.asarray(arr[()]))
 
 
 def copy_sample_array(arr, dst_group, name, start, end):
@@ -150,7 +150,7 @@ def main():
     # ---------------- SCALARS ----------------
     for name in SCALAR_ARRAYS:
         arr = src[name]
-        dst.create_array(name, data=arr[()])
+        dst.create_array(name, data=np.asarray(arr[()]))
 
     # ---------------- PROVENANCE ----------------
     copy_provenance(src, dst)
