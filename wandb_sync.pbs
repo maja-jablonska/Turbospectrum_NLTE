@@ -74,14 +74,38 @@ fi
 
 PYTHON="${PYTHON_BIN}"
 
-if [[ ! -d "${SYNC_DIR}" ]]; then
-    echo "[wandb-sync] ERROR: SYNC_DIR not found: ${SYNC_DIR}" >&2
+resolve_sync_dirs() {
+    local pattern="$1"
+    local -a expanded=()
+
+    # Expand wildcard patterns (e.g. /path/run*/wandb) if provided.
+    if [[ "${pattern}" == *"*"* || "${pattern}" == *"?"* || "${pattern}" == *"["* ]]; then
+        shopt -s nullglob
+        expanded=( ${pattern} )
+        shopt -u nullglob
+    else
+        expanded=( "${pattern}" )
+    fi
+
+    SYNC_DIRS=()
+    for d in "${expanded[@]}"; do
+        if [[ -d "${d}" ]]; then
+            SYNC_DIRS+=("${d}")
+        fi
+    done
+}
+
+declare -a SYNC_DIRS
+resolve_sync_dirs "${SYNC_DIR}"
+if [[ ${#SYNC_DIRS[@]} -eq 0 ]]; then
+    echo "[wandb-sync] ERROR: no sync directories found for: ${SYNC_DIR}" >&2
     exit 1
 fi
 
 echo "[wandb-sync] Python: ${PYTHON}"
 echo "[wandb-sync] Conda prefix: ${CONDA_PREFIX:-<unset>}"
-echo "[wandb-sync] Sync dir: ${SYNC_DIR}"
+echo "[wandb-sync] Sync dir pattern: ${SYNC_DIR}"
+echo "[wandb-sync] Resolved sync dirs: ${#SYNC_DIRS[@]}"
 echo "[wandb-sync] Run dir: ${RUN_DIR}"
 echo "[wandb-sync] W&B local dir: ${WANDB_LOCAL_DIR}"
 echo "[wandb-sync] Include offline: ${INCLUDE_OFFLINE}"
@@ -90,35 +114,41 @@ echo "[wandb-sync] Sync all: ${SYNC_ALL}"
 echo "[wandb-sync] Mark synced: ${MARK_SYNCED}"
 echo "[wandb-sync] Best effort: ${BEST_EFFORT}"
 
-CMD=("${PYTHON}" -m wandb sync)
-if [[ "${INCLUDE_OFFLINE}" == "1" ]]; then
-    CMD+=(--include-offline)
-fi
-if [[ "${INCLUDE_SYNCED}" == "1" ]]; then
-    CMD+=(--include-synced)
-fi
-if [[ "${SYNC_ALL}" == "1" ]]; then
-    CMD+=(--sync-all)
-fi
-if [[ "${MARK_SYNCED}" == "1" ]]; then
-    CMD+=(--mark-synced)
-fi
-if [[ -n "${WANDB_PROJECT}" ]]; then
-    CMD+=(--project "${WANDB_PROJECT}")
-fi
+status_any=0
+for target_dir in "${SYNC_DIRS[@]}"; do
+    CMD=("${PYTHON}" -m wandb sync)
+    if [[ "${INCLUDE_OFFLINE}" == "1" ]]; then
+        CMD+=(--include-offline)
+    fi
+    if [[ "${INCLUDE_SYNCED}" == "1" ]]; then
+        CMD+=(--include-synced)
+    fi
+    if [[ "${SYNC_ALL}" == "1" ]]; then
+        CMD+=(--sync-all)
+    fi
+    if [[ "${MARK_SYNCED}" == "1" ]]; then
+        CMD+=(--mark-synced)
+    fi
+    if [[ -n "${WANDB_PROJECT}" ]]; then
+        CMD+=(--project "${WANDB_PROJECT}")
+    fi
 
-CMD+=("${SYNC_DIR}")
+    CMD+=("${target_dir}")
+    echo "[wandb-sync] Command: ${CMD[*]}"
 
-echo "[wandb-sync] Command: ${CMD[*]}"
+    if [[ "${BEST_EFFORT}" == "1" ]]; then
+        "${CMD[@]}" || {
+            status=$?
+            status_any="${status}"
+            echo "[wandb-sync] WARN: sync failed for ${target_dir} with exit code ${status}" >&2
+        }
+    else
+        "${CMD[@]}"
+    fi
+done
 
-if [[ "${BEST_EFFORT}" == "1" ]]; then
-    "${CMD[@]}" || {
-        status=$?
-        echo "[wandb-sync] WARN: sync failed with exit code ${status}" >&2
-        exit 0
-    }
-else
-    "${CMD[@]}"
+if [[ "${BEST_EFFORT}" == "1" && "${status_any}" -ne 0 ]]; then
+    exit 0
 fi
 
 echo "[wandb-sync] Sync completed."
