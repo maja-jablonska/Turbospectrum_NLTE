@@ -143,6 +143,20 @@ if [[ ${#SYNC_DIRS[@]} -eq 0 ]]; then
     exit 1
 fi
 
+collect_sync_inputs() {
+    local dir="$1"
+    local -n out_ref="$2"
+    local -a items=()
+    shopt -s nullglob
+    items=("${dir}"/offline-run-* "${dir}"/run-* "${dir}"/*.wandb)
+    shopt -u nullglob
+    if [[ ${#items[@]} -gt 0 ]]; then
+        out_ref=("${items[@]}")
+    else
+        out_ref=("${dir}")
+    fi
+}
+
 echo "[wandb-sync] Python: ${PYTHON}"
 echo "[wandb-sync] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 echo "[wandb-sync] Sync dir pattern: ${SYNC_DIR}"
@@ -160,6 +174,9 @@ echo "[wandb-sync] Best effort: ${BEST_EFFORT}"
 
 status_any=0
 for target_dir in "${SYNC_DIRS[@]}"; do
+    declare -a SYNC_INPUTS=()
+    collect_sync_inputs "${target_dir}" SYNC_INPUTS
+
     CMD=("${PYTHON}" -m wandb sync)
     if [[ "${INCLUDE_OFFLINE}" == "1" ]]; then
         CMD+=(--include-offline)
@@ -177,7 +194,7 @@ for target_dir in "${SYNC_DIRS[@]}"; do
         CMD+=(--project "${WANDB_PROJECT}")
     fi
 
-    CMD+=("${target_dir}")
+    CMD+=("${SYNC_INPUTS[@]}")
     echo "[wandb-sync] Command: ${CMD[*]}"
 
     if [[ "${BEST_EFFORT}" == "1" ]]; then
