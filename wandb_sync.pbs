@@ -77,6 +77,17 @@ PYTHON="${PYTHON_BIN}"
 resolve_sync_dirs() {
     local pattern="$1"
     local -a expanded=()
+    local -a normalized=()
+    local d
+
+    is_wandb_run_dir() {
+        local dir="$1"
+        local -a matches
+        shopt -s nullglob
+        matches=("${dir}"/run-* "${dir}"/offline-run-* "${dir}"/*.wandb)
+        shopt -u nullglob
+        [[ ${#matches[@]} -gt 0 ]]
+    }
 
     # Expand wildcard patterns (e.g. /path/run*/wandb) if provided.
     if [[ "${pattern}" == *"*"* || "${pattern}" == *"?"* || "${pattern}" == *"["* ]]; then
@@ -87,8 +98,30 @@ resolve_sync_dirs() {
         expanded=( "${pattern}" )
     fi
 
-    SYNC_DIRS=()
+    # Normalize user-provided directories to actual W&B sync directories.
+    # Common case: user passes /runs/mlp_wandb/runXXX, but W&B data lives in /runXXX/wandb.
+    local -a nested=()
     for d in "${expanded[@]}"; do
+        [[ -d "${d}" ]] || continue
+        if is_wandb_run_dir "${d}"; then
+            normalized+=("${d}")
+            continue
+        fi
+        if [[ -d "${d}/wandb" ]] && is_wandb_run_dir "${d}/wandb"; then
+            normalized+=("${d}/wandb")
+            continue
+        fi
+        shopt -s nullglob
+        nested=("${d}"/run*/wandb)
+        shopt -u nullglob
+        if [[ ${#nested[@]} -gt 0 ]]; then
+            normalized+=("${nested[@]}")
+            continue
+        fi
+    done
+
+    SYNC_DIRS=()
+    for d in "${normalized[@]}"; do
         if [[ -d "${d}" ]]; then
             SYNC_DIRS+=("${d}")
         fi
