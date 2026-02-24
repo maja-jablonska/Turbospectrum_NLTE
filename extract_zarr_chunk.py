@@ -138,7 +138,7 @@ def main():
     # ---------------- STATIC ARRAYS ----------------
     for name in STATIC_ARRAYS:
         arr = src[name]
-        kwargs = safe_array_kwargs(arr)
+        kwargs = safe_array_kwargs(arr, for_data=True)
 
         dst.create_array(
             name,
