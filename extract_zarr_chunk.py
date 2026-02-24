@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 """
-Extract a chunk of samples from a spectra Zarr store.
-
-Zarr v2 + v3 compatible.
-HPC-safe (atomic write).
-
-Example:
-python extract_zarr_chunk.py \
-    --input synthesized_spectra.zarr \
-    --output chunk_100.zarr \
-    --start 0 \
-    --count 100
+Extract chunk from Zarr (v2/v3 compatible).
+Designed for HPC pipelines.
 """
 
 import argparse
@@ -19,10 +10,8 @@ import shutil
 import zarr
 import numpy as np
 
-# --------------------------------------------------
-# CONFIG
-# --------------------------------------------------
 
+# --------------------------------------------------
 SAMPLE_ARRAYS = [
     "flux",
     "global_index",
@@ -42,41 +31,60 @@ SCALAR_ARRAYS = [
     "physics_hash",
 ]
 
-BATCH = 32  # copy in chunks (memory-safe)
+BATCH = 32
 
 
 # --------------------------------------------------
-# HELPERS
-# --------------------------------------------------
+def safe_array_kwargs(arr):
+    """
+    Extract array creation kwargs safely across Zarr versions.
+    """
+
+    kwargs = dict(
+        dtype=arr.dtype,
+        chunks=arr.chunks,
+    )
+
+    # Zarr v3
+    if hasattr(arr, "compressors"):
+        try:
+            kwargs["compressors"] = arr.compressors
+        except Exception:
+            pass
+
+    # Zarr v2
+    elif hasattr(arr, "compressor"):
+        try:
+            kwargs["compressor"] = arr.compressor
+        except Exception:
+            pass
+
+    return kwargs
+
 
 def copy_provenance(src, dst):
     if "provenance" not in src:
         return
 
-    prov_src = src["provenance"]
-    prov_dst = dst.create_group("provenance")
+    psrc = src["provenance"]
+    pdst = dst.create_group("provenance")
 
-    for k in prov_src.array_keys():
-        arr = prov_src[k]
-        prov_dst.create_dataset(
-            k,
-            data=arr[()],
-            overwrite=True,
-        )
+    for k in psrc.array_keys():
+        arr = psrc[k]
+        pdst.create_array(k, data=arr[()])
 
 
 def copy_sample_array(arr, dst_group, name, start, end):
     n = end - start
 
-    # create empty output array with SAME metadata
-    out = dst_group.create_dataset(
+    kwargs = safe_array_kwargs(arr)
+
+    out = dst_group.create_array(
         name,
         shape=(n,) + arr.shape[1:],
-        like=arr,   # <- v3 safe magic
-        overwrite=True,
+        **kwargs,
     )
 
-    # batch copy (avoids loading entire flux block)
     for i in range(0, n, BATCH):
         j = min(i + BATCH, n)
         out[i:j] = arr[start + i:start + j]
@@ -91,9 +99,6 @@ def atomic_finalize(tmp_path, final_path):
 
 
 # --------------------------------------------------
-# MAIN
-# --------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -109,75 +114,52 @@ def main():
 
     n_total = src["flux"].shape[0]
     if end > n_total:
-        raise ValueError(f"Requested [{start}:{end}] exceeds {n_total}")
+        raise ValueError(f"{end=} exceeds dataset size {n_total}")
 
     print(f"Copying samples [{start}:{end})")
 
-    # --------------------------------------------------
-    # atomic write
-    # --------------------------------------------------
     tmp_output = args.output + ".tmp"
-
     if os.path.exists(tmp_output):
         shutil.rmtree(tmp_output)
 
     dst = zarr.open_group(tmp_output, mode="w")
 
-    # --------------------------------------------------
-    # copy sample arrays
-    # --------------------------------------------------
+    # ---------------- SAMPLE ARRAYS ----------------
     for name in SAMPLE_ARRAYS:
         arr = src[name]
         out = copy_sample_array(arr, dst, name, start, end)
         print(f"Copied {name} -> {out.shape}")
 
-    # --------------------------------------------------
-    # copy static arrays
-    # --------------------------------------------------
+    # ---------------- STATIC ARRAYS ----------------
     for name in STATIC_ARRAYS:
         arr = src[name]
-        dst.create_dataset(
+        kwargs = safe_array_kwargs(arr)
+
+        dst.create_array(
             name,
             data=arr[:],
-            like=arr,
-            overwrite=True,
+            **kwargs,
         )
         print(f"Copied static {name}")
 
-    # --------------------------------------------------
-    # copy scalars
-    # --------------------------------------------------
+    # ---------------- SCALARS ----------------
     for name in SCALAR_ARRAYS:
         arr = src[name]
-        dst.create_dataset(
-            name,
-            data=arr[()],
-            overwrite=True,
-        )
+        dst.create_array(name, data=arr[()])
 
-    # --------------------------------------------------
-    # provenance
-    # --------------------------------------------------
+    # ---------------- PROVENANCE ----------------
     copy_provenance(src, dst)
 
-    # copy root attrs
     dst.attrs.update(src.attrs)
 
-    # --------------------------------------------------
-    # validation (VERY IMPORTANT)
-    # --------------------------------------------------
+    # ---------------- VALIDATION ----------------
     gi = dst["global_index"][:]
     if not np.all(np.diff(gi) >= 0):
-        print("⚠ WARNING: global_index not sorted")
+        print("⚠ global_index not sorted")
 
-    print("Validation done.")
-
-    # --------------------------------------------------
-    # atomic finalize
-    # --------------------------------------------------
     atomic_finalize(tmp_output, args.output)
 
-    print(f"Done -> {args.output}")
+    print("Done.")
 
 
 if __name__ == "__main__":
