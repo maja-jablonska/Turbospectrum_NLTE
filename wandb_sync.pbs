@@ -15,6 +15,8 @@ cd "${PBS_O_WORKDIR}"
 
 unset PYTHONHOME || true
 unset PYTHONPATH || true
+# Prevent mixing user-site packages (~/.local) with the activated conda env.
+export PYTHONNOUSERSITE=1
 
 MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
 PYTHON_BIN="${PYTHON_BIN:-}"
