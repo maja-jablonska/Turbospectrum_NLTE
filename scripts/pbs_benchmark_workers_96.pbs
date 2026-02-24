@@ -1,0 +1,521 @@
+#!/bin/bash
+#PBS -N ts-workers-bench96
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=96
+#PBS -l mem=192GB
+#PBS -l jobfs=300GB
+#PBS -l walltime=12:00:00
+#PBS -l storage=scratch/mk27+scratch/y89
+#PBS -j oe
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+
+############################################
+# Thread caps (prevent oversubscription)
+############################################
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+# Prevent mixed-prefix Python startup failures on HPC nodes.
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+
+############################################
+# User-overridable knobs
+############################################
+
+PROJECT="${PROJECT:-mk27}"
+USER_ID="${USER_ID:-$(whoami)}"
+RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE_worker_bench/${PBS_JOBID}}"
+REPO="${REPO:-${PBS_O_WORKDIR}}"
+CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
+
+PYTHON_BIN="${PYTHON_BIN:-}"
+MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
+
+# Worker counts to benchmark (comma or space separated).
+WORKER_CANDIDATES="${WORKER_CANDIDATES:-16,24,32,40,48,56,64,72,80,88,96}"
+
+# Number of shard IDs to benchmark for each candidate.
+BENCHMARK_SHARDS="${BENCHMARK_SHARDS:-192}"
+
+# Retry attempts per shard during benchmark.
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
+
+# Minimum success rate required to be considered for "best".
+MIN_SUCCESS_RATE="${MIN_SUCCESS_RATE:-1.0}"
+
+# Keep per-candidate shard outputs after each trial.
+KEEP_BENCH_OUTPUTS="${KEEP_BENCH_OUTPUTS:-0}"
+
+SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
+TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
+TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
+
+############################################
+# Environment activation
+############################################
+
+activate_mamba() {
+    if [[ -n "${MAMBA_EXE:-}" && -x "${MAMBA_EXE}" ]]; then
+        eval "$("${MAMBA_EXE}" shell hook --shell bash)"
+    elif command -v mamba >/dev/null 2>&1; then
+        eval "$(mamba shell hook --shell bash)"
+    elif [[ -f "${HOME}/miniforge/etc/profile.d/conda.sh" ]]; then
+        source "${HOME}/miniforge/etc/profile.d/conda.sh"
+    else
+        return 1
+    fi
+
+    if command -v mamba >/dev/null 2>&1; then
+        mamba activate "${MAMBA_ENV_NAME}"
+    elif command -v conda >/dev/null 2>&1; then
+        conda activate "${MAMBA_ENV_NAME}"
+    else
+        return 1
+    fi
+}
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if activate_mamba; then
+        :
+    else
+        echo "[bench96] WARN: could not activate mamba env '${MAMBA_ENV_NAME}', falling back to PATH python." >&2
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    else
+        echo "[bench96] ERROR: no python executable found after env setup." >&2
+        exit 1
+    fi
+fi
+
+PYTHON="${PYTHON_BIN}"
+echo "[bench96] Python: ${PYTHON}"
+echo "[bench96] Mamba env: ${MAMBA_ENV_NAME}"
+echo "[bench96] Conda prefix: ${CONDA_PREFIX:-<unset>}"
+
+if ! "${PYTHON}" - <<'PY' >/dev/null 2>&1
+import numpy
+import zarr
+PY
+then
+    echo "[bench96] ERROR: Python is missing required packages (numpy, zarr): ${PYTHON}" >&2
+    exit 1
+fi
+
+############################################
+# Path setup
+############################################
+
+if [[ "${REPO}" != /* ]]; then
+    REPO="${PBS_O_WORKDIR}/${REPO}"
+fi
+REPO="$(cd "${REPO}" >/dev/null 2>&1 && pwd)"
+
+if [[ "${CONFIG_PATH}" != /* ]]; then
+    CONFIG_PATH="${REPO}/${CONFIG_PATH}"
+fi
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+    echo "[bench96] ERROR: config not found: ${CONFIG_PATH}" >&2
+    exit 1
+fi
+
+BENCH_ROOT="${RUN_ROOT}/worker_benchmark_96"
+RESULTS_DIR="${BENCH_ROOT}/results"
+GRID_DIR="${BENCH_ROOT}/grid"
+
+DERIVED_PIPELINE_CONFIG="${BENCH_ROOT}/config_pipeline.benchmark.json"
+TS_CONFIG="${BENCH_ROOT}/config_turbospectrum.benchmark.json"
+
+GRID_CSV="${GRID_DIR}/parameter_grid.csv"
+GRID_ZARR="${GRID_DIR}/parameter_grid.zarr"
+
+SUMMARY_CSV="${RESULTS_DIR}/workers_benchmark.csv"
+SUMMARY_TXT="${RESULTS_DIR}/recommendation.txt"
+
+mkdir -p "${BENCH_ROOT}" "${RESULTS_DIR}" "${GRID_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}"
+
+# Force temp users to write under designated scratch temp.
+export TMPDIR="${TMP_SYSTEM_DIR}"
+export TMP="${TMP_SYSTEM_DIR}"
+export TEMP="${TMP_SYSTEM_DIR}"
+
+############################################
+# Build benchmark-only configs
+############################################
+
+"${PYTHON}" - <<PY
+import copy
+import json
+import os
+
+config_path = os.path.abspath(r"${CONFIG_PATH}")
+derived_path = os.path.abspath(r"${DERIVED_PIPELINE_CONFIG}")
+ts_config_path = os.path.abspath(r"${TS_CONFIG}")
+bench_root = os.path.abspath(r"${BENCH_ROOT}")
+repo_root = os.path.abspath(r"${REPO}")
+grid_csv = os.path.abspath(r"${GRID_CSV}")
+grid_zarr = os.path.abspath(r"${GRID_ZARR}")
+
+with open(config_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+
+cfg_bench = copy.deepcopy(cfg)
+outs = dict(cfg_bench.get("outputs") or {})
+outs["grid_csv"] = grid_csv
+outs["grid_zarr"] = grid_zarr
+outs["spectra_zarr"] = os.path.join(bench_root, "unused", "merged_unused.zarr")
+outs["spectra_shard_template"] = os.path.join(bench_root, "unused", "spectra_shard_{shard_index}.zarr")
+cfg_bench["outputs"] = outs
+
+runtime = dict(cfg_bench.get("runtime") or {})
+runtime["workers"] = 1
+cfg_bench["runtime"] = runtime
+
+os.makedirs(os.path.dirname(derived_path), exist_ok=True)
+with open(derived_path, "w", encoding="utf-8") as handle:
+    json.dump(cfg_bench, handle, indent=2, sort_keys=True)
+
+def strip_private_keys(obj):
+    if isinstance(obj, dict):
+        return {
+            k: strip_private_keys(v)
+            for k, v in obj.items()
+            if not (isinstance(k, str) and k.startswith("_"))
+        }
+    if isinstance(obj, list):
+        return [strip_private_keys(v) for v in obj]
+    return obj
+
+ts_cfg = strip_private_keys(dict(cfg.get("turbospectrum") or {}))
+if not ts_cfg.get("project_root"):
+    ts_cfg["project_root"] = repo_root
+
+with open(ts_config_path, "w", encoding="utf-8") as handle:
+    json.dump(ts_cfg, handle, indent=2, sort_keys=True)
+
+print(f"[bench96] Derived pipeline config: {derived_path}")
+print(f"[bench96] Derived Turbospectrum config: {ts_config_path}")
+PY
+
+############################################
+# Generate benchmark grid once
+############################################
+
+echo "[bench96] Generating benchmark grid..."
+rm -rf "${GRID_ZARR}"
+"${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
+    --config "${DERIVED_PIPELINE_CONFIG}" \
+    --skip-synthesis
+
+if [[ ! -d "${GRID_ZARR}" ]]; then
+    echo "[bench96] ERROR: benchmark grid not found: ${GRID_ZARR}" >&2
+    exit 1
+fi
+
+ROW_COUNT=$("${PYTHON}" - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
+for key in ("teff", "params", "global_index"):
+    if key in root and len(root[key].shape) >= 1:
+        print(int(root[key].shape[0]))
+        break
+else:
+    raise RuntimeError(f"Could not infer row count from {r'${GRID_ZARR}'}")
+PY
+)
+
+if ! [[ "${ROW_COUNT}" =~ ^[0-9]+$ ]] || (( ROW_COUNT <= 0 )); then
+    echo "[bench96] ERROR: invalid row count inferred from grid: ${ROW_COUNT}" >&2
+    exit 1
+fi
+
+if ! [[ "${BENCHMARK_SHARDS}" =~ ^[0-9]+$ ]] || (( BENCHMARK_SHARDS <= 0 )); then
+    echo "[bench96] ERROR: BENCHMARK_SHARDS must be a positive integer." >&2
+    exit 1
+fi
+
+BENCH_SHARDS="${BENCHMARK_SHARDS}"
+if (( BENCH_SHARDS > ROW_COUNT )); then
+    BENCH_SHARDS="${ROW_COUNT}"
+fi
+
+ALLOC_CPUS="${PBS_NCPUS:-96}"
+if ! [[ "${ALLOC_CPUS}" =~ ^[0-9]+$ ]] || (( ALLOC_CPUS <= 0 )); then
+    ALLOC_CPUS=96
+fi
+
+echo "[bench96] Repo: ${REPO}"
+echo "[bench96] Source config: ${CONFIG_PATH}"
+echo "[bench96] Run root: ${RUN_ROOT}"
+echo "[bench96] Benchmark root: ${BENCH_ROOT}"
+echo "[bench96] Grid rows: ${ROW_COUNT}"
+echo "[bench96] Benchmark shards per candidate: ${BENCH_SHARDS}"
+echo "[bench96] Allocated CPUs: ${ALLOC_CPUS}"
+
+############################################
+# Candidate parsing
+############################################
+
+parse_candidates() {
+    local raw="$1"
+    local token
+    local seen=" "
+    local candidate
+
+    raw="$(printf '%s' "${raw}" | tr ',' ' ')"
+    for token in ${raw}; do
+        [[ "${token}" =~ ^[0-9]+$ ]] || continue
+        candidate="${token}"
+        (( candidate >= 1 )) || continue
+        if (( candidate > ALLOC_CPUS )); then
+            echo "[bench96] Skipping WORKERS=${candidate} (> allocated CPUs ${ALLOC_CPUS})" >&2
+            continue
+        fi
+        if [[ "${seen}" == *" ${candidate} "* ]]; then
+            continue
+        fi
+        seen="${seen}${candidate} "
+        echo "${candidate}"
+    done
+}
+
+mapfile -t CANDIDATES < <(parse_candidates "${WORKER_CANDIDATES}")
+if (( ${#CANDIDATES[@]} == 0 )); then
+    echo "[bench96] ERROR: no valid WORKER_CANDIDATES after filtering." >&2
+    exit 1
+fi
+
+echo "[bench96] Candidate WORKERS values: ${CANDIDATES[*]}"
+
+############################################
+# Validation and worker loop
+############################################
+
+is_valid_shard() {
+    local shard_path="$1"
+    SHARD_PATH="${shard_path}" "${PYTHON}" - <<'PY' >/dev/null 2>&1
+import os
+import zarr
+
+path = os.environ["SHARD_PATH"]
+root = zarr.open_group(path, mode="r")
+assert "flux" in root and "wavelength" in root
+assert root["flux"].shape[0] > 0
+PY
+}
+
+count_valid_shards() {
+    local shard_dir="$1"
+    local expected="$2"
+    SHARD_DIR="${shard_dir}" EXPECTED="${expected}" "${PYTHON}" - <<'PY'
+import os
+import zarr
+
+shard_dir = os.environ["SHARD_DIR"]
+expected = int(os.environ["EXPECTED"])
+ok = 0
+
+for shard_id in range(expected):
+    path = os.path.join(shard_dir, f"spectra_shard_{shard_id}.zarr")
+    try:
+        root = zarr.open_group(path, mode="r")
+        if "flux" in root and "wavelength" in root and root["flux"].shape[0] > 0:
+            ok += 1
+    except Exception:
+        pass
+
+print(ok)
+PY
+}
+
+worker_loop() {
+    local worker_id="$1"
+    local worker_scratch="${TMP_WORK_DIR}/w${CANDIDATE_WORKERS}/worker_${worker_id}"
+    mkdir -p "${worker_scratch}"
+
+    while true; do
+        local shard_index out_path log_path tmp_out_path attempt_scratch
+
+        exec 9<>"${CANDIDATE_LOCK_FILE}"
+        flock -x 9
+        shard_index="$(cat "${CANDIDATE_COUNTER_FILE}")"
+        echo $((shard_index + 1)) > "${CANDIDATE_COUNTER_FILE}"
+        flock -u 9
+        exec 9>&-
+
+        if (( shard_index >= BENCH_SHARDS )); then
+            break
+        fi
+
+        out_path="${CANDIDATE_SHARD_DIR}/spectra_shard_${shard_index}.zarr"
+        log_path="${CANDIDATE_LOG_DIR}/shard_${shard_index}.log"
+        rm -rf "${out_path}"
+
+        for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+            attempt_scratch="${worker_scratch}/shard_${shard_index}_a${attempt}"
+            tmp_out_path="${CANDIDATE_TMP_DIR}/spectra_shard_${shard_index}.a${attempt}.tmp.zarr"
+            rm -rf "${attempt_scratch}" "${tmp_out_path}"
+            mkdir -p "${attempt_scratch}"
+
+            "${PYTHON}" "${REPO}/scripts/run_turbospectrum_shard.py" \
+                --grid-zarr "${GRID_ZARR}" \
+                --config "${TS_CONFIG}" \
+                --output-zarr "${out_path}" \
+                --output-tmp "${tmp_out_path}" \
+                --shard-index "${shard_index}" \
+                --shard-count "${ROW_COUNT}" \
+                --workers 1 \
+                --scratch "${attempt_scratch}" \
+                --log-level INFO \
+                >> "${log_path}" 2>&1 || true
+
+            if is_valid_shard "${out_path}"; then
+                echo "status=ok attempt=${attempt}" >> "${log_path}"
+                break
+            fi
+
+            rm -rf "${tmp_out_path}" "${out_path}"
+
+            if (( attempt == MAX_ATTEMPTS )); then
+                echo "status=failed attempts=${MAX_ATTEMPTS}" >> "${log_path}"
+            else
+                sleep $(( (RANDOM % 10) + attempt * 5 ))
+            fi
+        done
+    done
+}
+
+############################################
+# Benchmark execution
+############################################
+
+echo "workers,valid_shards,total_shards,elapsed_seconds,throughput_shards_per_hour,success_rate" > "${SUMMARY_CSV}"
+
+run_candidate() {
+    local workers="$1"
+    local start_ts end_ts elapsed valid throughput success_rate
+    local candidate_root="${BENCH_ROOT}/workers_${workers}"
+
+    CANDIDATE_WORKERS="${workers}"
+    CANDIDATE_COUNTER_FILE="${candidate_root}/next_shard.txt"
+    CANDIDATE_LOCK_FILE="${candidate_root}/counter.lock"
+    CANDIDATE_SHARD_DIR="${candidate_root}/shards"
+    CANDIDATE_LOG_DIR="${candidate_root}/logs"
+    CANDIDATE_TMP_DIR="${candidate_root}/tmp"
+
+    rm -rf "${candidate_root}"
+    mkdir -p "${CANDIDATE_SHARD_DIR}" "${CANDIDATE_LOG_DIR}" "${CANDIDATE_TMP_DIR}"
+    echo 0 > "${CANDIDATE_COUNTER_FILE}"
+    : > "${CANDIDATE_LOCK_FILE}"
+
+    echo "[bench96] ============================================================"
+    echo "[bench96] Benchmarking WORKERS=${workers} (CPUs allocated: ${ALLOC_CPUS})"
+    echo "[bench96] Candidate root: ${candidate_root}"
+
+    start_ts="$(date +%s)"
+
+    for ((wid=0; wid<workers; wid++)); do
+        worker_loop "${wid}" &
+    done
+    wait
+
+    end_ts="$(date +%s)"
+    elapsed=$((end_ts - start_ts))
+    if (( elapsed < 1 )); then
+        elapsed=1
+    fi
+
+    valid="$(count_valid_shards "${CANDIDATE_SHARD_DIR}" "${BENCH_SHARDS}")"
+    if ! [[ "${valid}" =~ ^[0-9]+$ ]]; then
+        valid=0
+    fi
+
+    throughput="$(awk -v v="${valid}" -v e="${elapsed}" 'BEGIN { printf "%.6f", (v * 3600.0) / e }')"
+    success_rate="$(awk -v v="${valid}" -v t="${BENCH_SHARDS}" 'BEGIN { if (t <= 0) t = 1; printf "%.6f", v / t }')"
+
+    echo "${workers},${valid},${BENCH_SHARDS},${elapsed},${throughput},${success_rate}" >> "${SUMMARY_CSV}"
+    echo "[bench96] Result WORKERS=${workers}: valid=${valid}/${BENCH_SHARDS}, elapsed=${elapsed}s, throughput=${throughput} shards/hour, success_rate=${success_rate}"
+
+    if [[ "${KEEP_BENCH_OUTPUTS}" != "1" ]]; then
+        rm -rf "${CANDIDATE_SHARD_DIR}" "${CANDIDATE_TMP_DIR}"
+    fi
+}
+
+for workers in "${CANDIDATES[@]}"; do
+    run_candidate "${workers}"
+done
+
+############################################
+# Recommend best candidate
+############################################
+
+BEST_REPORT="$("${PYTHON}" - <<PY
+import csv
+import os
+
+path = os.path.abspath(r"${SUMMARY_CSV}")
+min_success_rate = float(r"${MIN_SUCCESS_RATE}")
+
+rows = []
+with open(path, "r", encoding="utf-8") as handle:
+    reader = csv.DictReader(handle)
+    for row in reader:
+        rows.append({
+            "workers": int(row["workers"]),
+            "valid_shards": int(row["valid_shards"]),
+            "total_shards": int(row["total_shards"]),
+            "elapsed_seconds": int(row["elapsed_seconds"]),
+            "throughput_shards_per_hour": float(row["throughput_shards_per_hour"]),
+            "success_rate": float(row["success_rate"]),
+        })
+
+if not rows:
+    raise RuntimeError("No benchmark rows found.")
+
+eligible = [r for r in rows if r["success_rate"] >= min_success_rate]
+pool = eligible if eligible else rows
+
+best = max(
+    pool,
+    key=lambda r: (
+        r["throughput_shards_per_hour"],
+        r["success_rate"],
+        -r["elapsed_seconds"],
+        -r["workers"],
+    ),
+)
+
+print(
+    "workers={workers} throughput={throughput:.6f} success_rate={success:.6f} "
+    "valid={valid}/{total} elapsed_seconds={elapsed} eligible_count={eligible}".format(
+        workers=best["workers"],
+        throughput=best["throughput_shards_per_hour"],
+        success=best["success_rate"],
+        valid=best["valid_shards"],
+        total=best["total_shards"],
+        elapsed=best["elapsed_seconds"],
+        eligible=len(eligible),
+    )
+)
+PY
+)"
+
+{
+    echo "[bench96] Benchmark complete."
+    echo "[bench96] Summary CSV: ${SUMMARY_CSV}"
+    echo "[bench96] ${BEST_REPORT}"
+} | tee "${SUMMARY_TXT}"
+
+echo "[bench96] Recommendation file: ${SUMMARY_TXT}"
