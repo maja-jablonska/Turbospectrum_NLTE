@@ -107,6 +107,14 @@ resolve_sync_dirs() {
             normalized+=("${d}")
             continue
         fi
+        # If the directory itself is named "wandb", treat it as the terminal candidate
+        # and do not append another /wandb.
+        if [[ "$(basename "${d}")" == "wandb" ]]; then
+            if is_wandb_run_dir "${d}"; then
+                normalized+=("${d}")
+            fi
+            continue
+        fi
         if [[ -d "${d}/wandb" ]] && is_wandb_run_dir "${d}/wandb"; then
             normalized+=("${d}/wandb")
             continue
@@ -139,6 +147,9 @@ echo "[wandb-sync] Python: ${PYTHON}"
 echo "[wandb-sync] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 echo "[wandb-sync] Sync dir pattern: ${SYNC_DIR}"
 echo "[wandb-sync] Resolved sync dirs: ${#SYNC_DIRS[@]}"
+for target_dir in "${SYNC_DIRS[@]}"; do
+    echo "[wandb-sync] Target: ${target_dir}"
+done
 echo "[wandb-sync] Run dir: ${RUN_DIR}"
 echo "[wandb-sync] W&B local dir: ${WANDB_LOCAL_DIR}"
 echo "[wandb-sync] Include offline: ${INCLUDE_OFFLINE}"
