@@ -35,24 +35,29 @@ BATCH = 32
 
 
 # --------------------------------------------------
-def safe_array_kwargs(arr):
+def safe_array_kwargs(arr, for_data=False):
     """
-    Extract array creation kwargs safely across Zarr versions.
+    Extract safe kwargs across zarr versions.
+
+    for_data=True -> omit dtype (required by newer Zarr)
     """
 
-    kwargs = dict(
-        dtype=arr.dtype,
-        chunks=arr.chunks,
-    )
+    kwargs = {}
 
-    # Zarr v3
+    if not for_data:
+        kwargs["dtype"] = arr.dtype
+
+    if arr.chunks is not None:
+        kwargs["chunks"] = arr.chunks
+
+    # v3
     if hasattr(arr, "compressors"):
         try:
             kwargs["compressors"] = arr.compressors
         except Exception:
             pass
 
-    # Zarr v2
+    # v2
     elif hasattr(arr, "compressor"):
         try:
             kwargs["compressor"] = arr.compressor
