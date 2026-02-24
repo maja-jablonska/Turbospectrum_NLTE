@@ -76,6 +76,18 @@ fi
 
 PYTHON="${PYTHON_BIN}"
 
+if ! "${PYTHON}" - <<'PY'
+import importlib
+for name in ("wandb", "pydantic"):
+    importlib.import_module(name)
+print("[wandb-sync] Dependency preflight OK: wandb, pydantic")
+PY
+then
+    echo "[wandb-sync] ERROR: missing/incompatible Python deps in active env." >&2
+    echo "[wandb-sync] Install into env '${MAMBA_ENV_NAME}': python -m pip install 'wandb>=0.17' 'pydantic>=2,<3'" >&2
+    exit 1
+fi
+
 resolve_sync_dirs() {
     local pattern="$1"
     local -a expanded=()
