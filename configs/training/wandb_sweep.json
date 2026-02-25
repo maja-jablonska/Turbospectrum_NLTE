@@ -1,129 +1,44 @@
 {
-  "method": "bayes",
-  "metric": {
-    "goal": "minimize",
-    "name": "val_recon"
+  "defaults": {
+    "weight_decay": 0.0001,
+    "lambda_hi": 0.02,
+    "lambda_lo": 0.005,
+    "lambda_smooth": 0.0003,
+    "huber_delta": 1.0,
+    "warmup_fraction": 0.1,
+    "min_lr_ratio": 0.05
   },
-  "early_terminate": {
-    "type": "hyperband",
-    "min_iter": 10
-  },
-  "parameters": {
-    "axis_name": {
-      "distribution": "categorical",
-      "values": [
-        "log_wavelength"
+  "grid": {
+    "hidden_dims": [
+      [
+        128,
+        256
+      ],
+      [
+        128,
+        128,
+        256,
+        256
+      ],
+      [
+        256,
+        256
       ]
-    },
-    "hidden_dims": {
-      "distribution": "categorical",
-      "values": [
-        "128x256",
-        "128x128x256x256",
-        "256x256"
-      ]
-    },
-    "batch_size": {
-      "distribution": "categorical",
-      "values": [
-        16,
-        32,
-        64
-      ]
-    },
-    "epochs": {
-      "distribution": "categorical",
-      "values": [
-        40,
-        80,
-        120
-      ]
-    },
-    "include_mu": {
-      "distribution": "categorical",
-      "values": [
-        true
-      ]
-    },
-    "jax_platform": {
-      "distribution": "categorical",
-      "values": [
-        "cpu"
-      ]
-    },
-    "huber_delta": {
-      "distribution": "uniform",
-      "min": 0.7,
-      "max": 1.5
-    },
-    "lambda_hi": {
-      "distribution": "uniform",
-      "min": 0.0,
-      "max": 0.05
-    },
-    "lambda_lo": {
-      "distribution": "uniform",
-      "min": 0.0,
-      "max": 0.02
-    },
-    "lambda_smooth": {
-      "distribution": "log_uniform_values",
-      "min": 1e-05,
-      "max": 0.01
-    },
-    "learning_rate": {
-      "distribution": "log_uniform_values",
-      "min": 0.0003,
-      "max": 0.003
-    },
-    "min_lr_ratio": {
-      "distribution": "uniform",
-      "min": 0.01,
-      "max": 0.2
-    },
-    "mu_key": {
-      "distribution": "categorical",
-      "values": [
-        "auto"
-      ]
-    },
-    "normalize_inputs": {
-      "distribution": "categorical",
-      "values": [
-        true
-      ]
-    },
-    "seed": {
-      "distribution": "categorical",
-      "values": [
-        7,
-        11,
-        13
-      ]
-    },
-    "target_points": {
-      "distribution": "categorical",
-      "values": [
-        512,
-        1024
-      ]
-    },
-    "warmup_fraction": {
-      "distribution": "uniform",
-      "min": 0.05,
-      "max": 0.25
-    },
-    "weight_decay": {
-      "distribution": "log_uniform_values",
-      "min": 1e-06,
-      "max": 0.001
-    },
-    "zarr_path": {
-      "distribution": "categorical",
-      "values": [
-        "ca_triplet_tiny.zarr"
-      ]
-    }
-  },
-  "program": "scripts/train_mlp_wandb.py"
+    ],
+    "learning_rate": [
+      0.0003,
+      0.001,
+      0.003
+    ],
+    "batch_size": [
+      16,
+      32,
+      64
+    ],
+    "epochs": [
+      40,
+      80,
+      120
+    ]
+  }
 }
