@@ -410,6 +410,61 @@ def _write_zarr_from_columns(columns: Mapping[str, np.ndarray], zarr_path: str, 
                 root.array(name, values, chunks=int(chunks), **kwargs)
 
 
+def _default_index_parquet_path(*, grid_zarr_path: str | None, grid_csv_path: str | None) -> str:
+    anchor = grid_zarr_path or grid_csv_path
+    if not anchor:
+        raise ValueError("Cannot resolve default index parquet path without grid_zarr_path or grid_csv_path")
+    base_dir = os.path.dirname(os.path.abspath(anchor))
+    return os.path.join(base_dir, "index.parquet")
+
+
+def _write_index_parquet_from_columns(columns: Mapping[str, np.ndarray], output_path: str) -> None:
+    if not columns:
+        raise ValueError("Cannot write index parquet: no columns provided")
+
+    first_name = next(iter(columns.keys()))
+    row_count = int(len(columns[first_name]))
+    for name, values in columns.items():
+        if len(values) != row_count:
+            raise ValueError(
+                f"Column '{name}' has length {len(values)} but expected {row_count} from '{first_name}'"
+            )
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    payload: Dict[str, Any] = {"row_index": np.arange(row_count, dtype=np.int64)}
+    payload.update({name: values for name, values in columns.items()})
+
+    # Prefer Polars when available (already used by ML grid workflows),
+    # fallback to pandas+pyarrow/fastparquet for environments without Polars.
+    try:
+        import polars as pl  # type: ignore
+
+        pl.DataFrame(payload).write_parquet(output_path, compression="zstd")
+        return
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        import pandas as pd  # type: ignore
+
+        pd.DataFrame(payload).to_parquet(output_path, index=False)
+        return
+    except Exception:
+        pass
+
+    try:
+        import pyarrow as pa  # type: ignore
+        import pyarrow.parquet as pq  # type: ignore
+
+        pq.write_table(pa.table(payload), output_path, compression="zstd")
+        return
+    except Exception as parquet_exc:  # noqa: BLE001
+        raise ImportError(
+            "Writing index.parquet requires `polars`, `pyarrow`, or `pandas` with a parquet engine "
+            "(pyarrow/fastparquet). Install e.g. `pip install polars`."
+        ) from parquet_exc
+
+
 def generate_grid(
     config_path='configs/sampling/grid_config.yml',
     output_path=None,
@@ -554,6 +609,15 @@ if __name__ == '__main__':
             compressor_cfg = (zarr_cfg.get("compressor") or {}) if isinstance(zarr_cfg, Mapping) else {}
             _write_zarr_from_columns(columns, zarr_out_abs, chunks=zarr_chunks, compressor_cfg=compressor_cfg)
             print(f"Successfully wrote Zarr store at {zarr_out_abs}")
+
+        index_out = cfg.get("index_parquet")
+        index_out_abs = (
+            _abs_from(config_dir, index_out)
+            if index_out
+            else _default_index_parquet_path(grid_zarr_path=zarr_out_abs, grid_csv_path=csv_out_abs)
+        )
+        _write_index_parquet_from_columns(columns, index_out_abs)
+        print(f"Successfully wrote parameter index at {index_out_abs}")
     else:
         # Legacy YAML config path.
         out = args.csv_output or args.output or default_csv_out

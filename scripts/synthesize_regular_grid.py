@@ -247,6 +247,7 @@ def main() -> None:
     parser.add_argument("--run-root", default=None, help="Runtime root (defaults to RUN_ROOT/scratch)")
     parser.add_argument("--grid-zarr", default=None, help="Output grid Zarr path")
     parser.add_argument("--grid-csv", default=None, help="Optional grid CSV path")
+    parser.add_argument("--index-parquet", default=None, help="Optional parameter index parquet output path")
     parser.add_argument("--csv-compression", default=None, choices=("none", "gzip", "zstd"))
     parser.add_argument("--csv-compression-level", type=int, default=None)
     parser.add_argument("--zarr-chunks", type=int, default=None)
@@ -338,6 +339,11 @@ def main() -> None:
         ("outputs", "grid_csv"),
         os.path.join(run_root, "outputs", "grids", "regular_parameter_grid.csv"),
     )
+    index_parquet = _resolve_path(
+        args.index_parquet,
+        ("outputs", "grid_index_parquet"),
+        os.path.join(os.path.dirname(grid_zarr), "index.parquet"),
+    )
     spectra_zarr = _resolve_path(
         args.spectra_zarr,
         ("outputs", "spectra_zarr"),
@@ -426,6 +432,7 @@ def main() -> None:
         print(f"[regular-grid] synthesis scratch: {scratch}")
     print(f"[regular-grid] writing CSV: {grid_csv}")
     print(f"[regular-grid] writing Zarr: {grid_zarr}")
+    print(f"[regular-grid] writing index parquet: {index_parquet}")
 
     sys.path.insert(0, SCRIPT_DIR)
     import generate_grid as gg  # type: ignore
@@ -433,6 +440,7 @@ def main() -> None:
     csv_compression_opt = None if csv_compression == "none" else csv_compression
     gg._write_csv_outputs(columns, grid_csv, compression=csv_compression_opt, level=csv_compression_level)  # type: ignore[attr-defined]
     gg._write_zarr_from_columns(columns, grid_zarr, chunks=zarr_chunks, compressor_cfg=zarr_compressor)  # type: ignore[attr-defined]
+    gg._write_index_parquet_from_columns(columns, index_parquet)  # type: ignore[attr-defined]
 
     if skip_synthesis:
         print("[regular-grid] skip-synthesis requested; done.")

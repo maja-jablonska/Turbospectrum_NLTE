@@ -55,6 +55,7 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
 
     grid_csv = _abs_from(config_dir, outputs.get("grid_csv"))
     grid_zarr = _abs_from(config_dir, outputs.get("grid_zarr"))
+    grid_index_parquet = _abs_from(config_dir, outputs.get("grid_index_parquet"))
     if not grid_zarr:
         raise ValueError("outputs.grid_zarr is required")
 
@@ -68,6 +69,11 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
     # Import and run the existing implementation directly.
     sys.path.insert(0, SCRIPT_DIR)
     import generate_grid as gg  # type: ignore
+    if not grid_index_parquet:
+        grid_index_parquet = gg._default_index_parquet_path(  # type: ignore[attr-defined]
+            grid_zarr_path=grid_zarr,
+            grid_csv_path=grid_csv,
+        )
 
     seed = grid_cfg.get("seed")
     rng = np.random.default_rng(seed)
@@ -90,9 +96,15 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
     chunks = int(zarr_cfg.get("chunks", 2048)) if isinstance(zarr_cfg, dict) else 2048
     compressor_cfg = (zarr_cfg.get("compressor") or {}) if isinstance(zarr_cfg, dict) else {}
     gg._write_zarr_from_columns(columns, grid_zarr, chunks=chunks, compressor_cfg=compressor_cfg)  # type: ignore[attr-defined]
+    gg._write_index_parquet_from_columns(columns, grid_index_parquet)  # type: ignore[attr-defined]
     print(f"Wrote grid Zarr: {grid_zarr}")
+    print(f"Wrote grid parameter index: {grid_index_parquet}")
 
-    return {"grid_csv": grid_csv or "", "grid_zarr": grid_zarr}
+    return {
+        "grid_csv": grid_csv or "",
+        "grid_zarr": grid_zarr,
+        "grid_index_parquet": grid_index_parquet,
+    }
 
 
 def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir: str, scratch: Optional[str]) -> str:

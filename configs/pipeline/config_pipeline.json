@@ -129,6 +129,7 @@
 
     "grid_csv": "../../runs/local-dev/outputs/grids/parameter_grid.csv",
     "grid_zarr": "../../runs/local-dev/outputs/grids/parameter_grid.zarr",
+    "grid_index_parquet": "../../runs/local-dev/outputs/grids/index.parquet",
 
     "spectra_zarr": "../../runs/local-dev/outputs/zarr/synthesized_spectra.zarr",
 
