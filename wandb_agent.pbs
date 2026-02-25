@@ -96,7 +96,7 @@ WANDB_SYNC_DIR="${WANDB_SYNC_DIR:-${WANDB_LOCAL_DIR}}"
 SWEEP_ID="${SWEEP_ID:-}"
 
 # Offline/disabled mode: required local sweep config file for train script.
-SWEEP_CONFIG="${SWEEP_CONFIG:-${PBS_O_WORKDIR}/configs/training/mlp_wandb_sweep.example.json}"
+SWEEP_CONFIG="${SWEEP_CONFIG:-${PBS_O_WORKDIR}/configs/training/wandb_sweep.json}"
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-${PBS_O_WORKDIR}/scripts/train_mlp_wandb.py}"
 ZARR_PATH="${ZARR_PATH:-${PBS_O_WORKDIR}/spectra_tiny.zarr}"
 WANDB_PROJECT="${WANDB_PROJECT:-turbospectrum-mlp}"
