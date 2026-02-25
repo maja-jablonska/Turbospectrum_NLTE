@@ -52,6 +52,10 @@ class RunSpec:
     weight_decay: float
     lambda_hi: float
     lambda_lo: float
+    lambda_smooth: float
+    huber_delta: float
+    warmup_fraction: float
+    min_lr_ratio: float
     epochs: int
     batch_size: int
     seed: int
@@ -179,7 +183,8 @@ def _spec_to_compact_name(spec: RunSpec, run_index: int) -> str:
     h = "x".join(str(x) for x in spec.hidden_dims)
     return _sanitize_name(
         f"run{run_index:03d}_h{h}_lr{spec.learning_rate:g}_wd{spec.weight_decay:g}"
-        f"_bs{spec.batch_size}_lh{spec.lambda_hi:g}_ll{spec.lambda_lo:g}_ep{spec.epochs}"
+        f"_bs{spec.batch_size}_lh{spec.lambda_hi:g}_ll{spec.lambda_lo:g}"
+        f"_ls{spec.lambda_smooth:g}_hd{spec.huber_delta:g}_ep{spec.epochs}"
     )
 
 
@@ -210,6 +215,10 @@ def _run_spec_from_mapping(raw: Mapping[str, Any], defaults: RunSpec, seed_fallb
     weight_decay = float(raw.get("weight_decay", defaults.weight_decay))
     lambda_hi = float(raw.get("lambda_hi", defaults.lambda_hi))
     lambda_lo = float(raw.get("lambda_lo", defaults.lambda_lo))
+    lambda_smooth = float(raw.get("lambda_smooth", defaults.lambda_smooth))
+    huber_delta = float(raw.get("huber_delta", defaults.huber_delta))
+    warmup_fraction = float(raw.get("warmup_fraction", defaults.warmup_fraction))
+    min_lr_ratio = float(raw.get("min_lr_ratio", defaults.min_lr_ratio))
     epochs = int(raw.get("epochs", defaults.epochs))
     batch_size = int(raw.get("batch_size", defaults.batch_size))
     seed = int(raw.get("seed", seed_fallback))
@@ -219,6 +228,14 @@ def _run_spec_from_mapping(raw: Mapping[str, Any], defaults: RunSpec, seed_fallb
         raise ValueError(f"epochs must be positive, got {epochs}")
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if lambda_smooth < 0.0:
+        raise ValueError(f"lambda_smooth must be >= 0, got {lambda_smooth}")
+    if huber_delta <= 0.0:
+        raise ValueError(f"huber_delta must be > 0, got {huber_delta}")
+    if not 0.0 <= warmup_fraction < 1.0:
+        raise ValueError(f"warmup_fraction must be in [0, 1), got {warmup_fraction}")
+    if not 0.0 < min_lr_ratio <= 1.0:
+        raise ValueError(f"min_lr_ratio must be in (0, 1], got {min_lr_ratio}")
 
     return RunSpec(
         hidden_dims=hidden_dims,
@@ -226,6 +243,10 @@ def _run_spec_from_mapping(raw: Mapping[str, Any], defaults: RunSpec, seed_fallb
         weight_decay=weight_decay,
         lambda_hi=lambda_hi,
         lambda_lo=lambda_lo,
+        lambda_smooth=lambda_smooth,
+        huber_delta=huber_delta,
+        warmup_fraction=warmup_fraction,
+        min_lr_ratio=min_lr_ratio,
         epochs=epochs,
         batch_size=batch_size,
         seed=seed,
@@ -239,6 +260,10 @@ def _build_specs_from_cli(args: argparse.Namespace) -> list[RunSpec]:
     weight_decay_grid = _parse_float_grid(args.weight_decay_grid)
     lambda_hi_grid = _parse_float_grid(args.lambda_hi_grid)
     lambda_lo_grid = _parse_float_grid(args.lambda_lo_grid)
+    lambda_smooth_grid = _parse_float_grid(args.lambda_smooth_grid)
+    huber_delta_grid = _parse_float_grid(args.huber_delta_grid)
+    warmup_fraction_grid = _parse_float_grid(args.warmup_fraction_grid)
+    min_lr_ratio_grid = _parse_float_grid(args.min_lr_ratio_grid)
     epochs_grid = _parse_int_grid(args.epochs_grid)
     batch_size_grid = _parse_int_grid(args.batch_size_grid)
 
@@ -249,10 +274,14 @@ def _build_specs_from_cli(args: argparse.Namespace) -> list[RunSpec]:
         weight_decay_grid,
         lambda_hi_grid,
         lambda_lo_grid,
+        lambda_smooth_grid,
+        huber_delta_grid,
+        warmup_fraction_grid,
+        min_lr_ratio_grid,
         epochs_grid,
         batch_size_grid,
     ):
-        hidden_dims, lr, wd, lhi, llo, epochs, batch_size = combo
+        hidden_dims, lr, wd, lhi, llo, lsmooth, hdelta, warmup, min_lr, epochs, batch_size = combo
         specs.append(
             RunSpec(
                 hidden_dims=tuple(hidden_dims),
@@ -260,6 +289,10 @@ def _build_specs_from_cli(args: argparse.Namespace) -> list[RunSpec]:
                 weight_decay=float(wd),
                 lambda_hi=float(lhi),
                 lambda_lo=float(llo),
+                lambda_smooth=float(lsmooth),
+                huber_delta=float(hdelta),
+                warmup_fraction=float(warmup),
+                min_lr_ratio=float(min_lr),
                 epochs=int(epochs),
                 batch_size=int(batch_size),
                 seed=0,  # filled below
@@ -304,6 +337,10 @@ def _build_specs_from_config(config_path: Path, defaults: RunSpec, base_seed: in
     weight_decay_values = grid.get("weight_decay", [merged_defaults.weight_decay])
     lambda_hi_values = grid.get("lambda_hi", [merged_defaults.lambda_hi])
     lambda_lo_values = grid.get("lambda_lo", [merged_defaults.lambda_lo])
+    lambda_smooth_values = grid.get("lambda_smooth", [merged_defaults.lambda_smooth])
+    huber_delta_values = grid.get("huber_delta", [merged_defaults.huber_delta])
+    warmup_fraction_values = grid.get("warmup_fraction", [merged_defaults.warmup_fraction])
+    min_lr_ratio_values = grid.get("min_lr_ratio", [merged_defaults.min_lr_ratio])
     epochs_values = grid.get("epochs", [merged_defaults.epochs])
     batch_size_values = grid.get("batch_size", [merged_defaults.batch_size])
 
@@ -315,11 +352,15 @@ def _build_specs_from_config(config_path: Path, defaults: RunSpec, base_seed: in
             weight_decay_values,
             lambda_hi_values,
             lambda_lo_values,
+            lambda_smooth_values,
+            huber_delta_values,
+            warmup_fraction_values,
+            min_lr_ratio_values,
             epochs_values,
             batch_size_values,
         )
     ):
-        hidden_dims, lr, wd, lhi, llo, epochs, batch_size = combo
+        hidden_dims, lr, wd, lhi, llo, lsmooth, hdelta, warmup, min_lr, epochs, batch_size = combo
         spec = _run_spec_from_mapping(
             {
                 "hidden_dims": hidden_dims,
@@ -327,6 +368,10 @@ def _build_specs_from_config(config_path: Path, defaults: RunSpec, base_seed: in
                 "weight_decay": wd,
                 "lambda_hi": lhi,
                 "lambda_lo": llo,
+                "lambda_smooth": lsmooth,
+                "huber_delta": hdelta,
+                "warmup_fraction": warmup,
+                "min_lr_ratio": min_lr,
                 "epochs": epochs,
                 "batch_size": batch_size,
                 "seed": base_seed + i,
@@ -540,6 +585,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-hi", "--lambda_hi", dest="lambda_hi_single", type=float, default=None, help="Single lambda_hi")
     parser.add_argument("--lambda-lo-grid", default="0.0", help="Comma-separated weights for flux<0 penalty")
     parser.add_argument("--lambda-lo", "--lambda_lo", dest="lambda_lo_single", type=float, default=None, help="Single lambda_lo")
+    parser.add_argument("--lambda-smooth-grid", default="1e-3", help="Comma-separated second-derivative smoothness weights")
+    parser.add_argument("--lambda-smooth", "--lambda_smooth", dest="lambda_smooth_single", type=float, default=None, help="Single lambda_smooth")
+    parser.add_argument("--huber-delta-grid", default="1.0", help="Comma-separated Huber deltas")
+    parser.add_argument("--huber-delta", "--huber_delta", dest="huber_delta_single", type=float, default=None, help="Single huber_delta")
+    parser.add_argument("--warmup-fraction-grid", default="0.1", help="Comma-separated warmup fractions for LR schedule")
+    parser.add_argument("--warmup-fraction", "--warmup_fraction", dest="warmup_fraction_single", type=float, default=None, help="Single warmup_fraction")
+    parser.add_argument("--min-lr-ratio-grid", default="0.05", help="Comma-separated minimum LR ratios for cosine schedule")
+    parser.add_argument("--min-lr-ratio", "--min_lr_ratio", dest="min_lr_ratio_single", type=float, default=None, help="Single min_lr_ratio")
     parser.add_argument("--epochs-grid", default="30", help="Comma-separated epoch counts")
     parser.add_argument("--epochs", dest="epochs_single", type=int, default=None, help="Single epoch count")
     parser.add_argument("--batch-size-grid", default="32", help="Comma-separated batch sizes")
@@ -631,6 +684,14 @@ def main() -> None:
         args.lambda_hi_grid = str(args.lambda_hi_single)
     if args.lambda_lo_single is not None:
         args.lambda_lo_grid = str(args.lambda_lo_single)
+    if args.lambda_smooth_single is not None:
+        args.lambda_smooth_grid = str(args.lambda_smooth_single)
+    if args.huber_delta_single is not None:
+        args.huber_delta_grid = str(args.huber_delta_single)
+    if args.warmup_fraction_single is not None:
+        args.warmup_fraction_grid = str(args.warmup_fraction_single)
+    if args.min_lr_ratio_single is not None:
+        args.min_lr_ratio_grid = str(args.min_lr_ratio_single)
     if args.epochs_single is not None:
         args.epochs_grid = str(args.epochs_single)
     if args.batch_size_single is not None:
@@ -743,6 +804,10 @@ def main() -> None:
             "weight_decay": _parse_float_grid(args.weight_decay_grid)[0],
             "lambda_hi": _parse_float_grid(args.lambda_hi_grid)[0],
             "lambda_lo": _parse_float_grid(args.lambda_lo_grid)[0],
+            "lambda_smooth": _parse_float_grid(args.lambda_smooth_grid)[0],
+            "huber_delta": _parse_float_grid(args.huber_delta_grid)[0],
+            "warmup_fraction": _parse_float_grid(args.warmup_fraction_grid)[0],
+            "min_lr_ratio": _parse_float_grid(args.min_lr_ratio_grid)[0],
             "epochs": _parse_int_grid(args.epochs_grid)[0],
             "batch_size": _parse_int_grid(args.batch_size_grid)[0],
             "seed": int(args.seed),
@@ -753,6 +818,10 @@ def main() -> None:
             weight_decay=0.0,
             lambda_hi=0.1,
             lambda_lo=0.0,
+            lambda_smooth=1e-3,
+            huber_delta=1.0,
+            warmup_fraction=0.1,
+            min_lr_ratio=0.05,
             epochs=30,
             batch_size=32,
             seed=int(args.seed),
@@ -845,54 +914,110 @@ def main() -> None:
                 h = nn.relu(h)
             return nn.Dense(self.output_dim)(h)
 
-    def create_train_state(rng, model, input_dim: int, learning_rate: float, weight_decay: float):
-        params = model.init(rng, jnp.ones((1, input_dim), dtype=jnp.float32))["params"]
-        tx = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
-        return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    def create_train_state(
+        rng,
+        model,
+        input_dim: int,
+        learning_rate: float,
+        weight_decay: float,
+        total_steps: int,
+        warmup_fraction: float,
+        min_lr_ratio: float,
+    ):
+        total_steps = max(1, int(total_steps))
+        if total_steps <= 1:
+            warmup_steps = 0
+        else:
+            warmup_steps = int(total_steps * float(warmup_fraction))
+            warmup_steps = min(max(warmup_steps, 1), total_steps - 1)
 
-    def loss_components(pred, y, lambda_hi, lambda_lo):
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=float(learning_rate) * 0.1,
+            peak_value=float(learning_rate),
+            warmup_steps=warmup_steps,
+            decay_steps=max(total_steps - warmup_steps, 1),
+            end_value=float(learning_rate) * float(min_lr_ratio),
+        )
+        params = model.init(rng, jnp.ones((1, input_dim), dtype=jnp.float32))["params"]
+        tx = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay),
+        )
+        state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+        return state, lr_schedule
+
+    def loss_components(pred, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+        recon = jnp.mean(optax.huber_loss(pred - y, delta=huber_delta))
         mse = jnp.mean((pred - y) ** 2)
         hi_pen = jnp.mean(jax.nn.relu(pred - 1.0) ** 2)
         lo_pen = jnp.mean(jax.nn.relu(0.0 - pred) ** 2)
-        total = mse + lambda_hi * hi_pen + lambda_lo * lo_pen
-        return total, mse, hi_pen, lo_pen
+        if pred.shape[1] >= 3:
+            d2 = pred[:, 2:] - 2.0 * pred[:, 1:-1] + pred[:, :-2]
+            smooth_pen = jnp.mean(d2**2)
+        else:
+            smooth_pen = jnp.asarray(0.0, dtype=pred.dtype)
+        total = recon + lambda_hi * hi_pen + lambda_lo * lo_pen + lambda_smooth * smooth_pen
+        return total, recon, mse, hi_pen, lo_pen, smooth_pen
 
     @jax.jit
-    def train_step(state, x, y, lambda_hi, lambda_lo):
+    def train_step(state, x, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
         def loss_fn(params):
             pred = state.apply_fn({"params": params}, x)
-            total, mse, hi_pen, lo_pen = loss_components(pred, y, lambda_hi, lambda_lo)
-            return total, (mse, hi_pen, lo_pen)
+            total, recon, mse, hi_pen, lo_pen, smooth_pen = loss_components(
+                pred, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+            )
+            return total, (recon, mse, hi_pen, lo_pen, smooth_pen)
 
-        (loss, (mse, hi_pen, lo_pen)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        (loss, (recon, mse, hi_pen, lo_pen, smooth_pen)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
         state = state.apply_gradients(grads=grads)
-        return state, loss, mse, hi_pen, lo_pen
+        return state, loss, recon, mse, hi_pen, lo_pen, smooth_pen
 
     @jax.jit
-    def eval_step(state, x, y, lambda_hi, lambda_lo):
+    def eval_step(state, x, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
         pred = state.apply_fn({"params": state.params}, x)
-        return loss_components(pred, y, lambda_hi, lambda_lo)
+        return loss_components(pred, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta)
 
-    def evaluate_loader(state, loader, adapter: BatchAdapter, lambda_hi: float, lambda_lo: float) -> dict[str, float]:
-        totals, mses, hi_pens, lo_pens = [], [], [], []
+    def evaluate_loader(
+        state,
+        loader,
+        adapter: BatchAdapter,
+        lambda_hi: float,
+        lambda_lo: float,
+        lambda_smooth: float,
+        huber_delta: float,
+    ) -> dict[str, float]:
+        totals, recons, mses, hi_pens, lo_pens, smooth_pens = [], [], [], [], [], []
         lh = jnp.asarray(lambda_hi, dtype=jnp.float32)
         ll = jnp.asarray(lambda_lo, dtype=jnp.float32)
+        ls = jnp.asarray(lambda_smooth, dtype=jnp.float32)
+        hd = jnp.asarray(huber_delta, dtype=jnp.float32)
         for batch in loader:
             x_np, y_np = adapter.batch_to_xy(batch)
             x = jnp.asarray(x_np, dtype=jnp.float32)
             y = jnp.asarray(y_np, dtype=jnp.float32)
-            total, mse, hi_pen, lo_pen = eval_step(state, x, y, lh, ll)
+            total, recon, mse, hi_pen, lo_pen, smooth_pen = eval_step(state, x, y, lh, ll, ls, hd)
             totals.append(float(total))
+            recons.append(float(recon))
             mses.append(float(mse))
             hi_pens.append(float(hi_pen))
             lo_pens.append(float(lo_pen))
+            smooth_pens.append(float(smooth_pen))
         if not totals:
-            return {"total": float("nan"), "mse": float("nan"), "hi_pen": float("nan"), "lo_pen": float("nan")}
+            return {
+                "total": float("nan"),
+                "recon": float("nan"),
+                "mse": float("nan"),
+                "hi_pen": float("nan"),
+                "lo_pen": float("nan"),
+                "smooth_pen": float("nan"),
+            }
         return {
             "total": float(np.mean(totals)),
+            "recon": float(np.mean(recons)),
             "mse": float(np.mean(mses)),
             "hi_pen": float(np.mean(hi_pens)),
             "lo_pen": float(np.mean(lo_pens)),
+            "smooth_pen": float(np.mean(smooth_pens)),
         }
 
     for run_idx, spec in indexed_specs:
@@ -919,6 +1044,10 @@ def main() -> None:
             "weight_decay": float(spec.weight_decay),
             "lambda_hi": float(spec.lambda_hi),
             "lambda_lo": float(spec.lambda_lo),
+            "lambda_smooth": float(spec.lambda_smooth),
+            "huber_delta": float(spec.huber_delta),
+            "warmup_fraction": float(spec.warmup_fraction),
+            "min_lr_ratio": float(spec.min_lr_ratio),
             "epochs": int(spec.epochs),
             "batch_size": int(spec.batch_size),
             "jax_platform": str(args.jax_platform),
@@ -946,21 +1075,28 @@ def main() -> None:
 
         probe = next(iter(loaders["train"]))
         x0, y0 = adapter.batch_to_xy(probe)
+        steps_per_epoch = max(1, len(loaders["train"]))
+        total_steps = int(spec.epochs) * steps_per_epoch
 
         model = FluxMLP(hidden_dims=spec.hidden_dims, output_dim=int(y0.shape[1]))
-        state = create_train_state(
+        state, lr_schedule = create_train_state(
             jax.random.PRNGKey(int(spec.seed)),
             model=model,
             input_dim=int(x0.shape[1]),
             learning_rate=float(spec.learning_rate),
             weight_decay=float(spec.weight_decay),
+            total_steps=total_steps,
+            warmup_fraction=float(spec.warmup_fraction),
+            min_lr_ratio=float(spec.min_lr_ratio),
         )
 
         lambda_hi = jnp.asarray(spec.lambda_hi, dtype=jnp.float32)
         lambda_lo = jnp.asarray(spec.lambda_lo, dtype=jnp.float32)
+        lambda_smooth = jnp.asarray(spec.lambda_smooth, dtype=jnp.float32)
+        huber_delta = jnp.asarray(spec.huber_delta, dtype=jnp.float32)
 
         logger.info(
-            "Run %d/%d: %s | h=%s lr=%g wd=%g bs=%d ep=%d lhi=%g llo=%g mu_source=%s",
+            "Run %d/%d: %s | h=%s lr=%g wd=%g bs=%d ep=%d lhi=%g llo=%g ls=%g hd=%g warm=%g minlr=%g mu_source=%s",
             run_idx + 1,
             len(specs),
             run_name,
@@ -971,37 +1107,58 @@ def main() -> None:
             spec.epochs,
             spec.lambda_hi,
             spec.lambda_lo,
+            spec.lambda_smooth,
+            spec.huber_delta,
+            spec.warmup_fraction,
+            spec.min_lr_ratio,
             adapter.mu_source,
         )
 
         best_val = float("inf")
+        best_val_mse = float("nan")
         best_epoch = -1
         best_params = None
         metrics_path = run_dir / "metrics.jsonl"
         with metrics_path.open("w", encoding="utf-8") as mf:
             for epoch in range(1, spec.epochs + 1):
                 epoch_start = time.time()
-                train_totals, train_mses, train_hi_pens, train_lo_pens = [], [], [], []
+                train_totals, train_recons, train_mses, train_hi_pens, train_lo_pens, train_smooth_pens = [], [], [], [], [], []
                 for batch in loaders["train"]:
                     x_np, y_np = adapter.batch_to_xy(batch)
                     x = jnp.asarray(x_np, dtype=jnp.float32)
                     y = jnp.asarray(y_np, dtype=jnp.float32)
-                    state, total, mse, hi_pen, lo_pen = train_step(state, x, y, lambda_hi, lambda_lo)
+                    state, total, recon, mse, hi_pen, lo_pen, smooth_pen = train_step(
+                        state, x, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+                    )
                     train_totals.append(float(total))
+                    train_recons.append(float(recon))
                     train_mses.append(float(mse))
                     train_hi_pens.append(float(hi_pen))
                     train_lo_pens.append(float(lo_pen))
+                    train_smooth_pens.append(float(smooth_pen))
 
                 train_stats = {
                     "total": float(np.mean(train_totals)) if train_totals else float("nan"),
+                    "recon": float(np.mean(train_recons)) if train_recons else float("nan"),
                     "mse": float(np.mean(train_mses)) if train_mses else float("nan"),
                     "hi_pen": float(np.mean(train_hi_pens)) if train_hi_pens else float("nan"),
                     "lo_pen": float(np.mean(train_lo_pens)) if train_lo_pens else float("nan"),
+                    "smooth_pen": float(np.mean(train_smooth_pens)) if train_smooth_pens else float("nan"),
                 }
-                val_stats = evaluate_loader(state, loaders["val"], adapter, spec.lambda_hi, spec.lambda_lo)
+                val_stats = evaluate_loader(
+                    state,
+                    loaders["val"],
+                    adapter,
+                    spec.lambda_hi,
+                    spec.lambda_lo,
+                    spec.lambda_smooth,
+                    spec.huber_delta,
+                )
+                current_lr = float(lr_schedule(state.step))
 
-                if val_stats["mse"] < best_val:
-                    best_val = val_stats["mse"]
+                if val_stats["recon"] < best_val:
+                    best_val = val_stats["recon"]
+                    best_val_mse = val_stats["mse"]
                     best_epoch = epoch
                     best_params = state.params
 
@@ -1009,14 +1166,19 @@ def main() -> None:
                     "epoch": int(epoch),
                     "seconds": float(time.time() - epoch_start),
                     "Relative Time (Process)": float(time.time() - epoch_start),
+                    "learning_rate": current_lr,
                     "train_total": train_stats["total"],
+                    "train_recon": train_stats["recon"],
                     "train_mse": train_stats["mse"],
                     "train_hi_pen": train_stats["hi_pen"],
                     "train_lo_pen": train_stats["lo_pen"],
+                    "train_smooth_pen": train_stats["smooth_pen"],
                     "val_total": val_stats["total"],
+                    "val_recon": val_stats["recon"],
                     "val_mse": val_stats["mse"],
                     "val_hi_pen": val_stats["hi_pen"],
                     "val_lo_pen": val_stats["lo_pen"],
+                    "val_smooth_pen": val_stats["smooth_pen"],
                 }
                 mf.write(json.dumps(metrics) + "\n")
                 mf.flush()
@@ -1026,26 +1188,40 @@ def main() -> None:
 
                 if epoch == 1 or epoch == spec.epochs or epoch % 5 == 0:
                     logger.info(
-                        "[%s] epoch=%03d train_mse=%.6f val_mse=%.6f val_hi_pen=%.6f",
+                        "[%s] epoch=%03d lr=%.6e train_recon=%.6f val_recon=%.6f val_smooth_pen=%.6f",
                         run_name,
                         epoch,
-                        train_stats["mse"],
-                        val_stats["mse"],
-                        val_stats["hi_pen"],
+                        current_lr,
+                        train_stats["recon"],
+                        val_stats["recon"],
+                        val_stats["smooth_pen"],
                     )
 
-        test_stats = evaluate_loader(state, loaders["test"], adapter, spec.lambda_hi, spec.lambda_lo)
+        test_stats = evaluate_loader(
+            state,
+            loaders["test"],
+            adapter,
+            spec.lambda_hi,
+            spec.lambda_lo,
+            spec.lambda_smooth,
+            spec.huber_delta,
+        )
 
         summary = {
             "run_name": run_name,
             "run_index": int(run_idx),
-            "best_val_mse": float(best_val),
+            "best_val_recon": float(best_val),
+            "best_val_mse": float(best_val_mse) if np.isfinite(best_val_mse) else float("nan"),
             "best_epoch": int(best_epoch),
+            "final_val_recon": float(val_stats["recon"]) if np.isfinite(val_stats["recon"]) else float("nan"),
             "final_val_mse": float(val_stats["mse"]) if np.isfinite(val_stats["mse"]) else float("nan"),
             "test_total": float(test_stats["total"]),
+            "test_recon": float(test_stats["recon"]),
             "test_mse": float(test_stats["mse"]),
             "test_hi_pen": float(test_stats["hi_pen"]),
             "test_lo_pen": float(test_stats["lo_pen"]),
+            "test_smooth_pen": float(test_stats["smooth_pen"]),
+            "final_learning_rate": float(lr_schedule(state.step)),
             "mu_source": adapter.mu_source,
         }
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
