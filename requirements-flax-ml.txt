@@ -5,3 +5,7 @@ jax==0.4.28
 jaxlib==0.4.28
 flax==0.8.1
 optax==0.1.9
+# Runtime deps used transitively by flax/wandb in scripts/train_mlp_wandb.py.
+rich>=13.0
+protobuf>=4.25,<6
+wandb>=0.17
