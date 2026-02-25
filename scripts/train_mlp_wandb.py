@@ -563,6 +563,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-fraction", "--val_fraction", type=float, default=0.1, help="Validation split fraction")
     parser.add_argument("--normalize-inputs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--normalize_inputs", dest="normalize_inputs_value", default=None, type=_parse_bool, help=argparse.SUPPRESS)
+    parser.add_argument("--normalize-targets", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--normalize_targets", dest="normalize_targets_value", default=None, type=_parse_bool, help=argparse.SUPPRESS)
     parser.add_argument("--input-features", default=None, help="Comma-separated subset of param_names (default: all)")
     parser.add_argument("--include-mu", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include_mu", dest="include_mu_value", default=None, type=_parse_bool, help=argparse.SUPPRESS)
@@ -667,6 +669,8 @@ def main() -> None:
 
     if args.normalize_inputs_value is not None:
         args.normalize_inputs = bool(args.normalize_inputs_value)
+    if args.normalize_targets_value is not None:
+        args.normalize_targets = bool(args.normalize_targets_value)
     if args.include_mu_value is not None:
         args.include_mu = bool(args.include_mu_value)
     if args.use_log_wavelength_value is not None:
@@ -882,7 +886,7 @@ def main() -> None:
                 drop_last=False,
                 seed=int(args.seed),
                 normalize_inputs=bool(args.normalize_inputs),
-                normalize_targets=False,
+                normalize_targets=bool(args.normalize_targets),
             )
             loader_cache[batch_size] = loaders
         return loader_cache[batch_size]
@@ -946,11 +950,11 @@ def main() -> None:
         state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
         return state, lr_schedule
 
-    def loss_components(pred, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+    def loss_components(pred, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
         recon = jnp.mean(optax.huber_loss(pred - y, delta=huber_delta))
         mse = jnp.mean((pred - y) ** 2)
-        hi_pen = jnp.mean(jax.nn.relu(pred - 1.0) ** 2)
-        lo_pen = jnp.mean(jax.nn.relu(0.0 - pred) ** 2)
+        hi_pen = jnp.mean(jax.nn.relu(pred - hi_bound[None, :]) ** 2)
+        lo_pen = jnp.mean(jax.nn.relu(lo_bound[None, :] - pred) ** 2)
         if pred.shape[1] >= 3:
             d2 = pred[:, 2:] - 2.0 * pred[:, 1:-1] + pred[:, :-2]
             smooth_pen = jnp.mean(d2**2)
@@ -960,11 +964,11 @@ def main() -> None:
         return total, recon, mse, hi_pen, lo_pen, smooth_pen
 
     @jax.jit
-    def train_step(state, x, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+    def train_step(state, x, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
         def loss_fn(params):
             pred = state.apply_fn({"params": params}, x)
             total, recon, mse, hi_pen, lo_pen, smooth_pen = loss_components(
-                pred, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+                pred, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
             )
             return total, (recon, mse, hi_pen, lo_pen, smooth_pen)
 
@@ -973,14 +977,16 @@ def main() -> None:
         return state, loss, recon, mse, hi_pen, lo_pen, smooth_pen
 
     @jax.jit
-    def eval_step(state, x, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+    def eval_step(state, x, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
         pred = state.apply_fn({"params": state.params}, x)
-        return loss_components(pred, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta)
+        return loss_components(pred, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta)
 
     def evaluate_loader(
         state,
         loader,
         adapter: BatchAdapter,
+        hi_bound,
+        lo_bound,
         lambda_hi: float,
         lambda_lo: float,
         lambda_smooth: float,
@@ -995,7 +1001,7 @@ def main() -> None:
             x_np, y_np = adapter.batch_to_xy(batch)
             x = jnp.asarray(x_np, dtype=jnp.float32)
             y = jnp.asarray(y_np, dtype=jnp.float32)
-            total, recon, mse, hi_pen, lo_pen, smooth_pen = eval_step(state, x, y, lh, ll, ls, hd)
+            total, recon, mse, hi_pen, lo_pen, smooth_pen = eval_step(state, x, y, hi_bound, lo_bound, lh, ll, ls, hd)
             totals.append(float(total))
             recons.append(float(recon))
             mses.append(float(mse))
@@ -1038,6 +1044,7 @@ def main() -> None:
             "train_fraction": float(args.train_fraction),
             "val_fraction": float(args.val_fraction),
             "normalize_inputs": bool(args.normalize_inputs),
+            "normalize_targets": bool(args.normalize_targets),
             "seed": int(spec.seed),
             "hidden_dims": list(spec.hidden_dims),
             "learning_rate": float(spec.learning_rate),
@@ -1075,6 +1082,22 @@ def main() -> None:
 
         probe = next(iter(loaders["train"]))
         x0, y0 = adapter.batch_to_xy(probe)
+        if bool(args.normalize_targets):
+            target_stats = loaders["train"].target_stats
+            if target_stats is None:
+                raise ValueError("normalize_targets=True but target_stats were not computed")
+            mean = np.asarray(target_stats.mean, dtype=np.float32)
+            std = np.asarray(target_stats.std, dtype=np.float32)
+            hi_source = (1.0 - mean) / std
+            lo_source = (0.0 - mean) / std
+            hi_bound_np = adapter.resampler.resample(hi_source[None, :])[0]
+            lo_bound_np = adapter.resampler.resample(lo_source[None, :])[0]
+        else:
+            hi_bound_np = np.ones((int(y0.shape[1]),), dtype=np.float32)
+            lo_bound_np = np.zeros((int(y0.shape[1]),), dtype=np.float32)
+        hi_bound = jnp.asarray(np.nan_to_num(hi_bound_np, nan=1.0, posinf=1.0, neginf=1.0), dtype=jnp.float32)
+        lo_bound = jnp.asarray(np.nan_to_num(lo_bound_np, nan=0.0, posinf=0.0, neginf=0.0), dtype=jnp.float32)
+
         steps_per_epoch = max(1, len(loaders["train"]))
         total_steps = int(spec.epochs) * steps_per_epoch
 
@@ -1128,7 +1151,7 @@ def main() -> None:
                     x = jnp.asarray(x_np, dtype=jnp.float32)
                     y = jnp.asarray(y_np, dtype=jnp.float32)
                     state, total, recon, mse, hi_pen, lo_pen, smooth_pen = train_step(
-                        state, x, y, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+                        state, x, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
                     )
                     train_totals.append(float(total))
                     train_recons.append(float(recon))
@@ -1149,6 +1172,8 @@ def main() -> None:
                     state,
                     loaders["val"],
                     adapter,
+                    hi_bound,
+                    lo_bound,
                     spec.lambda_hi,
                     spec.lambda_lo,
                     spec.lambda_smooth,
@@ -1201,6 +1226,8 @@ def main() -> None:
             state,
             loaders["test"],
             adapter,
+            hi_bound,
+            lo_bound,
             spec.lambda_hi,
             spec.lambda_lo,
             spec.lambda_smooth,
