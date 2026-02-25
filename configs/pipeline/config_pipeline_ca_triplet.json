@@ -86,6 +86,7 @@
   "outputs": {
     "grid_csv": "../../runs/ca_triplet/outputs/grids/parameter_grid.csv",
     "grid_zarr": "../../runs/ca_triplet/outputs/grids/parameter_grid.zarr",
+    "grid_index_parquet": "../../runs/ca_triplet/outputs/grids/index.parquet",
     "spectra_zarr": "../../runs/ca_triplet/outputs/zarr/synthesized_spectra.zarr",
     "spectra_shard_template": "../../runs/ca_triplet/outputs/shards/spectra_shard_{shard_index}.zarr"
   },

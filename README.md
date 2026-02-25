@@ -119,7 +119,11 @@ If you just need a compact, Latin-Hypercube-sampled grid for ML experiments, edi
 python3 scripts/sample_machine_learning_grid.py  # add --resume to append up to num_samples
 ```
 
-The helper writes a compressed Zarr store at `runs/local-dev/outputs/grids/ml_parameter_grid.zarr` (override with `--zarr-output`). It uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream consumption. Install dependencies with `pip install polars zarr numcodecs`. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the batch runners.
+The helper writes a compressed Zarr store plus a parameter lookup parquet:
+- grid Zarr: `runs/local-dev/outputs/grids/ml_parameter_grid.zarr` (override with `--zarr-output`)
+- parameter index: `runs/local-dev/outputs/grids/index.parquet` (override with `--index-parquet-output` or config `index_parquet`)
+
+`index.parquet` contains `row_index` and all grid parameter columns, so you can quickly filter by parameters and map directly to spectrum rows in downstream Zarr outputs. The helper uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream ingestion. Install dependencies with `pip install polars zarr numcodecs`. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the batch runners.
 
 #### JAX dataloader for spectra training
 
@@ -192,7 +196,7 @@ python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipelin
 ```
 
 This command will:
-- generate the grid outputs (CSV + Zarr)
+- generate the grid outputs (CSV + Zarr + `index.parquet`)
 - synthesize spectra into a single output Zarr using multiprocessing
 
 You can still split phases only when needed:

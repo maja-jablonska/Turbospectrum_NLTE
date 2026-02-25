@@ -53,6 +53,7 @@
     "run_root": "../../runs/regular-grid",
     "grid_csv": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.csv",
     "grid_zarr": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.zarr",
+    "grid_index_parquet": "../../runs/regular-grid/outputs/grids/index.parquet",
     "spectra_zarr": "../../runs/regular-grid/outputs/zarr/regular_synthesized_spectra.zarr"
   },
   "runtime": {

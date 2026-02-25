@@ -15,7 +15,7 @@ import json
 import os
 import logging
 import time
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import polars as pl
@@ -240,6 +240,70 @@ def _resolve_sampling_dimensions(config: Dict) -> Tuple[List[Tuple[float, float]
     return bounds, sampled_abundances, fixed_abundances, turbvel_options
 
 
+def _default_index_parquet_path(zarr_path: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(zarr_path)), "index.parquet")
+
+
+def _index_df_from_zarr(root, column_names: Sequence[str]) -> pl.DataFrame:
+    payload: Dict[str, Any] = {}
+    row_count: int | None = None
+    for name in column_names:
+        values = np.asarray(root[name][:])
+        if row_count is None:
+            row_count = int(values.shape[0])
+        elif int(values.shape[0]) != row_count:
+            raise ValueError(f"Zarr column {name} has inconsistent length {values.shape[0]} vs expected {row_count}")
+        payload[name] = values
+
+    if row_count is None:
+        row_count = 0
+    return pl.DataFrame({"row_index": np.arange(row_count, dtype=np.int64), **payload})
+
+
+def _write_index_parquet(
+    *,
+    df: pl.DataFrame,
+    index_parquet_path: str,
+    existing_rows: int,
+    resume: bool,
+    zarr_path: str,
+    logger: logging.Logger,
+) -> None:
+    expected_columns = ["row_index", *df.columns]
+    new_index_df = df.with_row_count("row_index", offset=existing_rows).select(expected_columns)
+
+    final_index_df = new_index_df
+    if resume and existing_rows > 0:
+        if os.path.exists(index_parquet_path):
+            existing_index_df = pl.read_parquet(index_parquet_path)
+            existing_cols = existing_index_df.columns
+            if "row_index" not in existing_cols and set(existing_cols) == set(df.columns):
+                existing_index_df = existing_index_df.with_row_count("row_index", offset=0)
+                existing_cols = existing_index_df.columns
+
+            if existing_index_df.height == existing_rows and set(existing_cols) == set(expected_columns):
+                existing_index_df = existing_index_df.select(expected_columns)
+                final_index_df = pl.concat([existing_index_df, new_index_df], rechunk=True)
+            else:
+                logger.warning(
+                    "Existing index parquet is out of sync (rows=%d expected=%d); rebuilding from Zarr.",
+                    existing_index_df.height,
+                    existing_rows,
+                )
+                store = _zarr_store(zarr_path)
+                root = zarr.open_group(store=store, mode="r", zarr_format=3)
+                final_index_df = _index_df_from_zarr(root, df.columns)
+        else:
+            logger.warning("Index parquet not found during resume; rebuilding from Zarr.")
+            store = _zarr_store(zarr_path)
+            root = zarr.open_group(store=store, mode="r", zarr_format=3)
+            final_index_df = _index_df_from_zarr(root, df.columns)
+
+    os.makedirs(os.path.dirname(os.path.abspath(index_parquet_path)), exist_ok=True)
+    final_index_df.write_parquet(index_parquet_path, compression="zstd")
+    logger.info("Wrote parameter index parquet: %s (%d rows)", os.path.abspath(index_parquet_path), final_index_df.height)
+
+
 def main() -> None:
     _ensure_polars_zarr_available()
 
@@ -251,6 +315,7 @@ def main() -> None:
         help="Deprecated alias for --zarr-output. CSV export is no longer supported; data are written to Zarr only.",
     )
     parser.add_argument("--zarr-output", default=None, help="Optional override for Zarr output path")
+    parser.add_argument("--index-parquet-output", default=None, help="Optional override for parameter index parquet path")
     parser.add_argument("--resume", action="store_true", help="Append new samples up to num_samples if outputs already exist")
     parser.add_argument("--samples", type=int, default=None, help="Override the number of samples without editing the config")
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
@@ -303,6 +368,7 @@ def main() -> None:
 
     zarr_cfg = config.get("zarr", {})
     zarr_path = args.zarr_output or args.output or zarr_cfg.get("path") or DEFAULT_ZARR_PATH
+    index_parquet_path = args.index_parquet_output or config.get("index_parquet") or _default_index_parquet_path(zarr_path)
     zarr_chunks = int(zarr_cfg.get("chunks", 2048)) if zarr_cfg else 2048
     zarr_compressor_cfg = zarr_cfg.get("compressor", {}) if zarr_cfg else {}
 
@@ -310,6 +376,7 @@ def main() -> None:
         raise ValueError("Zarr output path must be provided via config, --zarr-output, or --output (deprecated alias).")
     os.makedirs(os.path.dirname(os.path.abspath(zarr_path)), exist_ok=True)
     logger.info("Zarr output: %s (chunks=%s)", os.path.abspath(zarr_path), zarr_chunks)
+    logger.info("Index parquet: %s", os.path.abspath(index_parquet_path))
 
     existing_rows = 0
     if args.resume and os.path.exists(zarr_path):
@@ -452,6 +519,15 @@ def main() -> None:
                     root.array(column, series.to_numpy(), chunks=zarr_chunks, **compression_kwargs)
         logger.info("Wrote Zarr store to %s (chunk size %s)", zarr_path, zarr_chunks)
         logger.info("Zarr write finished in %.2fs", time.perf_counter() - t_step)
+
+    _write_index_parquet(
+        df=df,
+        index_parquet_path=index_parquet_path,
+        existing_rows=existing_rows,
+        resume=args.resume,
+        zarr_path=zarr_path,
+        logger=logger,
+    )
 
     logger.info("Done in %.2fs", time.perf_counter() - t0)
 

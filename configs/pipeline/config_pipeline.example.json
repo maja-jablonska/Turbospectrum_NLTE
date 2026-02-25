@@ -106,6 +106,7 @@
     "_note": "Paths are resolved relative to this config file unless absolute.",
     "grid_csv": "../../runs/local-dev/outputs/grids/intensity_grid.csv",
     "grid_zarr": "../../runs/local-dev/outputs/grids/intensity_grid.zarr",
+    "grid_index_parquet": "../../runs/local-dev/outputs/grids/index.parquet",
 
     "spectra_zarr": "../../runs/local-dev/outputs/zarr/synthesized_spectra.zarr",
 
