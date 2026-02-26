@@ -10,9 +10,12 @@ Each shard must contain:
 - `flux` (2D: shard_rows x wavelength_points)
 - `status` (1D)
 - `message` (1D)
+Optional in newer shards:
+- `continuum` (2D: shard_rows x wavelength_points)
 
 The merger writes a schema-compliant synthesis Zarr matching DATA_SCHEMA.md:
 - flux: (row_count, wavelength_points)
+- continuum: (row_count, wavelength_points)
 - wavelength: (wavelength_points,)
 - params: (row_count, n_params)
 - param_names: (n_params,)
@@ -806,17 +809,20 @@ def main() -> None:
         **compression_kwargs,
     )
     flux_out = root_out.create_array("flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
+    continuum_out = root_out.create_array("continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
     mu_chunk = (min(int(args.chunk_rows), out_row_count) if out_row_count else 1,)
     mu_selected_out = root_out.create_array("mu_selected", shape=(out_row_count,), dtype=np.float32, chunks=mu_chunk, **compression_kwargs)
     mu_selected_index_out = root_out.create_array("mu_selected_index", shape=(out_row_count,), dtype=np.int16, chunks=mu_chunk, **compression_kwargs)
 
     # Initialize to NaNs for missing rows.
     flux_out[:] = np.nan
+    continuum_out[:] = np.nan
     mu_selected_out[:] = np.nan
     mu_selected_index_out[:] = np.int16(-1)
 
     statuses = ["missing"] * out_row_count
     messages = [""] * out_row_count
+    saw_continuum = False
     saw_mu_selected = False
     saw_mu_selected_index = False
 
@@ -870,6 +876,17 @@ def main() -> None:
         except Exception:
             for i, li in enumerate(local_idx.tolist()):
                 flux_out[int(li), :] = flux[i]
+
+        if "continuum" in shard:
+            continuum = np.asarray(shard["continuum"][:], dtype=np.float32)
+            if continuum.shape != (gidx.size, wl_count):
+                raise ValueError(f"Shard {p} has unexpected continuum shape: {continuum.shape}")
+            try:
+                continuum_out.oindex[local_idx, :] = continuum  # type: ignore[attr-defined]
+            except Exception:
+                for i, li in enumerate(local_idx.tolist()):
+                    continuum_out[int(li), :] = continuum[i]
+            saw_continuum = True
 
         shard_status = [str(x) for x in np.asarray(shard["status"][:]).tolist()]
         shard_msg = [str(x) for x in np.asarray(shard["message"][:]).tolist()]
@@ -1166,6 +1183,7 @@ def main() -> None:
         "n_params": int(params.shape[1]),
         "shards_merged": len(shards),
         "status_counts": status_counts,
+        "continuum_present": bool(saw_continuum),
         "output_mode_values": output_mode_values,
         "calculation_mode_values": calculation_mode_values,
         "mu_sampling_values": sorted(mu_sampling_values),

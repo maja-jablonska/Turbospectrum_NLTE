@@ -622,6 +622,7 @@ def _write_zarr_output(
     output_path: str,
     wavelengths: np.ndarray,
     fluxes: np.ndarray,
+    continua: np.ndarray,
     mu_selected: np.ndarray,
     mu_selected_index: np.ndarray,
     params: np.ndarray,
@@ -655,6 +656,7 @@ def _write_zarr_output(
     # DATA_SCHEMA.md synthesis layout
     root.create_array("wavelength", data=wl, chunks=wl.shape if wl.size else (1,), **compression_kwargs)
     root.create_array("flux", data=fluxes, chunks=chunk_shape, **compression_kwargs)
+    root.create_array("continuum", data=continua, chunks=chunk_shape, **compression_kwargs)
     root.create_array(
         "mu_selected",
         data=mu_selected.astype(np.float32, copy=False),
@@ -721,7 +723,12 @@ def _write_zarr_output(
     }
     attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
     root.attrs.update(attrs_payload)
-    logger.info("Wrote spectra to %s (shape=%s)", os.path.abspath(output_path), fluxes.shape)
+    logger.info(
+        "Wrote spectra to %s (flux_shape=%s continuum_shape=%s)",
+        os.path.abspath(output_path),
+        fluxes.shape,
+        continua.shape,
+    )
 
 
 def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_config: TurbospectrumConfig):
@@ -818,6 +825,7 @@ def main() -> None:
         logger.info("Grid calculation_mode values: %s", unique_calc)
 
     fluxes = np.full((row_count, expected_points), np.nan, dtype=np.float32)
+    continua = np.full_like(fluxes, np.nan)
     statuses: List[str] = ["pending"] * row_count
     messages: List[str] = [""] * row_count
     mu_selected = np.full(row_count, np.nan, dtype=np.float32)
@@ -857,6 +865,7 @@ def main() -> None:
                 mu_selected_index[idx] = -1
             if result.get("spectrum"):
                 fluxes[idx] = result["spectrum"][0]
+                continua[idx] = result["spectrum"][1]
             logger.info(
                 "[%d/%d] %s %s (%.2fs) - %s",
                 idx + 1,
@@ -1043,6 +1052,7 @@ def main() -> None:
         output_path=write_path,
         wavelengths=wavelengths,
         fluxes=fluxes,
+        continua=continua,
         mu_selected=mu_selected,
         mu_selected_index=mu_selected_index,
         params=params,
