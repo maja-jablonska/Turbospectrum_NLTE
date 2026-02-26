@@ -188,6 +188,26 @@ def _run(cmd: Sequence[str]) -> None:
     subprocess.run(list(cmd), check=True)
 
 
+def _verify_continuum_saved(spectra_zarr: str) -> None:
+    import zarr
+
+    path = os.path.abspath(spectra_zarr)
+    root = zarr.open_group(path, mode="r")
+    missing = [name for name in ("flux", "continuum") if name not in root]
+    if missing:
+        raise KeyError(
+            f"Synthesis output {path} is missing required arrays: {missing}. "
+            "Expected both 'flux' and 'continuum'."
+        )
+    flux_shape = tuple(np.asarray(root["flux"]).shape)
+    continuum_shape = tuple(np.asarray(root["continuum"]).shape)
+    if flux_shape != continuum_shape:
+        raise ValueError(
+            f"Synthesis output {path} has mismatched shapes: "
+            f"flux={flux_shape}, continuum={continuum_shape}"
+        )
+
+
 def _write_mu_range_config(
     *,
     base_config_path: str,
@@ -473,6 +493,8 @@ def main() -> None:
 
     print("[regular-grid] launching synthesis...")
     _run(cmd)
+    _verify_continuum_saved(spectra_zarr)
+    print("[regular-grid] verified continuum array in synthesized output")
     print(f"[regular-grid] wrote synthesized spectra Zarr: {spectra_zarr}")
 
 
