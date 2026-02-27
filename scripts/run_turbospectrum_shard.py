@@ -113,6 +113,16 @@ def _choose_mu_indices(
     mu_summary = float(mu_sel[0]) if mu_sel.size == 1 else float(np.mean(mu_sel))
     return chosen, mu_summary
 
+
+def _reconstruct_continuum(abs_flux: np.ndarray, norm_flux: np.ndarray) -> np.ndarray:
+    """Reconstruct continuum from absolute and normalized quantities: cont = abs / norm."""
+    abs_arr = np.asarray(abs_flux, dtype=np.float32)
+    norm_arr = np.asarray(norm_flux, dtype=np.float32)
+    cont = np.full_like(abs_arr, np.nan, dtype=np.float32)
+    valid = np.isfinite(abs_arr) & np.isfinite(norm_arr) & (np.abs(norm_arr) > np.float32(1e-8))
+    np.divide(abs_arr, norm_arr, out=cont, where=valid)
+    return cont
+
 ############################################
 # Worker-global config
 ############################################
@@ -465,25 +475,28 @@ def _synthesis_task(batch):
                             i_norm = i_norm[:, None]
                         if reduce_mode == "mean" and i_abs.shape[1] > 1:
                             flux = i_abs.mean(axis=1)
-                            cont = i_norm.mean(axis=1)
+                            norm = i_norm.mean(axis=1)
                         else:
                             flux = i_abs[:, 0]
-                            cont = i_norm[:, 0]
+                            norm = i_norm[:, 0]
+                        cont = _reconstruct_continuum(flux, norm)
                     else:
-                        # Back-compat: store the flux columns.
-                        flux = data[:, 1].astype(np.float32)
-                        cont = (
-                            data[:, 2].astype(np.float32)
-                            if data.shape[1] > 2
-                            else np.full_like(flux, np.nan)
-                        )
+                        # Back-compat fallback to the flux columns.
+                        norm_flux = data[:, 1].astype(np.float32)
+                        flux = norm_flux
+                        if data.shape[1] > 2:
+                            abs_flux = data[:, 2].astype(np.float32)
+                            cont = _reconstruct_continuum(abs_flux, norm_flux)
+                        else:
+                            cont = np.full_like(flux, np.nan)
                 else:
-                    flux = data[:, 1].astype(np.float32)
-                    cont = (
-                        data[:, 2].astype(np.float32)
-                        if data.shape[1] > 2
-                        else np.full_like(flux, np.nan)
-                    )
+                    norm_flux = data[:, 1].astype(np.float32)
+                    flux = norm_flux
+                    if data.shape[1] > 2:
+                        abs_flux = data[:, 2].astype(np.float32)
+                        cont = _reconstruct_continuum(abs_flux, norm_flux)
+                    else:
+                        cont = np.full_like(flux, np.nan)
 
                 spectrum = (flux, cont)
 
