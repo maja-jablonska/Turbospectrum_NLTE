@@ -120,7 +120,9 @@ def _abs(p):
     return p if os.path.isabs(p) else os.path.abspath(os.path.join(cfg_dir, p))
 
 cfg_run_root = _abs(outputs.get("run_root"))
+grid_zarr = _abs(outputs.get("grid_zarr"))
 spectra_zarr = _abs(outputs.get("spectra_zarr"))
+output_tmp = _abs(runtime.get("output_tmp"))
 workers = runtime.get("workers")
 workers_out = ""
 if workers not in (None, ""):
@@ -139,16 +141,20 @@ def _boolish(v):
 skip_synthesis = "1" if _boolish(runtime.get("skip_synthesis", False)) else "0"
 
 print(cfg_run_root)
+print(grid_zarr)
 print(spectra_zarr)
+print(output_tmp)
 print(workers_out)
 print(skip_synthesis)
 PY
 )
 mapfile -t _cfg_lines <<< "${CONFIG_VALUES}"
 CFG_RUN_ROOT="${_cfg_lines[0]:-}"
-CFG_SPECTRA_ZARR="${_cfg_lines[1]:-}"
-CFG_WORKERS="${_cfg_lines[2]:-}"
-CFG_SKIP_SYNTHESIS="${_cfg_lines[3]:-0}"
+CFG_GRID_ZARR="${_cfg_lines[1]:-}"
+CFG_SPECTRA_ZARR="${_cfg_lines[2]:-}"
+CFG_OUTPUT_TMP="${_cfg_lines[3]:-}"
+CFG_WORKERS="${_cfg_lines[4]:-}"
+CFG_SKIP_SYNTHESIS="${_cfg_lines[5]:-0}"
 
 if [[ -n "${CFG_RUN_ROOT}" ]]; then
     RUN_ROOT="${CFG_RUN_ROOT}"
@@ -169,44 +175,205 @@ if [[ "$(to_bool01 "${SKIP_SYNTHESIS_OVERRIDE}")" == "1" ]]; then
     SKIP_SYNTHESIS_EFFECTIVE="1"
 fi
 
+RESUME="${RESUME:-1}"
+FORCE_RESTART="${FORCE_RESTART:-0}"
+
+GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR:-${RUN_ROOT}/outputs/grids/regular_parameter_grid.zarr}}"
+FINAL_ZARR="${FINAL_ZARR:-${CFG_SPECTRA_ZARR:-${RUN_ROOT}/outputs/zarr/regular_synthesized_spectra.zarr}}"
+SYNTH_OUTPUT_TMP="${SYNTH_OUTPUT_TMP:-${CFG_OUTPUT_TMP:-${RUN_ROOT}/tmp/regular_synthesized_spectra.output_tmp.zarr}}"
+
+if [[ "${GRID_ZARR}" != /* ]]; then
+    GRID_ZARR="${REPO}/${GRID_ZARR}"
+fi
+if [[ "${FINAL_ZARR}" != /* ]]; then
+    FINAL_ZARR="${REPO}/${FINAL_ZARR}"
+fi
+if [[ "${SYNTH_OUTPUT_TMP}" != /* ]]; then
+    SYNTH_OUTPUT_TMP="${REPO}/${SYNTH_OUTPUT_TMP}"
+fi
+
 LOG_DIR="${RUN_ROOT}/logs"
+STATE_DIR="${RUN_ROOT}/state/regular_grid"
+GRID_DONE_MARK="${STATE_DIR}/grid.done"
+SYNTH_DONE_MARK="${STATE_DIR}/synthesis.done"
+LAST_FAILURE_FILE="${STATE_DIR}/last_failure.txt"
+PHASE_LOG="${STATE_DIR}/phase.log"
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
 TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
-mkdir -p "${LOG_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
+mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" \
+         "$(dirname "${GRID_ZARR}")" "$(dirname "${FINAL_ZARR}")" "$(dirname "${SYNTH_OUTPUT_TMP}")"
 
 # Force mkstemp()/tempfile users to write under designated scratch temp.
 export TMPDIR="${TMP_SYSTEM_DIR}"
 export TMP="${TMP_SYSTEM_DIR}"
 export TEMP="${TMP_SYSTEM_DIR}"
 
+log_phase() {
+    local phase="$1"
+    local status="$2"
+    local message="$3"
+    printf '%s phase=%s status=%s job=%s msg=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        "${phase}" \
+        "${status}" \
+        "${PBS_JOBID:-unknown}" \
+        "${message}" >> "${PHASE_LOG}"
+}
+
+write_marker() {
+    local marker_path="$1"
+    local label="$2"
+    {
+        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "jobid=${PBS_JOBID:-unknown}"
+        echo "label=${label}"
+        echo "config=${CONFIG_PATH}"
+    } > "${marker_path}"
+}
+
+is_valid_grid_zarr() {
+    local zarr_path="$1"
+    if [[ ! -d "${zarr_path}" ]]; then
+        return 1
+    fi
+    "${PYTHON}" - <<PY >/dev/null 2>&1
+import zarr
+root = zarr.open_group(r"${zarr_path}", mode="r")
+assert "teff" in root and "logg" in root and "feh" in root
+assert root["teff"].shape[0] > 0
+PY
+}
+
+is_valid_synth_zarr() {
+    local zarr_path="$1"
+    if [[ ! -d "${zarr_path}" ]]; then
+        return 1
+    fi
+    "${PYTHON}" - <<PY >/dev/null 2>&1
+import zarr
+root = zarr.open_group(r"${zarr_path}", mode="r")
+for key in ("wavelength", "flux", "continuum"):
+    assert key in root, f"missing {key}"
+assert root["flux"].shape[0] > 0
+assert root["flux"].shape == root["continuum"].shape
+PY
+}
+
+if [[ "$(to_bool01 "${FORCE_RESTART}")" == "1" ]]; then
+    rm -f "${GRID_DONE_MARK}" "${SYNTH_DONE_MARK}"
+    log_phase "bootstrap" "info" "force_restart=1 cleared checkpoints"
+fi
+
+CURRENT_PHASE="bootstrap"
+trap 'rc=$?; if (( rc != 0 )); then log_phase "${CURRENT_PHASE}" "failed" "exit_code=${rc}"; printf "%s\n" "phase=${CURRENT_PHASE} exit_code=${rc} timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${LAST_FAILURE_FILE}"; fi' EXIT
+
 echo "[regular-grid] Repo: ${REPO}"
 echo "[regular-grid] Config: ${CONFIG_PATH}"
 echo "[regular-grid] Run root: ${RUN_ROOT}"
+echo "[regular-grid] Grid Zarr: ${GRID_ZARR}"
+echo "[regular-grid] Final spectra Zarr: ${FINAL_ZARR}"
+echo "[regular-grid] Output tmp path: ${SYNTH_OUTPUT_TMP}"
 echo "[regular-grid] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[regular-grid] Workers: ${WORKERS}"
 echo "[regular-grid] Skip synthesis: ${SKIP_SYNTHESIS_EFFECTIVE}"
+echo "[regular-grid] Resume: $(to_bool01 "${RESUME}")"
+echo "[regular-grid] Force restart: $(to_bool01 "${FORCE_RESTART}")"
 
-SYNTH_CMD=(
-    "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
-    --config-json "${CONFIG_PATH}"
-)
-if [[ -n "${WORKERS_OVERRIDE}" ]]; then
-    SYNTH_CMD+=(--workers "${WORKERS_OVERRIDE}")
+if [[ "$(to_bool01 "${RESUME}")" == "1" && "${SKIP_SYNTHESIS_EFFECTIVE}" != "1" ]]; then
+    if is_valid_synth_zarr "${FINAL_ZARR}"; then
+        echo "[regular-grid] Valid synthesized spectra already present; skipping all work."
+        write_marker "${SYNTH_DONE_MARK}" "synthesis_preexisting"
+        log_phase "bootstrap" "skipped" "valid_final_zarr_present"
+        exit 0
+    fi
 fi
-if [[ "${SKIP_SYNTHESIS_EFFECTIVE}" == "1" ]]; then
-    SYNTH_CMD+=(--skip-synthesis)
-fi
-"${SYNTH_CMD[@]}"
 
-if [[ "${SKIP_SYNTHESIS_EFFECTIVE}" == "1" ]]; then
-    echo "[regular-grid] Completed grid generation only."
-else
-    FINAL_ZARR="${FINAL_ZARR:-${CFG_SPECTRA_ZARR:-${RUN_ROOT}/outputs/zarr/regular_synthesized_spectra.zarr}}"
-    if [[ ! -d "${FINAL_ZARR}" ]]; then
-        echo "[regular-grid] ERROR: expected synthesized spectra Zarr not found: ${FINAL_ZARR}" >&2
+NEED_GRID=1
+if [[ "$(to_bool01 "${RESUME}")" == "1" && -f "${GRID_DONE_MARK}" ]]; then
+    if is_valid_grid_zarr "${GRID_ZARR}"; then
+        NEED_GRID=0
+    fi
+fi
+
+if (( NEED_GRID == 1 )); then
+    CURRENT_PHASE="grid_generation"
+    log_phase "${CURRENT_PHASE}" "start" "building_regular_grid"
+    GRID_CMD=(
+        "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
+        --config-json "${CONFIG_PATH}"
+        --skip-synthesis
+    )
+    if [[ -n "${WORKERS_OVERRIDE}" ]]; then
+        GRID_CMD+=(--workers "${WORKERS_OVERRIDE}")
+    fi
+    "${GRID_CMD[@]}"
+    if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+        echo "[regular-grid] ERROR: grid generation finished but output is invalid: ${GRID_ZARR}" >&2
         exit 1
     fi
-    echo "[regular-grid] Completed synthesis: ${FINAL_ZARR}"
+    write_marker "${GRID_DONE_MARK}" "grid_generation_complete"
+    log_phase "${CURRENT_PHASE}" "ok" "grid_ready"
+else
+    echo "[regular-grid] Resume: skipping grid generation (checkpoint + valid grid found)."
+    log_phase "grid_generation" "skipped" "checkpoint_hit"
 fi
+
+if [[ "${SKIP_SYNTHESIS_EFFECTIVE}" == "1" ]]; then
+    CURRENT_PHASE="complete"
+    log_phase "synthesis" "skipped" "skip_synthesis_effective=1"
+    rm -f "${LAST_FAILURE_FILE}"
+    echo "[regular-grid] Completed grid generation only."
+    exit 0
+fi
+
+NEED_SYNTH=1
+if [[ "$(to_bool01 "${RESUME}")" == "1" && -f "${SYNTH_DONE_MARK}" ]]; then
+    if is_valid_synth_zarr "${FINAL_ZARR}"; then
+        NEED_SYNTH=0
+    fi
+fi
+
+if (( NEED_SYNTH == 1 )); then
+    CURRENT_PHASE="spectrum_synthesis"
+    log_phase "${CURRENT_PHASE}" "start" "launching_synthesis"
+
+    if [[ -d "${FINAL_ZARR}" ]] && ! is_valid_synth_zarr "${FINAL_ZARR}"; then
+        BROKEN_BACKUP="${FINAL_ZARR}.broken.$(date -u +%Y%m%dT%H%M%SZ)"
+        echo "[regular-grid] Found invalid final output, moving aside: ${FINAL_ZARR} -> ${BROKEN_BACKUP}"
+        mv "${FINAL_ZARR}" "${BROKEN_BACKUP}"
+        log_phase "${CURRENT_PHASE}" "info" "moved_invalid_final_to_backup"
+    fi
+
+    if [[ -e "${SYNTH_OUTPUT_TMP}" ]]; then
+        echo "[regular-grid] Removing stale synthesis tmp output: ${SYNTH_OUTPUT_TMP}"
+        rm -rf "${SYNTH_OUTPUT_TMP}"
+    fi
+
+    SYNTH_CMD=(
+        "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
+        --config-json "${CONFIG_PATH}"
+        --spectra-zarr "${FINAL_ZARR}"
+        --output-tmp "${SYNTH_OUTPUT_TMP}"
+    )
+    if [[ -n "${WORKERS_OVERRIDE}" ]]; then
+        SYNTH_CMD+=(--workers "${WORKERS_OVERRIDE}")
+    fi
+
+    "${SYNTH_CMD[@]}"
+
+    if ! is_valid_synth_zarr "${FINAL_ZARR}"; then
+        echo "[regular-grid] ERROR: synthesized spectra output is missing/invalid: ${FINAL_ZARR}" >&2
+        exit 1
+    fi
+    write_marker "${SYNTH_DONE_MARK}" "synthesis_complete"
+    log_phase "${CURRENT_PHASE}" "ok" "synthesis_ready"
+else
+    echo "[regular-grid] Resume: skipping synthesis (checkpoint + valid spectra found)."
+    log_phase "synthesis" "skipped" "checkpoint_hit"
+fi
+
+CURRENT_PHASE="complete"
+rm -f "${LAST_FAILURE_FILE}"
+echo "[regular-grid] Completed synthesis: ${FINAL_ZARR}"
