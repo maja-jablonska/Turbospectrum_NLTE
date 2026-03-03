@@ -59,7 +59,7 @@
       "model_opac_dir": "COM/contopac"
     },
     "synthesis_parameters": {
-      "calculate_intensity": false,
+      "output_mode": "Flux",
       "mu_angles": [],
       "mu_sampling": {
         "mode": "none",

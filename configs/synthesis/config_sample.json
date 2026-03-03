@@ -9,7 +9,7 @@
     "output_dir": "",
     "log_dir": "",
     "tmp_dir": "",
-    "calculate_intensity": false,
+    "output_mode": "Flux",
     "mu_angles": [],
     "nlte": false,
     "nlte_info_file": "",

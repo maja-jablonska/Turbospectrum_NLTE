@@ -14,8 +14,8 @@ def main():
     # Initialize configuration
     config = TurbospectrumConfig(project_root=project_root)
     
-    # Enable Intensity Calculation
-    config.calculate_intensity = True
+    # Enable Intensity mode
+    config.output_mode = "Intensity"
     
     # Note: Turbospectrum now automatically calculates intensities for standard mu angles
     # when Intensity mode is enabled, so we don't need to specify them explicitly here.
@@ -30,14 +30,14 @@ def main():
     ]
     
     print("Starting sample intensity run...")
-    print(f"Calculating intensity for all standard mu angles.")
+    print("Calculating intensity for all standard mu angles.")
     
     # Run the grid (Intensity)
     run_grid(config, grid_points)
     
     # Run for Flux as well for comparison
     print("\nStarting sample flux run...")
-    config.calculate_intensity = False
+    config.output_mode = "Flux"
     run_grid(config, grid_points)
     
     # Verify Reading

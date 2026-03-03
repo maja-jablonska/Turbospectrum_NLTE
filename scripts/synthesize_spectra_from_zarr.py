@@ -521,7 +521,7 @@ def _synthesis_task(args) -> Dict:
     # to whatever the Turbospectrum config requested.
     output_mode = row_values.get("output_mode")
     if output_mode is None:
-        output_mode = "Intensity" if cfg.calculate_intensity else "Flux"
+        output_mode = getattr(cfg, "output_mode", "Flux")
     calculation_mode = row_values.get("calculation_mode")
     if calculation_mode is None:
         calculation_mode = "NLTE" if cfg.nlte else "LTE"
@@ -531,15 +531,22 @@ def _synthesis_task(args) -> Dict:
     cfg.lambda_min = lam_min
     cfg.lambda_max = lam_max
     cfg.lambda_step = lam_step
-    cfg.calculate_intensity = output_mode.lower() == "intensity"
+    cfg.output_mode = output_mode
     cfg.nlte = calculation_mode.lower() == "nlte"
+    is_intensity = output_mode.lower() == "intensity"
+    mu_sampling = getattr(cfg, "mu_sampling", {}) or {}
+    if not isinstance(mu_sampling, dict):
+        mu_sampling = {}
+    if is_intensity and str(mu_sampling.get("mode", "none")).strip().lower() in {"", "none"}:
+        mu_sampling["mode"] = "random"
+    cfg.mu_sampling = mu_sampling
 
     base_name = get_model_filename(teff, logg, feh, turb_str)
     start = time.perf_counter()
     result = run_single_synthesis(((teff, logg, feh, turb_str), cfg))
     duration = time.perf_counter() - start
 
-    suffix = ".intensity.spec" if cfg.calculate_intensity else ".spec"
+    suffix = ".intensity.spec" if is_intensity else ".spec"
     spec_path = os.path.join(cfg.output_dir, f"{os.path.splitext(base_name)[0]}{suffix}")
     spectrum = None
     mu_selected = float("nan")
@@ -565,7 +572,7 @@ def _synthesis_task(args) -> Dict:
             if data.shape[0] != expected_n:
                 raise ValueError(f"Unexpected wavelength count {data.shape[0]} (expected {expected_n})")
 
-            if cfg.calculate_intensity:
+            if is_intensity:
                 mu_points = _read_mu_points(spec_path)
                 chosen_idx, mu_selected = _choose_mu_indices(mu_points, row_index=int(index), cfg=cfg)
                 reduce_mode = str(getattr(cfg, "mu_sampling", {}).get("reduce", "first")).lower()

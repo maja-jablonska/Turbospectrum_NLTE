@@ -448,6 +448,21 @@ class FluxResampler:
         return out.astype(np.float32, copy=False)
 
 
+def _take_rows(array, row_ids: np.ndarray) -> np.ndarray:
+    ridx = np.asarray(row_ids, dtype=np.int64)
+    try:
+        return np.asarray(array.oindex[ridx, :], dtype=np.float32)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        return np.asarray(array[ridx, :], dtype=np.float32)
+    except Exception:
+        rows = [np.asarray(array[int(i), :], dtype=np.float32) for i in ridx]
+        if rows:
+            return np.stack(rows, axis=0)
+        return np.empty((0, int(array.shape[1])), dtype=np.float32)
+
+
 class BatchAdapter:
     """Convert dataloader batches to model-ready arrays."""
 
@@ -458,14 +473,29 @@ class BatchAdapter:
         train_indices: np.ndarray,
         row_count: int,
         resampler: FluxResampler,
+        normalize_targets: bool,
         include_mu: bool,
         mu_key: str,
         logger: logging.Logger,
     ):
+        self.root = root
         self.resampler = resampler
+        self.normalize_targets = bool(normalize_targets)
+        self.target_points = int(resampler.target_axis.size)
+        self.target_dim = 2 * self.target_points
         self.include_mu = include_mu
         self.mu_source = "disabled"
         self.mu_feature = np.zeros((row_count,), dtype=np.float32)
+        self.continuum_source = self._resolve_continuum_source(root=root)
+        if self.continuum_source == "unity_fallback":
+            logger.warning(
+                "No continuum/flux_norm array found; using unity continuum fallback (normalized target equals flux)."
+            )
+        self.target_mean = np.zeros((self.target_dim,), dtype=np.float32)
+        self.target_std = np.ones((self.target_dim,), dtype=np.float32)
+        self.norm_hi_bound = np.ones((self.target_points,), dtype=np.float32)
+        self.norm_lo_bound = np.zeros((self.target_points,), dtype=np.float32)
+
         if include_mu:
             self.mu_feature, self.mu_source = self._build_mu_feature(
                 root=root,
@@ -474,6 +504,89 @@ class BatchAdapter:
                 mu_key=mu_key,
                 logger=logger,
             )
+        if self.normalize_targets:
+            self.target_mean, self.target_std = self._compute_target_stats(
+                root=root,
+                train_indices=np.asarray(train_indices, dtype=np.int64),
+            )
+            mean_norm = self.target_mean[self.target_points :]
+            std_norm = self.target_std[self.target_points :]
+            self.norm_hi_bound = (1.0 - mean_norm) / std_norm
+            self.norm_lo_bound = (0.0 - mean_norm) / std_norm
+
+    @staticmethod
+    def _resolve_continuum_source(*, root) -> str:
+        if "continuum" in root:
+            return "continuum"
+
+        for key in root.array_keys():
+            key_name = str(key)
+            if key_name.lower().startswith("continuum"):
+                return key_name
+
+        if "flux_norm" in root:
+            return "flux_norm"
+        return "unity_fallback"
+
+    def _continuum_rows(self, row_ids: np.ndarray, flux_full: np.ndarray) -> np.ndarray:
+        if self.continuum_source == "flux_norm":
+            flux_norm = _take_rows(self.root["flux_norm"], row_ids)
+            cont = np.divide(
+                flux_full,
+                flux_norm,
+                out=np.zeros_like(flux_full, dtype=np.float32),
+                where=np.abs(flux_norm) > np.float32(1e-6),
+            )
+            return np.nan_to_num(cont, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.continuum_source == "unity_fallback":
+            return np.ones_like(flux_full, dtype=np.float32)
+        cont = _take_rows(self.root[self.continuum_source], row_ids)
+        return np.nan_to_num(cont, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compose_targets(self, flux_full: np.ndarray, continuum_full: np.ndarray, *, normalize: bool) -> np.ndarray:
+        flux = self.resampler.resample(flux_full)
+        cont = self.resampler.resample(continuum_full)
+        norm = np.divide(
+            flux,
+            cont,
+            out=np.zeros_like(flux, dtype=np.float32),
+            where=np.abs(cont) > np.float32(1e-6),
+        )
+
+        cont = np.nan_to_num(cont, nan=0.0, posinf=0.0, neginf=0.0)
+        norm = np.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
+        y = np.concatenate([cont, norm], axis=1).astype(np.float32, copy=False)
+        if normalize and self.normalize_targets:
+            y = (y - self.target_mean[None, :]) / self.target_std[None, :]
+        return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+    def _compute_target_stats(self, *, root, train_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if train_indices.size == 0:
+            raise ValueError("Cannot compute target stats with an empty training split")
+
+        sum_vec = np.zeros((self.target_dim,), dtype=np.float64)
+        sumsq_vec = np.zeros((self.target_dim,), dtype=np.float64)
+        count_vec = np.zeros((self.target_dim,), dtype=np.int64)
+
+        block_rows = 128
+        for start in range(0, int(train_indices.size), block_rows):
+            row_ids = train_indices[start : start + block_rows]
+            flux_full = _take_rows(root["flux"], row_ids)
+            cont_full = self._continuum_rows(row_ids, flux_full)
+            y = self._compose_targets(flux_full, cont_full, normalize=False).astype(np.float64, copy=False)
+
+            finite = np.isfinite(y)
+            clean = np.where(finite, y, 0.0)
+            sum_vec += clean.sum(axis=0)
+            sumsq_vec += np.square(clean).sum(axis=0)
+            count_vec += finite.sum(axis=0, dtype=np.int64)
+
+        mean = np.divide(sum_vec, count_vec, out=np.zeros_like(sum_vec), where=count_vec > 0)
+        var = np.divide(sumsq_vec, count_vec, out=np.zeros_like(sumsq_vec), where=count_vec > 0) - np.square(mean)
+        var = np.clip(var, 0.0, None)
+        std = np.sqrt(var)
+        std = np.where((count_vec <= 1) | (std < 1e-6), 1.0, std)
+        return mean.astype(np.float32), std.astype(np.float32)
 
     @staticmethod
     def _build_mu_feature(
@@ -541,9 +654,13 @@ class BatchAdapter:
 
         if "targets" not in batch:
             raise ValueError("Training requires batches with 'targets'")
-        y_full = np.asarray(batch["targets"], dtype=np.float32)
-        y = self.resampler.resample(y_full)
-        y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+        y_flux_full = np.asarray(batch["targets"], dtype=np.float32)
+        if y_flux_full.ndim == 1:
+            y_flux_full = y_flux_full[:, None]
+
+        row_ids = np.asarray(batch["indices"], dtype=np.int64)
+        y_cont_full = self._continuum_rows(row_ids, y_flux_full)
+        y = self._compose_targets(y_flux_full, y_cont_full, normalize=True)
         return x, y
 
 
@@ -886,7 +1003,8 @@ def main() -> None:
                 drop_last=False,
                 seed=int(args.seed),
                 normalize_inputs=bool(args.normalize_inputs),
-                normalize_targets=bool(args.normalize_targets),
+                # Dual targets are assembled/resampled in BatchAdapter, so normalize there.
+                normalize_targets=False,
             )
             loader_cache[batch_size] = loaders
         return loader_cache[batch_size]
@@ -900,6 +1018,7 @@ def main() -> None:
                 train_indices=np.asarray(loaders["train"].indices, dtype=np.int64),
                 row_count=row_count,
                 resampler=resampler,
+                normalize_targets=bool(args.normalize_targets),
                 include_mu=bool(args.include_mu),
                 mu_key=str(args.mu_key),
                 logger=logger,
@@ -950,49 +1069,75 @@ def main() -> None:
         state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
         return state, lr_schedule
 
-    def loss_components(pred, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
-        recon = jnp.mean(optax.huber_loss(pred - y, delta=huber_delta))
-        mse = jnp.mean((pred - y) ** 2)
-        hi_pen = jnp.mean(jax.nn.relu(pred - hi_bound[None, :]) ** 2)
-        lo_pen = jnp.mean(jax.nn.relu(lo_bound[None, :] - pred) ** 2)
-        if pred.shape[1] >= 3:
-            d2 = pred[:, 2:] - 2.0 * pred[:, 1:-1] + pred[:, :-2]
-            smooth_pen = jnp.mean(d2**2)
+    def loss_components(pred, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+        norm_dim = int(norm_hi_bound.shape[0])
+        if norm_dim <= 0 or pred.shape[1] <= norm_dim:
+            raise ValueError("Dual-output layout must include continuum and normalized spectrum blocks")
+
+        pred_cont = pred[:, :-norm_dim]
+        pred_norm = pred[:, -norm_dim:]
+        y_cont = y[:, :-norm_dim]
+        y_norm = y[:, -norm_dim:]
+
+        recon_cont = jnp.mean(optax.huber_loss(pred_cont - y_cont, delta=huber_delta))
+        recon_norm = jnp.mean(optax.huber_loss(pred_norm - y_norm, delta=huber_delta))
+        mse_cont = jnp.mean((pred_cont - y_cont) ** 2)
+        mse_norm = jnp.mean((pred_norm - y_norm) ** 2)
+        recon = 0.5 * (recon_cont + recon_norm)
+        mse = 0.5 * (mse_cont + mse_norm)
+
+        hi_pen = jnp.mean(jax.nn.relu(pred_norm - norm_hi_bound[None, :]) ** 2)
+        lo_pen = jnp.mean(jax.nn.relu(norm_lo_bound[None, :] - pred_norm) ** 2)
+
+        if pred_norm.shape[1] >= 3:
+            d2_norm = pred_norm[:, 2:] - 2.0 * pred_norm[:, 1:-1] + pred_norm[:, :-2]
+            smooth_norm = jnp.mean(d2_norm**2)
         else:
-            smooth_pen = jnp.asarray(0.0, dtype=pred.dtype)
+            smooth_norm = jnp.asarray(0.0, dtype=pred.dtype)
+        if pred_cont.shape[1] >= 3:
+            d2_cont = pred_cont[:, 2:] - 2.0 * pred_cont[:, 1:-1] + pred_cont[:, :-2]
+            smooth_cont = jnp.mean(d2_cont**2)
+        else:
+            smooth_cont = jnp.asarray(0.0, dtype=pred.dtype)
+        smooth_pen = 0.5 * (smooth_norm + smooth_cont)
+
         total = recon + lambda_hi * hi_pen + lambda_lo * lo_pen + lambda_smooth * smooth_pen
-        return total, recon, mse, hi_pen, lo_pen, smooth_pen
+        return total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen
 
     @jax.jit
-    def train_step(state, x, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+    def train_step(state, x, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
         def loss_fn(params):
             pred = state.apply_fn({"params": params}, x)
-            total, recon, mse, hi_pen, lo_pen, smooth_pen = loss_components(
-                pred, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+            total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen = loss_components(
+                pred, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
             )
-            return total, (recon, mse, hi_pen, lo_pen, smooth_pen)
+            return total, (recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen)
 
-        (loss, (recon, mse, hi_pen, lo_pen, smooth_pen)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        (loss, (recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen)), grads = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(state.params)
         state = state.apply_gradients(grads=grads)
-        return state, loss, recon, mse, hi_pen, lo_pen, smooth_pen
+        return state, loss, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen
 
     @jax.jit
-    def eval_step(state, x, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+    def eval_step(state, x, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
         pred = state.apply_fn({"params": state.params}, x)
-        return loss_components(pred, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta)
+        return loss_components(pred, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta)
 
     def evaluate_loader(
         state,
         loader,
         adapter: BatchAdapter,
-        hi_bound,
-        lo_bound,
+        norm_hi_bound,
+        norm_lo_bound,
         lambda_hi: float,
         lambda_lo: float,
         lambda_smooth: float,
         huber_delta: float,
     ) -> dict[str, float]:
-        totals, recons, mses, hi_pens, lo_pens, smooth_pens = [], [], [], [], [], []
+        totals, recons, mses = [], [], []
+        recon_conts, recon_norms, mse_conts, mse_norms = [], [], [], []
+        hi_pens, lo_pens, smooth_pens = [], [], []
         lh = jnp.asarray(lambda_hi, dtype=jnp.float32)
         ll = jnp.asarray(lambda_lo, dtype=jnp.float32)
         ls = jnp.asarray(lambda_smooth, dtype=jnp.float32)
@@ -1001,10 +1146,16 @@ def main() -> None:
             x_np, y_np = adapter.batch_to_xy(batch)
             x = jnp.asarray(x_np, dtype=jnp.float32)
             y = jnp.asarray(y_np, dtype=jnp.float32)
-            total, recon, mse, hi_pen, lo_pen, smooth_pen = eval_step(state, x, y, hi_bound, lo_bound, lh, ll, ls, hd)
+            total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen = eval_step(
+                state, x, y, norm_hi_bound, norm_lo_bound, lh, ll, ls, hd
+            )
             totals.append(float(total))
             recons.append(float(recon))
             mses.append(float(mse))
+            recon_conts.append(float(recon_cont))
+            recon_norms.append(float(recon_norm))
+            mse_conts.append(float(mse_cont))
+            mse_norms.append(float(mse_norm))
             hi_pens.append(float(hi_pen))
             lo_pens.append(float(lo_pen))
             smooth_pens.append(float(smooth_pen))
@@ -1013,6 +1164,10 @@ def main() -> None:
                 "total": float("nan"),
                 "recon": float("nan"),
                 "mse": float("nan"),
+                "recon_cont": float("nan"),
+                "recon_norm": float("nan"),
+                "mse_cont": float("nan"),
+                "mse_norm": float("nan"),
                 "hi_pen": float("nan"),
                 "lo_pen": float("nan"),
                 "smooth_pen": float("nan"),
@@ -1021,6 +1176,10 @@ def main() -> None:
             "total": float(np.mean(totals)),
             "recon": float(np.mean(recons)),
             "mse": float(np.mean(mses)),
+            "recon_cont": float(np.mean(recon_conts)),
+            "recon_norm": float(np.mean(recon_norms)),
+            "mse_cont": float(np.mean(mse_conts)),
+            "mse_norm": float(np.mean(mse_norms)),
             "hi_pen": float(np.mean(hi_pens)),
             "lo_pen": float(np.mean(lo_pens)),
             "smooth_pen": float(np.mean(smooth_pens)),
@@ -1038,6 +1197,7 @@ def main() -> None:
             "target_points": int(resampler.target_axis.size),
             "target_axis_min": float(resampler.target_axis[0]),
             "target_axis_max": float(resampler.target_axis[-1]),
+            "output_heads": ["continuum", "flux_normalized"],
             "include_mu": bool(args.include_mu),
             "mu_key": str(args.mu_key),
             "input_features": input_features,
@@ -1059,8 +1219,14 @@ def main() -> None:
             "batch_size": int(spec.batch_size),
             "jax_platform": str(args.jax_platform),
         }
-        (run_dir / "config.json").write_text(json.dumps(run_cfg, indent=2))
 
+        loaders = get_loaders(spec.batch_size)
+        if hasattr(loaders["train"], "_epoch"):
+            loaders["train"]._epoch = 0  # type: ignore[attr-defined]
+        adapter = get_adapter(spec.batch_size)
+        run_cfg["continuum_source"] = str(adapter.continuum_source)
+        run_cfg["target_layout"] = "concatenate([continuum, flux/continuum], axis=1)"
+        (run_dir / "config.json").write_text(json.dumps(run_cfg, indent=2))
         wb_run = None
         if wandb is not None:
             wb_run = wandb.init(
@@ -1075,28 +1241,16 @@ def main() -> None:
                 reinit=True,
             )
 
-        loaders = get_loaders(spec.batch_size)
-        if hasattr(loaders["train"], "_epoch"):
-            loaders["train"]._epoch = 0  # type: ignore[attr-defined]
-        adapter = get_adapter(spec.batch_size)
-
         probe = next(iter(loaders["train"]))
         x0, y0 = adapter.batch_to_xy(probe)
-        if bool(args.normalize_targets):
-            target_stats = loaders["train"].target_stats
-            if target_stats is None:
-                raise ValueError("normalize_targets=True but target_stats were not computed")
-            mean = np.asarray(target_stats.mean, dtype=np.float32)
-            std = np.asarray(target_stats.std, dtype=np.float32)
-            hi_source = (1.0 - mean) / std
-            lo_source = (0.0 - mean) / std
-            hi_bound_np = adapter.resampler.resample(hi_source[None, :])[0]
-            lo_bound_np = adapter.resampler.resample(lo_source[None, :])[0]
-        else:
-            hi_bound_np = np.ones((int(y0.shape[1]),), dtype=np.float32)
-            lo_bound_np = np.zeros((int(y0.shape[1]),), dtype=np.float32)
-        hi_bound = jnp.asarray(np.nan_to_num(hi_bound_np, nan=1.0, posinf=1.0, neginf=1.0), dtype=jnp.float32)
-        lo_bound = jnp.asarray(np.nan_to_num(lo_bound_np, nan=0.0, posinf=0.0, neginf=0.0), dtype=jnp.float32)
+        norm_hi_bound = jnp.asarray(
+            np.nan_to_num(adapter.norm_hi_bound, nan=1.0, posinf=1.0, neginf=1.0),
+            dtype=jnp.float32,
+        )
+        norm_lo_bound = jnp.asarray(
+            np.nan_to_num(adapter.norm_lo_bound, nan=0.0, posinf=0.0, neginf=0.0),
+            dtype=jnp.float32,
+        )
 
         steps_per_epoch = max(1, len(loaders["train"]))
         total_steps = int(spec.epochs) * steps_per_epoch
@@ -1119,7 +1273,7 @@ def main() -> None:
         huber_delta = jnp.asarray(spec.huber_delta, dtype=jnp.float32)
 
         logger.info(
-            "Run %d/%d: %s | h=%s lr=%g wd=%g bs=%d ep=%d lhi=%g llo=%g ls=%g hd=%g warm=%g minlr=%g mu_source=%s",
+            "Run %d/%d: %s | h=%s lr=%g wd=%g bs=%d ep=%d lhi=%g llo=%g ls=%g hd=%g warm=%g minlr=%g mu_source=%s continuum_source=%s",
             run_idx + 1,
             len(specs),
             run_name,
@@ -1135,6 +1289,7 @@ def main() -> None:
             spec.warmup_fraction,
             spec.min_lr_ratio,
             adapter.mu_source,
+            adapter.continuum_source,
         )
 
         best_val = float("inf")
@@ -1145,17 +1300,23 @@ def main() -> None:
         with metrics_path.open("w", encoding="utf-8") as mf:
             for epoch in range(1, spec.epochs + 1):
                 epoch_start = time.time()
-                train_totals, train_recons, train_mses, train_hi_pens, train_lo_pens, train_smooth_pens = [], [], [], [], [], []
+                train_totals, train_recons, train_mses = [], [], []
+                train_recon_conts, train_recon_norms, train_mse_conts, train_mse_norms = [], [], [], []
+                train_hi_pens, train_lo_pens, train_smooth_pens = [], [], []
                 for batch in loaders["train"]:
                     x_np, y_np = adapter.batch_to_xy(batch)
                     x = jnp.asarray(x_np, dtype=jnp.float32)
                     y = jnp.asarray(y_np, dtype=jnp.float32)
-                    state, total, recon, mse, hi_pen, lo_pen, smooth_pen = train_step(
-                        state, x, y, hi_bound, lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+                    state, total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen = train_step(
+                        state, x, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
                     )
                     train_totals.append(float(total))
                     train_recons.append(float(recon))
                     train_mses.append(float(mse))
+                    train_recon_conts.append(float(recon_cont))
+                    train_recon_norms.append(float(recon_norm))
+                    train_mse_conts.append(float(mse_cont))
+                    train_mse_norms.append(float(mse_norm))
                     train_hi_pens.append(float(hi_pen))
                     train_lo_pens.append(float(lo_pen))
                     train_smooth_pens.append(float(smooth_pen))
@@ -1164,6 +1325,10 @@ def main() -> None:
                     "total": float(np.mean(train_totals)) if train_totals else float("nan"),
                     "recon": float(np.mean(train_recons)) if train_recons else float("nan"),
                     "mse": float(np.mean(train_mses)) if train_mses else float("nan"),
+                    "recon_cont": float(np.mean(train_recon_conts)) if train_recon_conts else float("nan"),
+                    "recon_norm": float(np.mean(train_recon_norms)) if train_recon_norms else float("nan"),
+                    "mse_cont": float(np.mean(train_mse_conts)) if train_mse_conts else float("nan"),
+                    "mse_norm": float(np.mean(train_mse_norms)) if train_mse_norms else float("nan"),
                     "hi_pen": float(np.mean(train_hi_pens)) if train_hi_pens else float("nan"),
                     "lo_pen": float(np.mean(train_lo_pens)) if train_lo_pens else float("nan"),
                     "smooth_pen": float(np.mean(train_smooth_pens)) if train_smooth_pens else float("nan"),
@@ -1172,8 +1337,8 @@ def main() -> None:
                     state,
                     loaders["val"],
                     adapter,
-                    hi_bound,
-                    lo_bound,
+                    norm_hi_bound,
+                    norm_lo_bound,
                     spec.lambda_hi,
                     spec.lambda_lo,
                     spec.lambda_smooth,
@@ -1195,12 +1360,20 @@ def main() -> None:
                     "train_total": train_stats["total"],
                     "train_recon": train_stats["recon"],
                     "train_mse": train_stats["mse"],
+                    "train_recon_cont": train_stats["recon_cont"],
+                    "train_recon_norm": train_stats["recon_norm"],
+                    "train_mse_cont": train_stats["mse_cont"],
+                    "train_mse_norm": train_stats["mse_norm"],
                     "train_hi_pen": train_stats["hi_pen"],
                     "train_lo_pen": train_stats["lo_pen"],
                     "train_smooth_pen": train_stats["smooth_pen"],
                     "val_total": val_stats["total"],
                     "val_recon": val_stats["recon"],
                     "val_mse": val_stats["mse"],
+                    "val_recon_cont": val_stats["recon_cont"],
+                    "val_recon_norm": val_stats["recon_norm"],
+                    "val_mse_cont": val_stats["mse_cont"],
+                    "val_mse_norm": val_stats["mse_norm"],
                     "val_hi_pen": val_stats["hi_pen"],
                     "val_lo_pen": val_stats["lo_pen"],
                     "val_smooth_pen": val_stats["smooth_pen"],
@@ -1213,12 +1386,14 @@ def main() -> None:
 
                 if epoch == 1 or epoch == spec.epochs or epoch % 5 == 0:
                     logger.info(
-                        "[%s] epoch=%03d lr=%.6e train_recon=%.6f val_recon=%.6f val_smooth_pen=%.6f",
+                        "[%s] epoch=%03d lr=%.6e train_recon=%.6f val_recon=%.6f val_recon_cont=%.6f val_recon_norm=%.6f val_smooth_pen=%.6f",
                         run_name,
                         epoch,
                         current_lr,
                         train_stats["recon"],
                         val_stats["recon"],
+                        val_stats["recon_cont"],
+                        val_stats["recon_norm"],
                         val_stats["smooth_pen"],
                     )
 
@@ -1226,8 +1401,8 @@ def main() -> None:
             state,
             loaders["test"],
             adapter,
-            hi_bound,
-            lo_bound,
+            norm_hi_bound,
+            norm_lo_bound,
             spec.lambda_hi,
             spec.lambda_lo,
             spec.lambda_smooth,
@@ -1242,14 +1417,23 @@ def main() -> None:
             "best_epoch": int(best_epoch),
             "final_val_recon": float(val_stats["recon"]) if np.isfinite(val_stats["recon"]) else float("nan"),
             "final_val_mse": float(val_stats["mse"]) if np.isfinite(val_stats["mse"]) else float("nan"),
+            "final_val_recon_cont": float(val_stats["recon_cont"]) if np.isfinite(val_stats["recon_cont"]) else float("nan"),
+            "final_val_recon_norm": float(val_stats["recon_norm"]) if np.isfinite(val_stats["recon_norm"]) else float("nan"),
+            "final_val_mse_cont": float(val_stats["mse_cont"]) if np.isfinite(val_stats["mse_cont"]) else float("nan"),
+            "final_val_mse_norm": float(val_stats["mse_norm"]) if np.isfinite(val_stats["mse_norm"]) else float("nan"),
             "test_total": float(test_stats["total"]),
             "test_recon": float(test_stats["recon"]),
             "test_mse": float(test_stats["mse"]),
+            "test_recon_cont": float(test_stats["recon_cont"]),
+            "test_recon_norm": float(test_stats["recon_norm"]),
+            "test_mse_cont": float(test_stats["mse_cont"]),
+            "test_mse_norm": float(test_stats["mse_norm"]),
             "test_hi_pen": float(test_stats["hi_pen"]),
             "test_lo_pen": float(test_stats["lo_pen"]),
             "test_smooth_pen": float(test_stats["smooth_pen"]),
             "final_learning_rate": float(lr_schedule(state.step)),
             "mu_source": adapter.mu_source,
+            "continuum_source": adapter.continuum_source,
         }
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
