@@ -49,11 +49,12 @@
         "lambda_step": 0.1,
         "_lambda_note": "Wavelength range and step in Angstroms",
         
-        "calculate_intensity": false,
-        "_calculate_intensity_note": "If true, calculate intensity instead of flux",
+        "output_mode": "Flux",
+        "_output_mode_options": ["Flux", "Intensity"],
+        "_output_mode_note": "Controls whether BSYN writes continuum flux or intensity spectra",
         
         "mu_angles": [],
-        "_mu_angles_note": "List of mu angles (cos(theta)) for intensity calculations. If empty and calculate_intensity=true, uses default 12 Gauss-Radau points. Maximum 30 points.",
+        "_mu_angles_note": "List of mu angles (cos(theta)) for intensity calculations. If empty and output_mode='Intensity', uses default 12 Gauss-Radau points. Maximum 30 points.",
 
         "mu_sampling": {
             "_note": [
@@ -77,10 +78,7 @@
         "_segments_file_note": "File defining multiple wavelength segments. If specified, overrides lambda_min/max/step",
         
         "resolution": 500000.0,
-        "_resolution_note": "Spectral resolution (used with segments_file). Default: 500000",
-        
-        "intensity_flux": "Flux",
-        "_intensity_flux_options": ["Flux", "Intensity"]
+        "_resolution_note": "Spectral resolution (used with segments_file). Default: 500000"
     },
     
     "nlte": {

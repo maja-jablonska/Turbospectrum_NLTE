@@ -396,13 +396,20 @@ def _synthesis_task(batch):
         # to whatever the Turbospectrum config requested.
         output_mode = row_values.get("output_mode")
         if output_mode is None:
-            output_mode = "Intensity" if cfg.calculate_intensity else "Flux"
+            output_mode = getattr(cfg, "output_mode", "Flux")
         calculation_mode = row_values.get("calculation_mode")
         if calculation_mode is None:
             calculation_mode = "NLTE" if cfg.nlte else "LTE"
 
-        cfg.calculate_intensity = str(output_mode).lower() == "intensity"
+        cfg.output_mode = str(output_mode)
         cfg.nlte = str(calculation_mode).lower() == "nlte"
+        is_intensity = str(output_mode).lower() == "intensity"
+        mu_sampling = getattr(cfg, "mu_sampling", {}) or {}
+        if not isinstance(mu_sampling, dict):
+            mu_sampling = {}
+        if is_intensity and str(mu_sampling.get("mode", "none")).strip().lower() in {"", "none"}:
+            mu_sampling["mode"] = "random"
+        cfg.mu_sampling = mu_sampling
 
         base_name = get_model_filename(teff, logg, feh, turb)
 
@@ -410,7 +417,7 @@ def _synthesis_task(batch):
         result = run_single_synthesis(((teff, logg, feh, turb), cfg))
         duration = time.perf_counter() - start
 
-        suffix = ".intensity.spec" if cfg.calculate_intensity else ".spec"
+        suffix = ".intensity.spec" if is_intensity else ".spec"
         spec_path = os.path.join(
             cfg.output_dir,
             f"{os.path.splitext(base_name)[0]}{suffix}"
@@ -442,7 +449,7 @@ def _synthesis_task(batch):
                 if data.shape[0] != expected_n:
                     raise ValueError(f"Unexpected wavelength count {data.shape[0]} (expected {expected_n})")
 
-                if cfg.calculate_intensity:
+                if is_intensity:
                     # Optional: pick random mu points from the Intensity file and use
                     # their I_abs/I_norm as the stored spectrum.
                     mu_points = _read_mu_points(spec_path)

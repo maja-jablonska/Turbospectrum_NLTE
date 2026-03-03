@@ -30,6 +30,23 @@ def _strip_private_keys(obj):
     return obj
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+    return bool(value)
+
+
+def _normalize_output_mode(raw: Any) -> str:
+    text = str(raw if raw is not None else "Flux").strip().lower()
+    if text == "intensity":
+        return "Intensity"
+    if text == "flux":
+        return "Flux"
+    raise ValueError(f"output_mode must be 'Flux' or 'Intensity', got {raw!r}")
+
+
 def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     """
     Normalize config JSON to the flat schema expected by TurbospectrumConfig.
@@ -46,6 +63,29 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     if not has_nested_sections:
         if not cfg_data.get("project_root"):
             cfg_data["project_root"] = default_project_root
+        if "output_mode" not in cfg_data:
+            if "calculate_intensity" in cfg_data or "compute_intensity" in cfg_data:
+                cfg_data["output_mode"] = "Intensity" if _as_bool(
+                    cfg_data.get("calculate_intensity", cfg_data.get("compute_intensity"))
+                ) else "Flux"
+            elif "intensity_flux" in cfg_data:
+                cfg_data["output_mode"] = _normalize_output_mode(cfg_data.get("intensity_flux"))
+            else:
+                cfg_data["output_mode"] = "Flux"
+        else:
+            cfg_data["output_mode"] = _normalize_output_mode(cfg_data.get("output_mode"))
+        cfg_data.pop("calculate_intensity", None)
+        cfg_data.pop("compute_intensity", None)
+        cfg_data.pop("intensity_flux", None)
+
+        mu_sampling = cfg_data.get("mu_sampling", {}) or {}
+        if not isinstance(mu_sampling, dict):
+            mu_sampling = {}
+        if cfg_data["output_mode"] == "Intensity":
+            mode = str(mu_sampling.get("mode", "none")).strip().lower()
+            if mode in {"", "none"}:
+                mu_sampling["mode"] = "random"
+        cfg_data["mu_sampling"] = mu_sampling
         return cfg_data
 
     flat: dict = {}
@@ -75,11 +115,26 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["lambda_min"] = synthesis.get("lambda_min", 4000.0)
     flat["lambda_max"] = synthesis.get("lambda_max", 8000.0)
     flat["lambda_step"] = synthesis.get("lambda_step", 0.1)
-    flat["calculate_intensity"] = synthesis.get("calculate_intensity", False)
+    if "output_mode" in synthesis:
+        output_mode = _normalize_output_mode(synthesis.get("output_mode"))
+    elif "intensity_flux" in synthesis:
+        output_mode = _normalize_output_mode(synthesis.get("intensity_flux"))
+    else:
+        output_mode = "Intensity" if _as_bool(
+            synthesis.get("calculate_intensity", synthesis.get("compute_intensity", False))
+        ) else "Flux"
+    flat["output_mode"] = output_mode
     flat["mu_angles"] = synthesis.get("mu_angles", []) or []
     # Optional: choose a subset of mu points from an Intensity spectrum.
     # This is used by the Zarr-grid synthesis scripts when reading Turbospectrum outputs.
-    flat["mu_sampling"] = synthesis.get("mu_sampling", {}) or {}
+    mu_sampling = synthesis.get("mu_sampling", {}) or {}
+    if not isinstance(mu_sampling, dict):
+        mu_sampling = {}
+    if output_mode == "Intensity":
+        mode = str(mu_sampling.get("mode", "none")).strip().lower()
+        if mode in {"", "none"}:
+            mu_sampling["mode"] = "random"
+    flat["mu_sampling"] = mu_sampling
 
     nlte_cfg = cfg_data.get("nlte", {}) or {}
     flat["nlte"] = nlte_cfg.get("enabled", False)
@@ -209,8 +264,8 @@ class TurbospectrumConfig:
     bsyn_exec: str = "bsyn_lu"
     interpol_exec: str = "interpol_modeles"
 
-    # Intensity Calculation
-    calculate_intensity: bool = False
+    # Output mode
+    output_mode: str = "Flux"
     mu_angles: List[float] = field(default_factory=list)
     # Optional post-processing configuration for intensity outputs.
     # Expected shape (all keys optional):
@@ -249,6 +304,14 @@ class TurbospectrumConfig:
     grid_points_file: str = ""
 
     def __post_init__(self):
+        self.output_mode = _normalize_output_mode(self.output_mode)
+        if not isinstance(self.mu_sampling, dict):
+            self.mu_sampling = {}
+        if self.output_mode == "Intensity":
+            mode = str(self.mu_sampling.get("mode", "none")).strip().lower()
+            if mode in {"", "none"}:
+                self.mu_sampling["mode"] = "random"
+
         # Set derived paths if not provided
         if not self.model_atmosphere_path:
             # Prefer the common layout:
@@ -680,10 +743,12 @@ def run_single_synthesis(args):
     log_file = os.path.join(config.log_dir, f"{base_name}.log")
     opac_path = os.path.join(config.project_root, config.model_opac_dir, f"{base_name}opac")
     result_file = os.path.join(config.output_dir, f"{base_name}.spec")
+    output_mode = _normalize_output_mode(getattr(config, "output_mode", "Flux"))
+    is_intensity = output_mode == "Intensity"
     
     # Check if output exists and skip if force is False
     expected_outputs = []
-    if config.calculate_intensity:
+    if is_intensity:
         expected_outputs.append(os.path.join(config.output_dir, f"{base_name}.intensity.spec"))
     else:
         expected_outputs.append(os.path.join(config.output_dir, f"{base_name}.spec"))
@@ -762,13 +827,12 @@ def run_single_synthesis(args):
         # Step 2: BSYN (Spectral Synthesis)
         # ---------------------------------------------------------------------
         
-        # Determine synthesis mode
-        # If calculate_intensity is True, we run for Intensity. 
-        # Note: For Plane-Parallel models, Turbospectrum outputs intensities for 12 standard mu angles 
-        # in a single file, so we don't need to loop over angles.
+        # Determine synthesis mode.
+        # For plane-parallel models, Turbospectrum outputs intensities for 12
+        # standard mu angles in a single file, so we do not loop over angles.
         
         synthesis_runs = []
-        if config.calculate_intensity:
+        if is_intensity:
             synthesis_runs.append({
                 'mode': 'Intensity',
                 'suffix': ".intensity"
@@ -927,8 +991,8 @@ def main():
     else:
         grid_points = config.grid_points
     
-    # Example: Enable intensity calculation
-    # config.calculate_intensity = True
+    # Example: enable intensity calculation
+    # config.output_mode = "Intensity"
     # config.mu_angles = [1.0, 0.8, 0.6, 0.4, 0.2]
     
     run_grid(config, grid_points)

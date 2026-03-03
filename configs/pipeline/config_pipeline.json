@@ -87,7 +87,7 @@
         "These are Turbospectrum defaults used ONLY when the grid does not include per-row values.",
         "In the Zarr-grid workflow, lam_min/max/step/output_mode typically come from the grid."
       ],
-      "calculate_intensity": true,
+      "output_mode": "Intensity",
       "mu_angles": [],
       "mu_sampling": {
         "_note": [
@@ -95,7 +95,7 @@
           "If mode='random', pick mu columns from the Turbospectrum intensity .spec file and store them in the Zarr outputs.",
           "reduce='first' stores one randomly selected mu; reduce='mean' averages over the sampled mus."
         ],
-        "mode": "none",
+        "mode": "random",
         "count": 1,
         "seed": 0,
         "min": 0.0,

@@ -69,11 +69,11 @@
     },
 
     "synthesis_parameters": {
-      "calculate_intensity": false,
+      "output_mode": "Intensity",
       "mu_angles": [],
       "mu_sampling": {
         "_note": "Only used when output_mode='Intensity'. mode='random' selects random mu columns from the Turbospectrum intensity output.",
-        "mode": "none",
+        "mode": "random",
         "count": 1,
         "seed": 0,
         "min": 0.0,
