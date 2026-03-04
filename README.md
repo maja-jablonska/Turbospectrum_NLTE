@@ -206,6 +206,16 @@ python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipelin
 python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipeline.json --skip-grid
 ```
 
+If you need to reset generated outputs/state before a fresh run:
+
+```bash
+# dry-run (shows what would be removed)
+python3 scripts/clean_pipeline_outputs.py --config configs/pipeline/config_pipeline.json
+
+# apply deletion
+python3 scripts/clean_pipeline_outputs.py --config configs/pipeline/config_pipeline.json --apply
+```
+
 ### 3. Optional Sharded Runs + Merge
 
 If you need independent shard jobs (e.g. separate PBS submissions), use:

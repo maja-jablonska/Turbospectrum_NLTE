@@ -10,7 +10,7 @@
     "_note": "Sampling + defaults that become columns in the grid Zarr (output_mode/calculation_mode/mode).",
 
     "grid_version": "mu-sampling",
-    "num_samples": 1000,
+    "num_samples": 50000,
     "seed": 1329397429,
 
     "bounds": {
