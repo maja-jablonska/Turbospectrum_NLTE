@@ -65,9 +65,8 @@ input_files/*
 
 # Ignore runtime configs and PBS scripts by default.
 /configs/**
-!/configs/**/
 *.pbs
 
 # Keep template files that explicitly include "_EXAMPLE" in the name.
-!/configs/**/*_EXAMPLE*
-!*_EXAMPLE*.pbs
+!/configs/**/_example*
+!*_example*.pbs
