@@ -115,6 +115,9 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["lambda_min"] = synthesis.get("lambda_min", 4000.0)
     flat["lambda_max"] = synthesis.get("lambda_max", 8000.0)
     flat["lambda_step"] = synthesis.get("lambda_step", 0.1)
+    # BSYN control parameter (historically hardcoded to 300.00 in shell/python runners).
+    # Accept explicit config override when present.
+    flat["resolution"] = synthesis.get("resolution", cfg_data.get("resolution", 300.0))
     if "output_mode" in synthesis:
         output_mode = _normalize_output_mode(synthesis.get("output_mode"))
     elif "intensity_flux" in synthesis:
@@ -276,6 +279,7 @@ class TurbospectrumConfig:
     lambda_min: float = 4000
     lambda_max: float = 8000
     lambda_step: float = 0.1
+    resolution: float = 300.0
     model_opac_dir: str = "COM/contopac"
     # Optional provenance metadata used to populate DATA_SCHEMA.md manifests.
     linelist_version: str = ""
@@ -305,6 +309,12 @@ class TurbospectrumConfig:
 
     def __post_init__(self):
         self.output_mode = _normalize_output_mode(self.output_mode)
+        try:
+            self.resolution = float(self.resolution)
+        except Exception as exc:
+            raise ValueError(f"resolution must be numeric, got {self.resolution!r}") from exc
+        if self.resolution <= 0:
+            raise ValueError(f"resolution must be > 0, got {self.resolution!r}")
         if not isinstance(self.mu_sampling, dict):
             self.mu_sampling = {}
         if self.output_mode == "Intensity":
@@ -869,7 +879,7 @@ def run_single_synthesis(args):
 'LIST_OF_LINELISTS:' '{config.linelist_file_path}'
 'SPHERICAL:'  'F'
   30
-  300.00
+  {float(config.resolution):.2f}
   15
   {turb_val:.2f}
 """
