@@ -162,8 +162,24 @@ TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
 TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
 mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_SHARD}")" "$(dirname "${LOCK_FILE}")" \
          "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
-MAX_RESUBMITS=1                                            # max automatic qsub continuation attempts (hard cap)
+MAX_RESUBMITS="${MAX_RESUBMITS:-1}"                        # max automatic qsub continuation attempts (hard cap)
 RESUBMIT_COUNT="${RESUBMIT_COUNT:-0}"                      # current automatic resubmit count (0 = first submission)
+
+if ! [[ "${MAX_RESUBMITS}" =~ ^[0-9]+$ ]]; then
+    echo "[turbospec] WARN: invalid MAX_RESUBMITS='${MAX_RESUBMITS}', defaulting to 1." >&2
+    MAX_RESUBMITS=1
+fi
+if ! [[ "${RESUBMIT_COUNT}" =~ ^[0-9]+$ ]]; then
+    echo "[turbospec] WARN: invalid RESUBMIT_COUNT='${RESUBMIT_COUNT}', defaulting to 0." >&2
+    RESUBMIT_COUNT=0
+fi
+
+STATE_FOUND=0
+if [[ -f "${NEXT_SHARD}" ]]; then
+    STATE_FOUND=1
+elif [[ -n "$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -print -quit 2>/dev/null)" ]]; then
+    STATE_FOUND=1
+fi
 
 # Force mkstemp()/tempfile users to write under designated scratch temp.
 export TMPDIR="${TMP_SYSTEM_DIR}"
@@ -178,6 +194,7 @@ echo "[turbospec] Merged: ${MERGED_ZARR}"
 echo "[turbospec] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[turbospec] Workers: ${WORKERS}"
 echo "[turbospec] Auto-resubmits used/max: ${RESUBMIT_COUNT}/${MAX_RESUBMITS}"
+echo "[turbospec] Prior shard state found: ${STATE_FOUND}"
 
 CONFIG_NUM_SAMPLES=$(
     "${PYTHON}" - <<PY
@@ -188,25 +205,17 @@ print(int((cfg.get("grid") or {}).get("num_samples", 0)))
 PY
 )
 
-if (( RESUBMIT_COUNT == 0 )); then
-    echo "[turbospec] Fresh submission detected; regenerating grid and resetting shard state (num_samples=${CONFIG_NUM_SAMPLES})."
-    rm -rf "${GRID_ZARR}"
+if (( STATE_FOUND == 1 )); then
+    echo "[turbospec] Existing shard state detected; preserving shards and counter for recovery."
+fi
+
+if [[ ! -d "${GRID_ZARR}" ]]; then
+    echo "[turbospec] Grid not found; generating grid (num_samples=${CONFIG_NUM_SAMPLES})."
     "${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
         --config "${CONFIG_PATH}" \
         --skip-synthesis
-
-    echo "[turbospec] Cleaning shard outputs and counter for a fresh run..."
-    rm -rf "${SHARDS_DIR}"
-    mkdir -p "${SHARDS_DIR}"
-    rm -f "${NEXT_SHARD}"
 else
-    echo "[turbospec] Resubmission detected (attempt ${RESUBMIT_COUNT}/${MAX_RESUBMITS}); preserving shard outputs and counter."
-    if [[ ! -d "${GRID_ZARR}" ]]; then
-        echo "[turbospec] Resume requested but grid is missing. Regenerating grid from config."
-        "${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
-            --config "${CONFIG_PATH}" \
-            --skip-synthesis
-    fi
+    echo "[turbospec] Using existing grid: ${GRID_ZARR}"
 fi
 
 if [[ ! -d "${GRID_ZARR}" ]]; then
