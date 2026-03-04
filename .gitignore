@@ -62,3 +62,12 @@ COM/contopac/*
 input_files/*
 
 */*.code-workspace
+
+# Ignore runtime configs and PBS scripts by default.
+/configs/**
+!/configs/**/
+*.pbs
+
+# Keep template files that explicitly include "_EXAMPLE" in the name.
+!/configs/**/*_EXAMPLE*
+!*_EXAMPLE*.pbs
