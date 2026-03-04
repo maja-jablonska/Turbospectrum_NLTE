@@ -300,6 +300,7 @@ Behavior summary:
 - reads default grid/shard/merged output paths from `outputs` in the pipeline config
 - uses `RUN_ROOT` for queue state/log/tmp directories (and as a fallback when output paths are missing)
 - validates shard completeness with `scripts/validate_dataset.py` before merge
+- keeps existing shard outputs across manual and automatic resubmissions, then merges all valid shards at the end (partial merge allowed if some shards remain missing)
 
 ## W&B on Gadi/HPC (MLP)
 
