@@ -138,6 +138,26 @@ CFG_MERGED_ZARR="${_cfg_lines[2]:-}"
 CFG_WORKERS="${_cfg_lines[3]:-}"
 
 WORKERS="${WORKERS_OVERRIDE:-${CFG_WORKERS:-16}}"
+if ! [[ "${WORKERS}" =~ ^[0-9]+$ ]] || (( WORKERS < 1 )); then
+    echo "[turbospec] WARN: invalid WORKERS='${WORKERS}', defaulting to 16." >&2
+    WORKERS=16
+fi
+
+DEFAULT_VALIDATE_WORKERS="${WORKERS}"
+if (( DEFAULT_VALIDATE_WORKERS > 32 )); then
+    DEFAULT_VALIDATE_WORKERS=32
+fi
+VALIDATE_WORKERS="${VALIDATE_WORKERS:-${DEFAULT_VALIDATE_WORKERS}}"
+if ! [[ "${VALIDATE_WORKERS}" =~ ^[0-9]+$ ]] || (( VALIDATE_WORKERS < 1 )); then
+    echo "[turbospec] WARN: invalid VALIDATE_WORKERS='${VALIDATE_WORKERS}', defaulting to ${DEFAULT_VALIDATE_WORKERS}." >&2
+    VALIDATE_WORKERS="${DEFAULT_VALIDATE_WORKERS}"
+fi
+
+MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-128}"
+if ! [[ "${MERGE_CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( MERGE_CHUNK_ROWS < 1 )); then
+    echo "[turbospec] WARN: invalid MERGE_CHUNK_ROWS='${MERGE_CHUNK_ROWS}', defaulting to 128." >&2
+    MERGE_CHUNK_ROWS=128
+fi
 
 GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR:-${RUN_ROOT}/grid/parameter_grid.zarr}}"
 SHARDS_DIR="${SHARDS_DIR:-${CFG_SHARDS_DIR:-${RUN_ROOT}/shards}}"
@@ -193,6 +213,8 @@ echo "[turbospec] Shards: ${SHARDS_DIR}"
 echo "[turbospec] Merged: ${MERGED_ZARR}"
 echo "[turbospec] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[turbospec] Workers: ${WORKERS}"
+echo "[turbospec] Validate workers: ${VALIDATE_WORKERS}"
+echo "[turbospec] Merge chunk rows: ${MERGE_CHUNK_ROWS}"
 echo "[turbospec] Auto-resubmits used/max: ${RESUBMIT_COUNT}/${MAX_RESUBMITS}"
 echo "[turbospec] Prior shard state found: ${STATE_FOUND}"
 
@@ -450,6 +472,9 @@ else
 
         echo "Recovery pass ${pass}/${RECOVERY_PASSES}: ${MISSING_COUNT} missing shard(s)." | tee -a "${LOG_DIR}/recovery.log"
 
+        recovery_failed=0
+        recovery_pids=()
+
         while IFS= read -r shard; do
             [[ -z "${shard}" ]] && continue
             if ! [[ "${shard}" =~ ^[0-9]+$ ]]; then
@@ -472,10 +497,31 @@ else
                 continue
             fi
 
-            if ! run_shard_attempts "${shard}" "${RECOVERY_RETRY_ATTEMPTS}" "${TMP_WORK_DIR}/recovery_pass${pass}" "${SHARD_LOG}" "${RECOVERY_JITTER_BASE}"; then
-                echo "Shard ${shard} still failed after recovery pass ${pass}." >> "${SHARD_LOG}"
+            (
+                if ! run_shard_attempts "${shard}" "${RECOVERY_RETRY_ATTEMPTS}" "${TMP_WORK_DIR}/recovery_pass${pass}" "${SHARD_LOG}" "${RECOVERY_JITTER_BASE}"; then
+                    echo "Shard ${shard} still failed after recovery pass ${pass}." >> "${SHARD_LOG}"
+                    exit 1
+                fi
+            ) &
+            recovery_pids+=("$!")
+
+            if (( ${#recovery_pids[@]} >= WORKERS )); then
+                if ! wait "${recovery_pids[0]}"; then
+                    recovery_failed=1
+                fi
+                recovery_pids=("${recovery_pids[@]:1}")
             fi
         done < "${MISSING_FILE}"
+
+        for pid in "${recovery_pids[@]}"; do
+            if ! wait "${pid}"; then
+                recovery_failed=1
+            fi
+        done
+
+        if (( recovery_failed == 1 )); then
+            echo "Recovery pass ${pass}: one or more shards still failed after retries." | tee -a "${LOG_DIR}/recovery.log"
+        fi
     done
 fi
 
@@ -489,10 +535,14 @@ FINAL_MISSING=$(wc -l < "${MISSING_FILE}" | tr -d '[:space:]')
 MERGE_EXTRA=()
 if (( FINAL_MISSING == 0 )); then
     echo "All shards recovered. Validating completeness before merge..."
+    validate_start=$(date +%s)
     ${PYTHON} ${REPO}/scripts/validate_dataset.py \
         --shard-dir "${SHARDS_DIR}" \
         --expected-shards "${ROW_COUNT}" \
+        --workers "${VALIDATE_WORKERS}" \
         | tee "${LOG_DIR}/validate.log"
+    validate_end=$(date +%s)
+    echo "[turbospec] Validation stage completed in $((validate_end - validate_start))s."
 else
     echo "WARNING: ${FINAL_MISSING} shard(s) still missing after recovery; proceeding with partial merge." | tee -a "${LOG_DIR}/recovery.log"
     echo "Missing shard list: ${MISSING_FILE}" | tee -a "${LOG_DIR}/recovery.log"
@@ -500,10 +550,14 @@ else
 fi
 
 echo "Merging shards..."
+merge_start=$(date +%s)
 ${PYTHON} ${REPO}/scripts/merge_spectra_shards.py \
     --shard-dir "${SHARDS_DIR}" \
     --grid-zarr "${GRID_ZARR}" \
     --output-zarr "${MERGED_ZARR}" \
+    --chunk-rows "${MERGE_CHUNK_ROWS}" \
     --tmp-dir "${TMP_SYSTEM_DIR}" \
     "${MERGE_EXTRA[@]}" \
     > "${LOG_DIR}/merge.log" 2>&1
+merge_end=$(date +%s)
+echo "[turbospec] Merge stage completed in $((merge_end - merge_start))s. Log: ${LOG_DIR}/merge.log"
