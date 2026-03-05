@@ -295,6 +295,12 @@ Common overrides:
 qsub -v MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json,RUN_ROOT=/scratch/mk27/$USER/turbospec,WORKERS=16 turbospectrum.pbs
 ```
 
+Post-processing tuning overrides (optional):
+
+```bash
+qsub -v WORKERS=96,VALIDATE_WORKERS=32,MERGE_CHUNK_ROWS=128 turbospectrum.pbs
+```
+
 Behavior summary:
 - uses the one-config pipeline (`pipeline_from_config.py --synthesis-mode sharded`) for shard generation
 - reads default grid/shard/merged output paths from `outputs` in the pipeline config

@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -155,6 +156,15 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
         return False, {"exception": str(e)}
 
 
+def _validate_one_shard(path: Path, reference_wavelength, *, enforce_provenance: bool):
+    ok, info = validate_shard(
+        path,
+        reference_wavelength,
+        enforce_provenance=enforce_provenance,
+    )
+    return path.name, ok, info
+
+
 ############################################
 # Completeness Check
 ############################################
@@ -192,7 +202,13 @@ def check_completeness(shards, expected_count):
 # Main Validator
 ############################################
 
-def validate_dataset(shard_dir: Path, expected_shards: int, *, allow_incomplete_provenance: bool):
+def validate_dataset(
+    shard_dir: Path,
+    expected_shards: int,
+    *,
+    allow_incomplete_provenance: bool,
+    workers: int = 1,
+):
 
     shards = sorted(shard_dir.glob("spectra_shard_*.zarr"))
 
@@ -232,26 +248,53 @@ def validate_dataset(shard_dir: Path, expected_shards: int, *, allow_incomplete_
     # Deep validation
     ##################################################
 
+    workers = max(int(workers), 1)
     reference_wavelength = None
+    for shard in shards:
+        if not is_valid_zarr(shard):
+            continue
+        try:
+            root = zarr.open_group(shard, mode="r")
+            if "wavelength" in root:
+                reference_wavelength = root["wavelength"][:]
+                break
+        except Exception:
+            continue
+
     total_spectra = 0
     failures = []
+    results_by_name = {}
+    enforce_provenance = not allow_incomplete_provenance
+
+    if workers == 1:
+        for shard in shards:
+            name, ok, info = _validate_one_shard(
+                shard,
+                reference_wavelength,
+                enforce_provenance=enforce_provenance,
+            )
+            results_by_name[name] = (ok, info)
+    else:
+        print(f"Deep validation using {workers} worker threads")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(
+                    _validate_one_shard,
+                    shard,
+                    reference_wavelength,
+                    enforce_provenance=enforce_provenance,
+                ): shard
+                for shard in shards
+            }
+            for future in as_completed(future_map):
+                name, ok, info = future.result()
+                results_by_name[name] = (ok, info)
 
     for shard in shards:
-
-        ok, info = validate_shard(
-            shard,
-            reference_wavelength,
-            enforce_provenance=not allow_incomplete_provenance,
-        )
-
+        ok, info = results_by_name[shard.name]
         if not ok:
             failures.append((shard.name, info))
             continue
-
-        if reference_wavelength is None:
-            root = zarr.open_group(shard, mode="r")
-            reference_wavelength = root["wavelength"][:]
-
         total_spectra += info["spectra"]
 
     ##################################################
@@ -298,6 +341,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Allow shards that do not satisfy provenance/hash contract fields.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker threads for deep shard validation.",
+    )
 
     args = parser.parse_args()
 
@@ -305,4 +354,5 @@ if __name__ == "__main__":
         Path(args.shard_dir),
         args.expected_shards,
         allow_incomplete_provenance=bool(args.allow_incomplete_provenance),
+        workers=int(args.workers),
     )
