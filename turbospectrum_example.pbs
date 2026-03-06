@@ -180,26 +180,9 @@ SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
 TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
+MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_SHARD}")" "$(dirname "${LOCK_FILE}")" \
          "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
-MAX_RESUBMITS="${MAX_RESUBMITS:-1}"                        # max automatic qsub continuation attempts (hard cap)
-RESUBMIT_COUNT="${RESUBMIT_COUNT:-0}"                      # current automatic resubmit count (0 = first submission)
-
-if ! [[ "${MAX_RESUBMITS}" =~ ^[0-9]+$ ]]; then
-    echo "[turbospec] WARN: invalid MAX_RESUBMITS='${MAX_RESUBMITS}', defaulting to 1." >&2
-    MAX_RESUBMITS=1
-fi
-if ! [[ "${RESUBMIT_COUNT}" =~ ^[0-9]+$ ]]; then
-    echo "[turbospec] WARN: invalid RESUBMIT_COUNT='${RESUBMIT_COUNT}', defaulting to 0." >&2
-    RESUBMIT_COUNT=0
-fi
-
-STATE_FOUND=0
-if [[ -f "${NEXT_SHARD}" ]]; then
-    STATE_FOUND=1
-elif [[ -n "$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -print -quit 2>/dev/null)" ]]; then
-    STATE_FOUND=1
-fi
 
 # Force mkstemp()/tempfile users to write under designated scratch temp.
 export TMPDIR="${TMP_SYSTEM_DIR}"
@@ -215,8 +198,8 @@ echo "[turbospec] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[turbospec] Workers: ${WORKERS}"
 echo "[turbospec] Validate workers: ${VALIDATE_WORKERS}"
 echo "[turbospec] Merge chunk rows: ${MERGE_CHUNK_ROWS}"
-echo "[turbospec] Auto-resubmits used/max: ${RESUBMIT_COUNT}/${MAX_RESUBMITS}"
-echo "[turbospec] Prior shard state found: ${STATE_FOUND}"
+echo "[turbospec] Missing shard report: ${MISSING_FILE}"
+echo "[turbospec] Run policy: no auto-resubmit, no post-pass recovery."
 
 CONFIG_NUM_SAMPLES=$(
     "${PYTHON}" - <<PY
@@ -226,10 +209,6 @@ with open(r"${CONFIG_PATH}", "r", encoding="utf-8") as f:
 print(int((cfg.get("grid") or {}).get("num_samples", 0)))
 PY
 )
-
-if (( STATE_FOUND == 1 )); then
-    echo "[turbospec] Existing shard state detected; preserving shards and counter for recovery."
-fi
 
 if [[ ! -d "${GRID_ZARR}" ]]; then
     echo "[turbospec] Grid not found; generating grid (num_samples=${CONFIG_NUM_SAMPLES})."
@@ -264,13 +243,18 @@ PY
 echo "Grid rows: ${ROW_COUNT}"
 
 ############################################
-# Initialize atomic counter (ONLY once)
+# Fresh run setup
 ############################################
 
-if [[ ! -f "${NEXT_SHARD}" ]]; then
-    echo "Initializing shard counter"
-    echo 0 > "${NEXT_SHARD}"
+if [[ -z "${SHARDS_DIR}" || "${SHARDS_DIR}" == "/" ]]; then
+    echo "[turbospec] ERROR: unsafe SHARDS_DIR='${SHARDS_DIR}' for fresh-run cleanup." >&2
+    exit 1
 fi
+echo "[turbospec] Clearing previous shard outputs (fresh run)."
+find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
+echo 0 > "${NEXT_SHARD}"
+rm -f "${MISSING_FILE}"
+echo "[turbospec] Shard counter reset: ${NEXT_SHARD}=0"
 
 ############################################
 # Walltime guard
@@ -282,10 +266,6 @@ START_TIME=$(date +%s)
 SAFETY_BUFFER="${SAFETY_BUFFER:-900}"  # stop 15 minutes early
 EST_RUNTIME="${EST_RUNTIME:-600}"      # expected shard runtime (tune later)
 SHARD_RETRY_ATTEMPTS="${SHARD_RETRY_ATTEMPTS:-3}"          # attempts during the main worker loop
-RECOVERY_PASSES="${RECOVERY_PASSES:-2}"                    # post-pass missing-shard recovery passes
-RECOVERY_RETRY_ATTEMPTS="${RECOVERY_RETRY_ATTEMPTS:-2}"    # attempts per shard in each recovery pass
-RECOVERY_JITTER_BASE="${RECOVERY_JITTER_BASE:-20}"         # backoff base (seconds)
-MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 
 time_left () {
     echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
@@ -338,18 +318,6 @@ run_shard_attempts () {
     done
 
     return 1
-}
-
-resubmit_self () {
-    if (( RESUBMIT_COUNT >= MAX_RESUBMITS )); then
-        echo "[turbospec] Auto-resubmit limit reached (${RESUBMIT_COUNT}/${MAX_RESUBMITS}); not resubmitting."
-        return 1
-    fi
-
-    local next_resubmit
-    next_resubmit=$((RESUBMIT_COUNT + 1))
-    echo "[turbospec] Resubmitting for remaining/failed shards (attempt ${next_resubmit}/${MAX_RESUBMITS})."
-    qsub -v "PYTHON_BIN=${PYTHON_BIN},MAMBA_ENV_NAME=${MAMBA_ENV_NAME},PROJECT=${PROJECT},USER_ID=${USER_ID},RUN_ROOT=${RUN_ROOT},REPO=${REPO},CONFIG_PATH=${CONFIG_PATH},GRID_ZARR=${GRID_ZARR},SHARDS_DIR=${SHARDS_DIR},MERGED_ZARR=${MERGED_ZARR},NEXT_SHARD=${NEXT_SHARD},LOCK_FILE=${LOCK_FILE},LOG_DIR=${LOG_DIR},WORKERS=${WORKERS},SAFETY_BUFFER=${SAFETY_BUFFER},EST_RUNTIME=${EST_RUNTIME},SHARD_RETRY_ATTEMPTS=${SHARD_RETRY_ATTEMPTS},RECOVERY_PASSES=${RECOVERY_PASSES},RECOVERY_RETRY_ATTEMPTS=${RECOVERY_RETRY_ATTEMPTS},RECOVERY_JITTER_BASE=${RECOVERY_JITTER_BASE},MISSING_FILE=${MISSING_FILE},MAX_RESUBMITS=${MAX_RESUBMITS},RESUBMIT_COUNT=${next_resubmit},SCRATCH_TMP_ROOT=${SCRATCH_TMP_ROOT},TMP_SYSTEM_DIR=${TMP_SYSTEM_DIR},TMP_WORK_DIR=${TMP_WORK_DIR},TMP_OUTPUT_DIR=${TMP_OUTPUT_DIR}" "$0"
 }
 
 ############################################
@@ -437,104 +405,23 @@ done
 
 wait
 
-############################################
-# Auto-resubmit if shards remain
-############################################
-
 CURRENT=$(cat ${NEXT_SHARD})
 
 if (( CURRENT < ROW_COUNT )); then
-    echo "Shards remaining ($CURRENT / $ROW_COUNT)."
-    if resubmit_self; then
-        exit 0
-    fi
-    echo "[turbospec] Continuing without further resubmits."
+    echo "[turbospec] NOTICE: walltime ended before all shard IDs were assigned (${CURRENT}/${ROW_COUNT})."
 fi
 
 mkdir -p "$(dirname "${MISSING_FILE}")"
-
-if (( RESUBMIT_COUNT >= MAX_RESUBMITS )); then
-    echo "[turbospec] Job has already been resubmitted once (${RESUBMIT_COUNT}/${MAX_RESUBMITS}); skipping recovery and merging current results as-is."
-else
-    echo "All shard IDs assigned. Running post-pass recovery for failed shards..."
-    for ((pass=1; pass<=RECOVERY_PASSES; pass++)); do
-        ${PYTHON} ${REPO}/scripts/find_missing_shards.py \
-            --shard-dir "${SHARDS_DIR}" \
-            --expected-shards "${ROW_COUNT}" \
-            --output "${MISSING_FILE}" \
-            2>> "${LOG_DIR}/recovery.log"
-
-        MISSING_COUNT=$(wc -l < "${MISSING_FILE}" | tr -d '[:space:]')
-        if (( MISSING_COUNT == 0 )); then
-            echo "Recovery pass ${pass}: no missing shards left." | tee -a "${LOG_DIR}/recovery.log"
-            break
-        fi
-
-        echo "Recovery pass ${pass}/${RECOVERY_PASSES}: ${MISSING_COUNT} missing shard(s)." | tee -a "${LOG_DIR}/recovery.log"
-
-        recovery_failed=0
-        recovery_pids=()
-
-        while IFS= read -r shard; do
-            [[ -z "${shard}" ]] && continue
-            if ! [[ "${shard}" =~ ^[0-9]+$ ]]; then
-                echo "Skipping invalid shard id '${shard}' in ${MISSING_FILE}" | tee -a "${LOG_DIR}/recovery.log"
-                continue
-            fi
-
-            if (( $(time_left) < EST_RUNTIME + SAFETY_BUFFER )); then
-                echo "Low walltime during recovery; resubmitting job for continuation." | tee -a "${LOG_DIR}/recovery.log"
-                if resubmit_self; then
-                    exit 0
-                fi
-                echo "[turbospec] Recovery continuation skipped because auto-resubmit limit is reached." | tee -a "${LOG_DIR}/recovery.log"
-                break
-            fi
-
-            SHARD_OUT="${SHARDS_DIR}/spectra_shard_${shard}.zarr"
-            SHARD_LOG="${LOG_DIR}/shard_${shard}.recovery_pass${pass}.log"
-            if is_valid_shard "${SHARD_OUT}"; then
-                continue
-            fi
-
-            (
-                if ! run_shard_attempts "${shard}" "${RECOVERY_RETRY_ATTEMPTS}" "${TMP_WORK_DIR}/recovery_pass${pass}" "${SHARD_LOG}" "${RECOVERY_JITTER_BASE}"; then
-                    echo "Shard ${shard} still failed after recovery pass ${pass}." >> "${SHARD_LOG}"
-                    exit 1
-                fi
-            ) &
-            recovery_pids+=("$!")
-
-            if (( ${#recovery_pids[@]} >= WORKERS )); then
-                if ! wait "${recovery_pids[0]}"; then
-                    recovery_failed=1
-                fi
-                recovery_pids=("${recovery_pids[@]:1}")
-            fi
-        done < "${MISSING_FILE}"
-
-        for pid in "${recovery_pids[@]}"; do
-            if ! wait "${pid}"; then
-                recovery_failed=1
-            fi
-        done
-
-        if (( recovery_failed == 1 )); then
-            echo "Recovery pass ${pass}: one or more shards still failed after retries." | tee -a "${LOG_DIR}/recovery.log"
-        fi
-    done
-fi
-
 ${PYTHON} ${REPO}/scripts/find_missing_shards.py \
     --shard-dir "${SHARDS_DIR}" \
     --expected-shards "${ROW_COUNT}" \
     --output "${MISSING_FILE}" \
-    2>> "${LOG_DIR}/recovery.log"
+    2>> "${LOG_DIR}/missing.log"
 FINAL_MISSING=$(wc -l < "${MISSING_FILE}" | tr -d '[:space:]')
 
 MERGE_EXTRA=()
 if (( FINAL_MISSING == 0 )); then
-    echo "All shards recovered. Validating completeness before merge..."
+    echo "All shards present. Validating completeness before merge..."
     validate_start=$(date +%s)
     ${PYTHON} ${REPO}/scripts/validate_dataset.py \
         --shard-dir "${SHARDS_DIR}" \
@@ -544,8 +431,14 @@ if (( FINAL_MISSING == 0 )); then
     validate_end=$(date +%s)
     echo "[turbospec] Validation stage completed in $((validate_end - validate_start))s."
 else
-    echo "WARNING: ${FINAL_MISSING} shard(s) still missing after recovery; proceeding with partial merge." | tee -a "${LOG_DIR}/recovery.log"
-    echo "Missing shard list: ${MISSING_FILE}" | tee -a "${LOG_DIR}/recovery.log"
+    echo "WARNING: ${FINAL_MISSING} shard(s) missing from this run; merging existing shards only." | tee -a "${LOG_DIR}/missing.log"
+    echo "Missing shard list: ${MISSING_FILE}" | tee -a "${LOG_DIR}/missing.log"
+    echo "First 20 missing shard IDs:"
+    head -n 20 "${MISSING_FILE}"
+    if (( FINAL_MISSING >= ROW_COUNT )); then
+        echo "[turbospec] ERROR: no valid shards were produced; nothing to merge." >&2
+        exit 2
+    fi
     MERGE_EXTRA+=(--allow-missing)
 fi
 
