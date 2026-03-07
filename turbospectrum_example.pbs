@@ -251,7 +251,7 @@ if [[ -z "${SHARDS_DIR}" || "${SHARDS_DIR}" == "/" ]]; then
     exit 1
 fi
 echo "[turbospec] Clearing previous shard outputs (fresh run)."
-find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
+find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name '*.zarr' -exec rm -rf {} +
 echo 0 > "${NEXT_SHARD}"
 rm -f "${MISSING_FILE}"
 echo "[turbospec] Shard counter reset: ${NEXT_SHARD}=0"
@@ -260,7 +260,33 @@ echo "[turbospec] Shard counter reset: ${NEXT_SHARD}=0"
 # Walltime guard
 ############################################
 
-WALLTIME_SECONDS=$((12*3600))
+walltime_to_seconds () {
+    local raw="$1"
+    if [[ -z "${raw}" ]]; then
+        echo ""
+        return 0
+    fi
+    if [[ "${raw}" =~ ^[0-9]+$ ]]; then
+        echo "${raw}"
+        return 0
+    fi
+    if [[ "${raw}" =~ ^([0-9]+):([0-9]{2}):([0-9]{2})$ ]]; then
+        local hh mm ss
+        hh="${BASH_REMATCH[1]}"
+        mm="${BASH_REMATCH[2]}"
+        ss="${BASH_REMATCH[3]}"
+        echo $((10#${hh} * 3600 + 10#${mm} * 60 + 10#${ss}))
+        return 0
+    fi
+    echo ""
+}
+
+WALLTIME_RAW="${WALLTIME_SECONDS:-${PBS_WALLTIME:-${PBS_RESOURCE_LIST_WALLTIME:-}}}"
+WALLTIME_SECONDS="$(walltime_to_seconds "${WALLTIME_RAW}")"
+if ! [[ "${WALLTIME_SECONDS}" =~ ^[0-9]+$ ]] || (( WALLTIME_SECONDS < 1 )); then
+    WALLTIME_SECONDS=$((12*3600))
+    echo "[turbospec] WARN: could not parse walltime from '${WALLTIME_RAW:-<unset>}' — defaulting to ${WALLTIME_SECONDS}s." >&2
+fi
 START_TIME=$(date +%s)
 
 SAFETY_BUFFER="${SAFETY_BUFFER:-900}"  # stop 15 minutes early
@@ -271,15 +297,6 @@ time_left () {
     echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
 }
 
-is_valid_shard () {
-    local shard_path="$1"
-    ${PYTHON} - <<PY >/dev/null 2>&1
-import zarr
-root = zarr.open_group(r"${shard_path}", mode="r")
-assert "flux" in root and "wavelength" in root and root["flux"].shape[0] > 0
-PY
-}
-
 run_shard_attempts () {
     local shard="$1"
     local max_attempts="$2"
@@ -287,7 +304,6 @@ run_shard_attempts () {
     local log_file="$4"
     local sleep_base="$5"
 
-    local out="${SHARDS_DIR}/spectra_shard_${shard}.zarr"
     local tmp_out="${TMP_OUTPUT_DIR}/spectra_shard_${shard}.a$$.tmp.zarr"
 
     for ((attempt=1; attempt<=max_attempts; attempt++)); do
@@ -296,7 +312,7 @@ run_shard_attempts () {
         attempt_scratch="${scratch_root}/shard_${shard}_a${attempt}"
         mkdir -p "${attempt_scratch}"
 
-        ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
+        if ${PYTHON} ${REPO}/scripts/pipeline_from_config.py \
           --config "${CONFIG_PATH}" \
           --skip-grid \
           --synthesis-mode sharded \
@@ -305,19 +321,59 @@ run_shard_attempts () {
           --workers 1 \
           --scratch "${attempt_scratch}" \
           --output "${tmp_out}" \
-          >> "${log_file}" 2>&1 || true
-
-        if is_valid_shard "${out}"; then
+          >> "${log_file}" 2>&1; then
             end=$(date +%s)
             echo "runtime_seconds=$((end-start)) attempt=${attempt}" >> "${log_file}"
             return 0
         fi
 
-        rm -rf "${tmp_out}" "${out}"
+        rm -rf "${tmp_out}"
         sleep $(( (RANDOM % 10) + attempt * sleep_base ))
     done
 
     return 1
+}
+
+write_missing_shards_file () {
+    ${PYTHON} - <<PY
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import zarr
+
+shard_dir = Path(r"${SHARDS_DIR}")
+expected = int(r"${ROW_COUNT}")
+out_path = Path(r"${MISSING_FILE}")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+seen: set[int] = set()
+for shard_path in sorted(shard_dir.glob("*.zarr")):
+    try:
+        root = zarr.open_group(str(shard_path), mode="r")
+    except Exception:
+        continue
+    if "global_index" not in root:
+        continue
+    try:
+        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
+    except Exception:
+        continue
+    if gidx.ndim != 1 or gidx.size == 0:
+        continue
+    valid = gidx[(gidx >= 0) & (gidx < expected)]
+    if valid.size:
+        seen.update(int(x) for x in valid.tolist())
+
+missing = sorted(set(range(expected)) - seen)
+text = "\n".join(str(x) for x in missing)
+out_path.write_text(f"{text}\n" if text else "", encoding="utf-8")
+print(
+    f"[missing-shards] expected={expected} seen={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('*.zarr')))}",
+    file=sys.stderr,
+)
+PY
 }
 
 ############################################
@@ -370,16 +426,6 @@ worker() {
             break
         fi
 
-        OUT=${SHARDS_DIR}/spectra_shard_${shard}.zarr
-
-        #################################
-        # Skip valid shards
-        #################################
-
-        if is_valid_shard "${OUT}"; then
-            continue
-        fi
-
         #################################
         # Retry with jitter
         #################################
@@ -412,45 +458,12 @@ if (( CURRENT < ROW_COUNT )); then
 fi
 
 mkdir -p "$(dirname "${MISSING_FILE}")"
-${PYTHON} ${REPO}/scripts/find_missing_shards.py \
-    --shard-dir "${SHARDS_DIR}" \
-    --expected-shards "${ROW_COUNT}" \
-    --output "${MISSING_FILE}" \
-    2>> "${LOG_DIR}/missing.log"
+write_missing_shards_file 2>> "${LOG_DIR}/missing.log"
 FINAL_MISSING=$(wc -l < "${MISSING_FILE}" | tr -d '[:space:]')
 
-MERGE_EXTRA=()
-if (( FINAL_MISSING == 0 )); then
-    echo "All shards present. Validating completeness before merge..."
-    validate_start=$(date +%s)
-    ${PYTHON} ${REPO}/scripts/validate_dataset.py \
-        --shard-dir "${SHARDS_DIR}" \
-        --expected-shards "${ROW_COUNT}" \
-        --workers "${VALIDATE_WORKERS}" \
-        | tee "${LOG_DIR}/validate.log"
-    validate_end=$(date +%s)
-    echo "[turbospec] Validation stage completed in $((validate_end - validate_start))s."
-else
-    echo "WARNING: ${FINAL_MISSING} shard(s) missing from this run; merging existing shards only." | tee -a "${LOG_DIR}/missing.log"
-    echo "Missing shard list: ${MISSING_FILE}" | tee -a "${LOG_DIR}/missing.log"
-    echo "First 20 missing shard IDs:"
+echo "[turbospec] Failed shard report written: ${MISSING_FILE} (count=${FINAL_MISSING})"
+if (( FINAL_MISSING > 0 )); then
+    echo "First 20 failed shard IDs:"
     head -n 20 "${MISSING_FILE}"
-    if (( FINAL_MISSING >= ROW_COUNT )); then
-        echo "[turbospec] ERROR: no valid shards were produced; nothing to merge." >&2
-        exit 2
-    fi
-    MERGE_EXTRA+=(--allow-missing)
 fi
-
-echo "Merging shards..."
-merge_start=$(date +%s)
-${PYTHON} ${REPO}/scripts/merge_spectra_shards.py \
-    --shard-dir "${SHARDS_DIR}" \
-    --grid-zarr "${GRID_ZARR}" \
-    --output-zarr "${MERGED_ZARR}" \
-    --chunk-rows "${MERGE_CHUNK_ROWS}" \
-    --tmp-dir "${TMP_SYSTEM_DIR}" \
-    "${MERGE_EXTRA[@]}" \
-    > "${LOG_DIR}/merge.log" 2>&1
-merge_end=$(date +%s)
-echo "[turbospec] Merge stage completed in $((merge_end - merge_start))s. Log: ${LOG_DIR}/merge.log"
+echo "[turbospec] No validation or merge requested; exiting."
