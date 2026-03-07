@@ -466,4 +466,33 @@ if (( FINAL_MISSING > 0 )); then
     echo "First 20 failed shard IDs:"
     head -n 20 "${MISSING_FILE}"
 fi
-echo "[turbospec] No validation or merge requested; exiting."
+
+echo "[turbospec] Validating shard outputs..."
+set +e
+"${PYTHON}" "${REPO}/scripts/validate_dataset.py" \
+    --shard-dir "${SHARDS_DIR}" \
+    --expected-shards "${ROW_COUNT}" \
+    --workers "${VALIDATE_WORKERS}"
+VALIDATE_RC=$?
+set -e
+if (( VALIDATE_RC != 0 )); then
+    echo "[turbospec] WARN: validation exited with code ${VALIDATE_RC}; continuing with merge."
+fi
+
+MERGE_CMD=(
+    "${PYTHON}" "${REPO}/scripts/merge_spectra_shards.py"
+    --shard-dir "${SHARDS_DIR}"
+    --grid-zarr "${GRID_ZARR}"
+    --output-zarr "${MERGED_ZARR}"
+    --chunk-rows "${MERGE_CHUNK_ROWS}"
+    --tmp-dir "${TMP_SYSTEM_DIR}"
+)
+
+if (( FINAL_MISSING > 0 )); then
+    echo "[turbospec] WARN: missing shards detected; enabling partial merge (--allow-missing --skip-nonexistent-shards)."
+    MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
+fi
+
+echo "[turbospec] Merging shard outputs..."
+"${MERGE_CMD[@]}"
+echo "[turbospec] Merge complete: ${MERGED_ZARR}"

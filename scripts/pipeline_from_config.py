@@ -181,7 +181,7 @@ def main() -> None:
         print("Skipping grid generation.")
 
     if args.skip_synthesis:
-        print("Skipping synthesis.")
+        print("Synthesis deferred for this invocation (--skip-synthesis).")
         return
 
     ts_cfg_path = _write_temp_turbospectrum_config(pipeline_cfg, config_dir=cfg_dir, scratch=scratch)
