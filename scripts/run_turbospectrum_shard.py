@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
+import errno
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
-import copy
-import re
-import subprocess
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -253,6 +255,34 @@ def _write_string_scalar(root, name: str, value: str) -> None:
             arr[0] = str(value)
             return
     _write_string_1d(root, name, [str(value)], chunks=1)
+
+
+def _finalize_zarr_store(write_path: str, final_path: str, *, logger: logging.Logger, label: str) -> None:
+    """Move a completed Zarr directory into place.
+
+    On the same filesystem we keep the atomic rename. Across filesystems, fall
+    back to copy+delete so scratch-backed temp outputs still complete.
+    """
+    if write_path == final_path:
+        return
+
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    try:
+        os.rename(write_path, final_path)
+        logger.info("%s written to %s (atomic rename)", label, final_path)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    logger.warning(
+        "Cross-filesystem move for %s detected; falling back to copy+delete from %s to %s",
+        label.lower(),
+        write_path,
+        final_path,
+    )
+    shutil.move(write_path, final_path)
+    logger.info("%s written to %s (copy+delete fallback)", label, final_path)
 
 
 def _git_commit(project_root: str) -> str:
@@ -894,8 +924,7 @@ def main():
         for name, value in provenance_payload.items():
             _write_string_scalar(prov, name, str(value))
         if write_path != final_path:
-            os.rename(write_path, final_path)
-            logger.info("Empty shard written to %s (atomic rename)", final_path)
+            _finalize_zarr_store(write_path, final_path, logger=logger, label="Empty shard")
         else:
             logger.info("Empty shard written to %s", final_path)
         return
@@ -1093,8 +1122,7 @@ def main():
         _write_string_scalar(prov, name, str(value))
 
     if write_path != final_path:
-        os.rename(write_path, final_path)
-        logger.info("Shard written to %s (atomic rename)", final_path)
+        _finalize_zarr_store(write_path, final_path, logger=logger, label="Shard")
     else:
         logger.info("Shard written to %s", final_path)
 
