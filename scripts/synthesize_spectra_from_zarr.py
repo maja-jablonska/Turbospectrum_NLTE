@@ -35,12 +35,14 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from run_turbospectrum import (  # noqa: E402
+    LinelistValidationError,
     TurbospectrumConfig,
     _normalize_config_dict,
     create_linelist_file,
     determine_worker_count,
     ensure_directories,
     get_model_filename,
+    resolve_linelist_paths,
     run_single_synthesis,
 )
 from provenance_contract import (  # noqa: E402
@@ -277,18 +279,7 @@ def _git_commit(project_root: str) -> str:
 
 
 def _resolve_linelist_paths(config: TurbospectrumConfig) -> List[str]:
-    out: List[str] = []
-    seen: set[str] = set()
-    for item in (config.linelist_files or []):
-        raw = str(item).strip()
-        if not raw:
-            continue
-        path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(str(config.linelist_path), raw))
-        if path in seen:
-            continue
-        seen.add(path)
-        out.append(path)
-    return out
+    return resolve_linelist_paths(str(config.linelist_path), config.linelist_files)
 
 
 def _resolve_synthesis_binary_paths(config: TurbospectrumConfig, project_root: str) -> List[str]:
@@ -864,7 +855,11 @@ def main() -> None:
         config.output_dir = os.path.join(scratch, "spectra")
         config.model_opac_dir = os.path.join(scratch, "opac")
     ensure_directories(config)
-    config.linelist_file_path = create_linelist_file(config)
+    try:
+        config.linelist_file_path = create_linelist_file(config)
+    except LinelistValidationError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
 
     grid_store = _zarr_store(args.grid_zarr)
     grid_root = zarr.open_group(store=grid_store, mode="r")
