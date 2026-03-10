@@ -11,17 +11,19 @@ single-node bottlenecks where possible.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
+import errno
+import hashlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
-import copy
-import re
 import warnings
-import hashlib
-import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -422,6 +424,30 @@ def _write_fixed_string_scalar(root, name: str, value: str, min_width: int, comp
         arr[...] = sval
     except Exception:
         _write_string_scalar(root, name, sval, compression_kwargs=compression_kwargs)
+
+
+def _finalize_zarr_store(write_path: str, final_path: str, *, logger: logging.Logger, label: str) -> None:
+    """Move a completed Zarr directory into place."""
+    if write_path == final_path:
+        return
+
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    try:
+        os.rename(write_path, final_path)
+        logger.info("%s written to %s (atomic rename)", label, final_path)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    logger.warning(
+        "Cross-filesystem move for %s detected; falling back to copy+delete from %s to %s",
+        label.lower(),
+        write_path,
+        final_path,
+    )
+    shutil.move(write_path, final_path)
+    logger.info("%s written to %s (copy+delete fallback)", label, final_path)
 
 
 def _to_u32_param_names(values: Sequence[str]) -> np.ndarray:
@@ -1101,8 +1127,7 @@ def main() -> None:
         logger=logger,
     )
     if write_path != final_path:
-        os.rename(write_path, final_path)
-        logger.info("Atomic rename: %s -> %s", write_path, final_path)
+        _finalize_zarr_store(write_path, final_path, logger=logger, label="Synthesis Zarr")
     logger.info("Completed synthesis in %.2fs", time.perf_counter() - t0)
 
 

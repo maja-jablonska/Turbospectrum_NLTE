@@ -479,6 +479,13 @@ if (( VALIDATE_RC != 0 )); then
     echo "[turbospec] WARN: validation exited with code ${VALIDATE_RC}; continuing with merge."
 fi
 
+SHARD_STORE_COUNT=$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name '*.zarr' | wc -l | tr -d '[:space:]')
+if (( SHARD_STORE_COUNT == 0 )); then
+    echo "[turbospec] ERROR: no shard stores were produced in ${SHARDS_DIR}; skipping merge." >&2
+    echo "[turbospec] ERROR: inspect ${LOG_DIR}/shard_*.log for worker failures." >&2
+    exit 1
+fi
+
 MERGE_CMD=(
     "${PYTHON}" "${REPO}/scripts/merge_spectra_shards.py"
     --shard-dir "${SHARDS_DIR}"
