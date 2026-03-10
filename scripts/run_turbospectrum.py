@@ -47,6 +47,10 @@ def _normalize_output_mode(raw: Any) -> str:
     raise ValueError(f"output_mode must be 'Flux' or 'Intensity', got {raw!r}")
 
 
+class LinelistValidationError(ValueError):
+    """Raised when configured linelist files fail upfront validation."""
+
+
 def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     """
     Normalize config JSON to the flat schema expected by TurbospectrumConfig.
@@ -528,16 +532,109 @@ def determine_worker_count(config: TurbospectrumConfig) -> int:
 
     return worker_count
 
+def resolve_linelist_paths(linelist_path: str, linelist_files: Optional[List[str]]) -> List[str]:
+    """Resolve linelist entries into absolute file paths.
+
+    Supports explicit files, glob patterns such as ``dir/*``, and bare
+    directories, which are expanded to all files in that directory.
+    """
+    out: List[str] = []
+    seen: set[str] = set()
+    base_dir = str(linelist_path or "")
+
+    for item in (linelist_files or []):
+        raw = str(item).strip()
+        if not raw:
+            continue
+
+        candidate = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(base_dir, raw))
+
+        if glob.has_magic(candidate):
+            matches = sorted(os.path.abspath(path) for path in glob.glob(candidate))
+            paths = [path for path in matches if os.path.isfile(path)]
+            if not paths:
+                raise FileNotFoundError(f"linelist pattern {raw!r} matched no files")
+        elif os.path.isdir(candidate):
+            matches = sorted(
+                os.path.abspath(os.path.join(candidate, name))
+                for name in os.listdir(candidate)
+                if not name.startswith(".")
+            )
+            paths = [path for path in matches if os.path.isfile(path)]
+            if not paths:
+                raise FileNotFoundError(f"linelist directory {raw!r} contained no files")
+        else:
+            paths = [candidate]
+
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            out.append(path)
+
+    return out
+
+
+def validate_linelist_files(linelist_path: str, linelist_files: Optional[List[str]]) -> List[str]:
+    """Resolve and sanity-check linelist files before launching synthesis."""
+    try:
+        resolved = resolve_linelist_paths(linelist_path, linelist_files)
+    except FileNotFoundError as exc:
+        raise LinelistValidationError(f"Invalid linelist configuration: {exc}") from exc
+
+    if not resolved:
+        raise LinelistValidationError(
+            "Invalid linelist configuration: no linelist files were resolved from linelist_files"
+        )
+
+    issues: List[str] = []
+    for path in resolved:
+        if not os.path.exists(path):
+            issues.append(f"{path}: file does not exist")
+            continue
+        if not os.path.isfile(path):
+            issues.append(f"{path}: not a regular file")
+            continue
+        if not os.access(path, os.R_OK):
+            issues.append(f"{path}: file is not readable")
+            continue
+
+        try:
+            size_bytes = os.path.getsize(path)
+        except OSError as exc:
+            issues.append(f"{path}: could not read file metadata ({exc})")
+            continue
+        if size_bytes <= 0:
+            issues.append(f"{path}: file is empty and appears corrupted")
+            continue
+
+        try:
+            with open(path, "rb") as handle:
+                sample = handle.read(4096)
+        except OSError as exc:
+            issues.append(f"{path}: could not read file contents ({exc})")
+            continue
+
+        if not sample:
+            issues.append(f"{path}: file is empty and appears corrupted")
+            continue
+        if b"\x00" in sample:
+            issues.append(f"{path}: file contains NUL bytes and appears corrupted")
+
+    if issues:
+        details = "\n".join(f" - {issue}" for issue in issues)
+        raise LinelistValidationError(
+            "Invalid linelist input. Fix linelist_path/linelist_files before rerunning:\n"
+            f"{details}"
+        )
+
+    return resolved
+
 def create_linelist_file(config: TurbospectrumConfig) -> str:
     """Creates a file containing the list of linelists to use."""
     list_file_path = os.path.join(config.tmp_dir, "linelists.txt")
     with open(list_file_path, "w") as f:
-        for linelist in config.linelist_files:
-            # If it's an absolute path, use it. Otherwise join with linelist_path
-            if os.path.isabs(linelist):
-                path = linelist
-            else:
-                path = os.path.join(config.linelist_path, linelist)
+        for path in validate_linelist_files(config.linelist_path, config.linelist_files):
             f.write(f"{path}\n") # Turbospectrum does not want quotes in the list file apparently
             
     return list_file_path
@@ -1005,7 +1102,11 @@ def main():
     # config.output_mode = "Intensity"
     # config.mu_angles = [1.0, 0.8, 0.6, 0.4, 0.2]
     
-    run_grid(config, grid_points)
+    try:
+        run_grid(config, grid_points)
+    except LinelistValidationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 if __name__ == "__main__":
     main()
