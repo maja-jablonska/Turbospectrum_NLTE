@@ -24,6 +24,7 @@ DEFAULT_PARAMETER_CONFIG = {
     'r': ["+0.00"],
     's': ["+0.00"],
 }
+LEGACY_ABUNDANCE_KEYS = ("a", "c", "n", "o", "r", "s")
 
 
 def _default_run_root() -> str:
@@ -186,6 +187,13 @@ def _choose_series(raw_value: Any, rng: np.random.Generator, length: int, name: 
     return np.full(length, raw_value, dtype=object)
 
 
+def _ordered_abundance_keys(abund_cfg: Mapping[str, Any]) -> List[str]:
+    configured = {str(key).strip() for key in (abund_cfg or {}).keys() if str(key).strip()}
+    ordered: List[str] = [key for key in LEGACY_ABUNDANCE_KEYS if key in configured]
+    ordered.extend(sorted(configured.difference(ordered)))
+    return ordered
+
+
 def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) -> Dict[str, np.ndarray]:
     """
     Build ML-style sampled parameter columns from
@@ -207,7 +215,7 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
     abund_cfg = config.get("abundances") or {}
     sampled_abundances: List[str] = []
     fixed_abundances: Dict[str, str] = {}
-    for element in ["a", "c", "n", "o", "r", "s"]:
+    for element in _ordered_abundance_keys(abund_cfg):
         raw_val = abund_cfg.get(element)
         if isinstance(raw_val, Mapping):
             if "min" not in raw_val or "max" not in raw_val:
@@ -274,16 +282,15 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
         "lam_step": np.full(sample_count, lam_step, dtype=float),
         "turbvel": turbvel,
         "t_value": t_value,
-        "a": abundance_samples.get("a", np.full(sample_count, fixed_abundances.get("a", "+0.00"), dtype=object)),
-        "c": abundance_samples.get("c", np.full(sample_count, fixed_abundances.get("c", "+0.00"), dtype=object)),
-        "n": abundance_samples.get("n", np.full(sample_count, fixed_abundances.get("n", "+0.00"), dtype=object)),
-        "o": abundance_samples.get("o", np.full(sample_count, fixed_abundances.get("o", "+0.00"), dtype=object)),
-        "r": abundance_samples.get("r", np.full(sample_count, fixed_abundances.get("r", "+0.00"), dtype=object)),
-        "s": abundance_samples.get("s", np.full(sample_count, fixed_abundances.get("s", "+0.00"), dtype=object)),
         "output_mode": np.full(sample_count, output_mode, dtype=object),
         "mode": np.full(sample_count, mode, dtype=object),
         "calculation_mode": np.full(sample_count, calculation_mode, dtype=object),
     }
+    for element in _ordered_abundance_keys(abund_cfg):
+        out[element] = abundance_samples.get(
+            element,
+            np.full(sample_count, fixed_abundances.get(element, "+0.00"), dtype=object),
+        )
     return out
 
 

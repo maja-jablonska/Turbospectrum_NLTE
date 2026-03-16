@@ -233,9 +233,31 @@ def _to_float32(values: np.ndarray) -> np.ndarray:
     return out
 
 
+def _ordered_param_names(column_data: Mapping[str, np.ndarray]) -> List[str]:
+    reserved = {
+        "grid_version",
+        "lam_min",
+        "lam_max",
+        "lam_step",
+        "output_mode",
+        "mode",
+        "calculation_mode",
+        "turb",
+        "turbvel",
+        "t_value",
+    }
+    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
+    extras = sorted(
+        name
+        for name in column_data.keys()
+        if name not in reserved and name not in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"}
+    )
+    return candidate_order + extras
+
+
 def _build_params_matrix(column_data: Mapping[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
     # Fixed ordering keeps schema stable across runs.
-    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
+    candidate_order = _ordered_param_names(column_data)
     params_by_name: Dict[str, np.ndarray] = {}
 
     for name in ("teff", "logg", "feh"):
@@ -249,7 +271,9 @@ def _build_params_matrix(column_data: Mapping[str, np.ndarray]) -> Tuple[np.ndar
     elif "t_value" in column_data:
         params_by_name["vmicro"] = _to_float32(np.asarray(column_data["t_value"]))
 
-    for name in ("a", "c", "n", "o", "r", "s"):
+    for name in candidate_order:
+        if name in {"teff", "logg", "feh", "vmicro"}:
+            continue
         if name in column_data:
             params_by_name[name] = _to_float32(np.asarray(column_data[name]))
 
@@ -487,8 +511,12 @@ def _validate_grid(grid_root) -> Tuple[int, Dict[str, np.ndarray]]:
         raise KeyError("Grid Zarr must include either 'turbvel' or 't_value' for microturbulence selection")
     column_data["turb"] = np.array(grid_root[turb_column][:])
 
-    optional_columns = ["output_mode", "calculation_mode", "grid_version", "a", "c", "n", "o", "r", "s"]
-    for name in optional_columns:
+    passthrough_columns = sorted(
+        name
+        for name in available
+        if name not in set(required_columns + wavelength_columns + optional_turb)
+    )
+    for name in passthrough_columns:
         if name in available:
             column_data[name] = np.array(grid_root[name][:])
 
@@ -739,7 +767,7 @@ def _write_zarr_output(
     for name in param_name_list:
         if name == "teff":
             param_units[name] = "K"
-        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"}:
+        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"} or name.isalpha():
             param_units[name] = "dex"
         elif name == "vmicro":
             param_units[name] = "km/s"

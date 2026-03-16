@@ -130,6 +130,15 @@ def _require_arrays(root, names: Sequence[str]) -> None:
         raise KeyError(f"Shard {getattr(root.store, 'path', '?')} missing arrays: {missing}")
 
 
+def _validate_shard_structure(path: str) -> np.ndarray:
+    root = _open_shard(path)
+    _require_arrays(root, ["wavelength", "global_index", "flux", "status", "message"])
+    wavelengths = np.asarray(root["wavelength"][:], dtype=np.float32)
+    if wavelengths.size <= 0:
+        raise ValueError(f"Shard {path} wavelength array is empty")
+    return wavelengths
+
+
 def _infer_row_count_from_grid(grid_zarr: str) -> int:
     store = _zarr_store(grid_zarr)
     root = zarr.open_group(store=store, mode="r")
@@ -172,6 +181,43 @@ def _filter_nonexistent_shards(shards: Sequence[str], *, skip_nonexistent: bool)
             file=sys.stderr,
         )
     return kept, skipped
+
+
+def _filter_invalid_shards(
+    shards: Sequence[str], *, skip_invalid: bool
+) -> tuple[List[str], List[str], Optional[np.ndarray], Optional[str]]:
+    if not skip_invalid:
+        return list(shards), [], None, None
+
+    kept: List[str] = []
+    skipped_messages: List[str] = []
+    reference_wavelengths: Optional[np.ndarray] = None
+    reference_path: Optional[str] = None
+
+    for path in shards:
+        try:
+            wavelengths = _validate_shard_structure(path)
+            if reference_wavelengths is None:
+                reference_wavelengths = wavelengths
+                reference_path = path
+            elif (
+                wavelengths.shape != reference_wavelengths.shape
+                or not np.allclose(wavelengths, reference_wavelengths)
+            ):
+                raise ValueError(f"Wavelength mismatch vs {reference_path}")
+        except Exception as exc:
+            skipped_messages.append(f"{path}: {exc}")
+            continue
+        kept.append(path)
+
+    if skipped_messages:
+        preview = skipped_messages[:10]
+        suffix = " (truncated)" if len(skipped_messages) > 10 else ""
+        print(
+            f"WARNING: skipping {len(skipped_messages)} invalid shard(s): {preview}{suffix}",
+            file=sys.stderr,
+        )
+    return kept, skipped_messages, reference_wavelengths, reference_path
 
 
 def _write_string_scalar(root, name: str, value: str, compression_kwargs: Mapping[str, Any]) -> None:
@@ -241,8 +287,30 @@ def _to_float32(values: np.ndarray) -> np.ndarray:
     return out
 
 
-def _build_params_matrix(columns: Mapping[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+def _ordered_param_names(columns: Mapping[str, np.ndarray]) -> List[str]:
+    reserved = {
+        "grid_version",
+        "lam_min",
+        "lam_max",
+        "lam_step",
+        "output_mode",
+        "mode",
+        "calculation_mode",
+        "turb",
+        "turbvel",
+        "t_value",
+    }
     candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
+    extras = sorted(
+        name
+        for name in columns.keys()
+        if name not in reserved and name not in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"}
+    )
+    return candidate_order + extras
+
+
+def _build_params_matrix(columns: Mapping[str, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    candidate_order = _ordered_param_names(columns)
     params_by_name: Dict[str, np.ndarray] = {}
 
     for name in ("teff", "logg", "feh"):
@@ -256,7 +324,9 @@ def _build_params_matrix(columns: Mapping[str, np.ndarray]) -> Tuple[np.ndarray,
     elif "t_value" in columns:
         params_by_name["vmicro"] = _to_float32(np.asarray(columns["t_value"]))
 
-    for name in ("a", "c", "n", "o", "r", "s"):
+    for name in candidate_order:
+        if name in {"teff", "logg", "feh", "vmicro"}:
+            continue
         if name in columns:
             params_by_name[name] = _to_float32(np.asarray(columns[name]))
 
@@ -643,6 +713,14 @@ def main() -> None:
             "or interrupted reruns)."
         ),
     )
+    parser.add_argument(
+        "--skip-invalid-shards",
+        action="store_true",
+        help=(
+            "Skip shard stores that exist but fail structural validation "
+            "(for example missing required arrays or mismatched wavelength grids)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.tmp_dir:
@@ -658,15 +736,21 @@ def main() -> None:
         shards,
         skip_nonexistent=bool(args.skip_nonexistent_shards),
     )
+    shards, skipped_invalid_shards, validated_wavelengths, _validated_wavelength_path = _filter_invalid_shards(
+        shards,
+        skip_invalid=bool(args.skip_invalid_shards),
+    )
     if not shards:
         raise FileNotFoundError(
             "No readable shard stores remain after filtering. "
-            "Either point --shard-dir to existing shard outputs or disable --skip-nonexistent-shards."
+            "Either point --shard-dir to existing shard outputs or disable shard skipping flags."
         )
-    effective_allow_missing = bool(args.allow_missing or args.skip_nonexistent_shards)
-    if args.skip_nonexistent_shards and not args.allow_missing:
+    effective_allow_missing = bool(
+        args.allow_missing or args.skip_nonexistent_shards or args.skip_invalid_shards
+    )
+    if (args.skip_nonexistent_shards or args.skip_invalid_shards) and not args.allow_missing:
         print(
-            "WARNING: --skip-nonexistent-shards enables partial merge semantics "
+            "WARNING: shard skipping enables partial merge semantics "
             "(missing rows will be omitted).",
             file=sys.stderr,
         )
@@ -687,19 +771,23 @@ def main() -> None:
         raise ValueError("Could not infer a positive row_count; provide --grid-zarr or non-empty shards")
 
     # Read wavelength from first shard and validate all shards match.
-    first = _open_shard(shards[0])
-    _require_arrays(first, ["wavelength", "flux", "global_index", "status", "message"])
-    wavelengths = np.asarray(first["wavelength"][:], dtype=np.float32)
+    if validated_wavelengths is not None:
+        wavelengths = validated_wavelengths
+    else:
+        first = _open_shard(shards[0])
+        _require_arrays(first, ["wavelength", "flux", "global_index", "status", "message"])
+        wavelengths = np.asarray(first["wavelength"][:], dtype=np.float32)
     wl_count = int(wavelengths.size)
     if wl_count <= 0:
         raise ValueError("Shard wavelength array is empty")
 
-    for p in shards[1:]:
-        root = _open_shard(p)
-        _require_arrays(root, ["wavelength"])
-        other = np.asarray(root["wavelength"][:], dtype=np.float32)
-        if other.shape != wavelengths.shape or not np.allclose(other, wavelengths):
-            raise ValueError(f"Wavelength mismatch between shards: {shards[0]} vs {p}")
+    if validated_wavelengths is None:
+        for p in shards[1:]:
+            root = _open_shard(p)
+            _require_arrays(root, ["wavelength"])
+            other = np.asarray(root["wavelength"][:], dtype=np.float32)
+            if other.shape != wavelengths.shape or not np.allclose(other, wavelengths):
+                raise ValueError(f"Wavelength mismatch between shards: {shards[0]} vs {p}")
 
     # Open grid once for metadata/params if provided.
     grid_root = None
@@ -727,8 +815,14 @@ def main() -> None:
     shard_attr_snapshots: List[Dict[str, str]] = []
     shard_provenance_candidates: Dict[str, List[str]] = {name: [] for name in PROVENANCE_FILENAMES}
     for p in shards:
-        shard = _open_shard(p)
-        _require_arrays(shard, ["global_index", "flux", "status", "message"])
+        try:
+            shard = _open_shard(p)
+            _require_arrays(shard, ["global_index", "flux", "status", "message"])
+        except Exception as exc:
+            if effective_allow_missing:
+                print(f"WARNING: skipping shard during preflight: {p}: {exc}", file=sys.stderr)
+                continue
+            raise
         shard_attrs = _collect_attrs(shard)
         if shard_attrs:
             shard_attr_snapshots.append(shard_attrs)
@@ -843,10 +937,37 @@ def main() -> None:
         "output_mode",
         "calculation_mode",
     ]
+    if grid_root is not None:
+        extra_grid_cols = sorted(
+            name
+            for name in grid_root.keys()
+            if name not in {
+                "teff",
+                "logg",
+                "feh",
+                "turb",
+                "turbvel",
+                "t_value",
+                "a",
+                "c",
+                "n",
+                "o",
+                "r",
+                "s",
+                "lam_min",
+                "lam_max",
+                "lam_step",
+                "output_mode",
+                "mode",
+                "calculation_mode",
+                "grid_version",
+            }
+        )
+        param_candidate_cols.extend(extra_grid_cols)
     merged_meta: Dict[str, np.ndarray] = {}
     merged_meta_is_str: Dict[str, bool] = {}
     for name in param_candidate_cols:
-        if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"}:
+        if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"} or name.isalpha():
             merged_meta[name] = np.full(out_row_count, np.nan, dtype=np.float32)
             merged_meta_is_str[name] = False
         else:
@@ -854,8 +975,14 @@ def main() -> None:
             merged_meta_is_str[name] = True
 
     for p in shards:
-        shard = _open_shard(p)
-        _require_arrays(shard, ["global_index", "flux", "status", "message"])
+        try:
+            shard = _open_shard(p)
+            _require_arrays(shard, ["global_index", "flux", "status", "message"])
+        except Exception as exc:
+            if effective_allow_missing:
+                print(f"WARNING: skipping shard during write: {p}: {exc}", file=sys.stderr)
+                continue
+            raise
         gidx = np.asarray(shard["global_index"][:], dtype=np.int64)
         if gidx.size == 0:
             continue
@@ -950,16 +1077,25 @@ def main() -> None:
     if missing_status_rows:
         preview = missing_status_rows[:20]
         suffix = " (truncated)" if len(missing_status_rows) > 20 else ""
-        raise ValueError(
-            f"Merged status vector is incomplete: {len(missing_status_rows)} row(s) still missing, "
-            f"examples={preview}{suffix}"
-        )
+        if effective_allow_missing:
+            print(
+                f"WARNING: leaving {len(missing_status_rows)} merged row(s) with missing status "
+                f"after shard skips, examples={preview}{suffix}",
+                file=sys.stderr,
+            )
+        else:
+            raise ValueError(
+                f"Merged status vector is incomplete: {len(missing_status_rows)} row(s) still missing, "
+                f"examples={preview}{suffix}"
+            )
 
     # Build params matrix from original grid when available; otherwise fall back to merged shard metadata.
     if grid_root is not None:
         grid_cols: Dict[str, np.ndarray] = {}
-        for name in ("teff", "logg", "feh", "a", "c", "n", "o", "r", "s"):
+        for name in grid_root.keys():
             if name in grid_root:
+                if name in {"lam_min", "lam_max", "lam_step", "output_mode", "mode", "calculation_mode", "grid_version"}:
+                    continue
                 values = np.asarray(grid_root[name][:])
                 if effective_allow_missing:
                     values = values[selected_global_indices]
@@ -977,7 +1113,7 @@ def main() -> None:
         params, param_names = _build_params_matrix(grid_cols)
     else:
         params_source: Dict[str, np.ndarray] = {}
-        for name in ("teff", "logg", "feh", "a", "c", "n", "o", "r", "s"):
+        for name in merged_meta.keys():
             if name in merged_meta:
                 params_source[name] = np.asarray(merged_meta[name])
         if "turb" in merged_meta and any(str(x).strip() for x in merged_meta["turb"].tolist()):
@@ -1192,7 +1328,9 @@ def main() -> None:
         "allow_missing": bool(effective_allow_missing),
         "allow_missing_requested": bool(args.allow_missing),
         "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
+        "skip_invalid_shards": bool(args.skip_invalid_shards),
         "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
+        "skipped_invalid_shards": int(len(skipped_invalid_shards)),
         "expected_models": int(row_count),
         "missing_models": int(row_count - out_row_count),
     }

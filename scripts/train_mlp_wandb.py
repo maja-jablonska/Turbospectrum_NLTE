@@ -383,6 +383,295 @@ def _build_specs_from_config(config_path: Path, defaults: RunSpec, base_seed: in
     return specs
 
 
+def _deep_update(base: dict[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_update(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _default_unified_config() -> dict[str, Any]:
+    return {
+        "preset": "baseline",
+        "data": {
+            "zarr_path": None,
+            "input_features": None,
+            "include_mu": True,
+            "mu_key": "auto",
+            "train_fraction": 0.8,
+            "val_fraction": 0.1,
+            "normalize_inputs": True,
+            "normalize_targets": True,
+            "axis": {
+                "name": "log_wavelength",
+                "target_points": 1024,
+                "min": None,
+                "max": None,
+            },
+        },
+        "model": {
+            "type": "mlp",
+            "hidden_dims": [128, 256],
+        },
+        "training": {
+            "seed": 7,
+            "epochs": 30,
+            "batch_size": 32,
+            "optimizer": {
+                "name": "adamw",
+                "learning_rate": 1e-3,
+                "weight_decay": 0.0,
+                "grad_clip_norm": 1.0,
+            },
+            "scheduler": {
+                "name": "warmup_cosine",
+                "warmup_fraction": 0.1,
+                "min_lr_ratio": 0.05,
+            },
+            "loss": {
+                "name": "dual_huber",
+                "huber_delta": 1.0,
+                "lambda_hi": 0.1,
+                "lambda_lo": 0.0,
+                "lambda_smooth": 1e-3,
+            },
+        },
+        "logging": {
+            "output_dir": str(DEFAULT_OUTPUT_DIR),
+            "save_checkpoints": False,
+            "jax_platform": "cpu",
+            "wandb": {
+                "enabled": True,
+                "project": "turbospectrum-mlp",
+                "entity": None,
+                "group": None,
+                "tags": [],
+                "mode": "online",
+                "dir": None,
+                "sync_after_run": False,
+                "sync_dir": None,
+                "sync_include_offline": True,
+                "sync_best_effort": True,
+            },
+        },
+        "sweep": None,
+    }
+
+
+def _unified_presets() -> dict[str, dict[str, Any]]:
+    return {
+        "baseline": {},
+        "dev": {
+            "training": {
+                "epochs": 5,
+                "batch_size": 16,
+            },
+            "logging": {
+                "wandb": {
+                    "mode": "offline",
+                }
+            },
+        },
+        "hpc": {
+            "logging": {
+                "save_checkpoints": True,
+                "wandb": {
+                    "mode": "offline",
+                    "sync_include_offline": True,
+                    "sync_best_effort": True,
+                },
+            }
+        },
+        "sweep-small": {
+            "logging": {
+                "wandb": {
+                    "mode": "offline",
+                }
+            },
+            "sweep": {
+                "parameters": {
+                    "model.hidden_dims": [[128, 256], [256, 256]],
+                    "training.optimizer.learning_rate": [1e-3, 3e-4],
+                    "training.batch_size": [32, 64],
+                    "training.loss.lambda_smooth": [1e-3, 1e-2],
+                }
+            },
+        },
+    }
+
+
+def _looks_like_unified_config(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    unified_keys = {"preset", "data", "model", "training", "logging", "sweep"}
+    return any(key in payload for key in unified_keys)
+
+
+def _normalize_wandb_tags(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, Sequence):
+        return ",".join(str(item).strip() for item in raw if str(item).strip())
+    raise TypeError(f"Unsupported wandb tags type: {type(raw)!r}")
+
+
+def _run_mapping_from_unified_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    model = dict(config.get("model", {}))
+    training = dict(config.get("training", {}))
+    optimizer = dict(training.get("optimizer", {}))
+    scheduler = dict(training.get("scheduler", {}))
+    loss = dict(training.get("loss", {}))
+    return {
+        "hidden_dims": model.get("hidden_dims", [128, 256]),
+        "learning_rate": optimizer.get("learning_rate", 1e-3),
+        "weight_decay": optimizer.get("weight_decay", 0.0),
+        "lambda_hi": loss.get("lambda_hi", 0.1),
+        "lambda_lo": loss.get("lambda_lo", 0.0),
+        "lambda_smooth": loss.get("lambda_smooth", 1e-3),
+        "huber_delta": loss.get("huber_delta", 1.0),
+        "warmup_fraction": scheduler.get("warmup_fraction", 0.1),
+        "min_lr_ratio": scheduler.get("min_lr_ratio", 0.05),
+        "epochs": training.get("epochs", 30),
+        "batch_size": training.get("batch_size", 32),
+        "seed": training.get("seed", 7),
+        "run_name": config.get("run_name"),
+    }
+
+
+def _set_path_value(target: dict[str, Any], path: str, value: Any) -> None:
+    parts = [part.strip() for part in path.split(".") if part.strip()]
+    if not parts:
+        raise ValueError(f"Invalid empty path in sweep parameter '{path}'")
+    cursor = target
+    for part in parts[:-1]:
+        next_value = cursor.get(part)
+        if next_value is None:
+            next_value = {}
+            cursor[part] = next_value
+        if not isinstance(next_value, dict):
+            raise ValueError(f"Cannot set nested path '{path}' because '{part}' is already a leaf")
+        cursor = next_value
+    cursor[parts[-1]] = value
+
+
+def _build_specs_from_unified_config(payload: Mapping[str, Any], defaults: RunSpec) -> tuple[dict[str, Any], list[RunSpec]]:
+    preset_name = str(payload.get("preset", "baseline"))
+    presets = _unified_presets()
+    if preset_name not in presets:
+        raise ValueError(f"Unknown unified config preset '{preset_name}'")
+    base_config = _deep_update(_default_unified_config(), presets[preset_name])
+    base_config = _deep_update(base_config, payload)
+    base_seed = int(dict(base_config.get("training", {})).get("seed", defaults.seed))
+    sweep = base_config.get("sweep")
+    if sweep in (None, {}):
+        run_mapping = _run_mapping_from_unified_config(base_config)
+        return base_config, [_run_spec_from_mapping(run_mapping, defaults=defaults, seed_fallback=base_seed)]
+    if not isinstance(sweep, Mapping):
+        raise ValueError("'sweep' must be a mapping when provided")
+    parameters = sweep.get("parameters", {})
+    if not isinstance(parameters, Mapping) or not parameters:
+        raise ValueError("'sweep.parameters' must be a non-empty mapping")
+
+    items: list[tuple[str, list[Any]]] = []
+    for key, raw_values in parameters.items():
+        if not isinstance(key, str):
+            raise ValueError("Sweep parameter keys must be strings")
+        if not isinstance(raw_values, Sequence) or isinstance(raw_values, (str, bytes)):
+            raise ValueError(f"Sweep parameter '{key}' must be a list of values")
+        values = list(raw_values)
+        if not values:
+            raise ValueError(f"Sweep parameter '{key}' cannot be empty")
+        items.append((key, values))
+
+    max_runs = sweep.get("max_runs")
+    specs: list[RunSpec] = []
+    for run_offset, combo in enumerate(itertools.product(*(values for _, values in items))):
+        override: dict[str, Any] = {}
+        for (path, _), value in zip(items, combo, strict=False):
+            _set_path_value(override, path, value)
+        run_config = _deep_update(base_config, override)
+        run_mapping = _run_mapping_from_unified_config(run_config)
+        run_mapping["seed"] = int(base_seed + run_offset)
+        specs.append(_run_spec_from_mapping(run_mapping, defaults=defaults, seed_fallback=base_seed + run_offset))
+        if max_runs is not None and len(specs) >= int(max_runs):
+            break
+    return base_config, specs
+
+
+def _apply_unified_config_to_args(args: argparse.Namespace, config: Mapping[str, Any]) -> None:
+    data = dict(config.get("data", {}))
+    model = dict(config.get("model", {}))
+    training = dict(config.get("training", {}))
+    optimizer = dict(training.get("optimizer", {}))
+    scheduler = dict(training.get("scheduler", {}))
+    loss = dict(training.get("loss", {}))
+    logging_cfg = dict(config.get("logging", {}))
+    wandb_cfg = dict(logging_cfg.get("wandb", {}))
+    axis = dict(data.get("axis", {}))
+
+    if data.get("zarr_path") is not None:
+        args.zarr_path = str(data["zarr_path"])
+    args.input_features = data.get("input_features")
+    args.include_mu = bool(data.get("include_mu", args.include_mu))
+    args.mu_key = str(data.get("mu_key", args.mu_key))
+    args.train_fraction = float(data.get("train_fraction", args.train_fraction))
+    args.val_fraction = float(data.get("val_fraction", args.val_fraction))
+    args.normalize_inputs = bool(data.get("normalize_inputs", args.normalize_inputs))
+    args.normalize_targets = bool(data.get("normalize_targets", args.normalize_targets))
+
+    axis_name = axis.get("name")
+    if axis_name is not None:
+        if axis_name not in {"wavelength", "log_wavelength"}:
+            raise ValueError(f"Unsupported data.axis.name '{axis_name}'")
+        args.axis_name = str(axis_name)
+        args.use_log_wavelength = bool(axis_name == "log_wavelength")
+    args.target_points = int(axis.get("target_points", args.target_points))
+    args.target_axis_min = axis.get("min", args.target_axis_min)
+    args.target_axis_max = axis.get("max", args.target_axis_max)
+
+    if model.get("type", "mlp") != "mlp":
+        raise ValueError(f"Unsupported model.type '{model.get('type')}', only 'mlp' is supported")
+
+    hidden_dims = model.get("hidden_dims")
+    if hidden_dims is not None:
+        args.hidden_dims_grid = "x".join(str(v) for v in hidden_dims)
+    args.seed = int(training.get("seed", args.seed))
+    args.epochs_grid = str(training.get("epochs", args.epochs_grid))
+    args.batch_size_grid = str(training.get("batch_size", args.batch_size_grid))
+    args.learning_rate_grid = str(optimizer.get("learning_rate", args.learning_rate_grid))
+    args.weight_decay_grid = str(optimizer.get("weight_decay", args.weight_decay_grid))
+    args.lambda_hi_grid = str(loss.get("lambda_hi", args.lambda_hi_grid))
+    args.lambda_lo_grid = str(loss.get("lambda_lo", args.lambda_lo_grid))
+    args.lambda_smooth_grid = str(loss.get("lambda_smooth", args.lambda_smooth_grid))
+    args.huber_delta_grid = str(loss.get("huber_delta", args.huber_delta_grid))
+    args.warmup_fraction_grid = str(scheduler.get("warmup_fraction", args.warmup_fraction_grid))
+    args.min_lr_ratio_grid = str(scheduler.get("min_lr_ratio", args.min_lr_ratio_grid))
+
+    if logging_cfg.get("output_dir") is not None:
+        args.output_dir = str(logging_cfg["output_dir"])
+    args.save_checkpoints = bool(logging_cfg.get("save_checkpoints", args.save_checkpoints))
+    args.jax_platform = str(logging_cfg.get("jax_platform", args.jax_platform))
+
+    wandb_enabled = bool(wandb_cfg.get("enabled", True))
+    args.wandb_mode = "disabled" if not wandb_enabled else str(wandb_cfg.get("mode", args.wandb_mode))
+    args.wandb_project = str(wandb_cfg.get("project", args.wandb_project))
+    args.wandb_entity = wandb_cfg.get("entity", args.wandb_entity)
+    args.wandb_group = wandb_cfg.get("group", args.wandb_group)
+    args.wandb_tags = _normalize_wandb_tags(wandb_cfg.get("tags", args.wandb_tags))
+    args.wandb_dir = wandb_cfg.get("dir", args.wandb_dir)
+    args.wandb_sync_after_run = bool(wandb_cfg.get("sync_after_run", args.wandb_sync_after_run))
+    args.wandb_sync_dir = wandb_cfg.get("sync_dir", args.wandb_sync_dir)
+    args.wandb_sync_include_offline = bool(
+        wandb_cfg.get("sync_include_offline", args.wandb_sync_include_offline)
+    )
+    args.wandb_sync_best_effort = bool(wandb_cfg.get("sync_best_effort", args.wandb_sync_best_effort))
+
+
 def _resolve_run_index(args: argparse.Namespace) -> int | None:
     if args.run_index is not None:
         return int(args.run_index)
@@ -673,7 +962,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output directory for run artifacts",
     )
     parser.add_argument("--sweep-config", default=None, help="JSON file with either 'runs' or 'grid' definitions")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Config file in either the current sweep format or the newer nested preset/data/model/training/logging shape",
+    )
     parser.add_argument("--example-sweep-config", action="store_true", help="Print example sweep config path and exit")
+    parser.add_argument(
+        "--print-effective-config",
+        action="store_true",
+        help="Print the resolved nested config when using --config and exit",
+    )
 
     parser.add_argument("--seed", type=int, default=7, help="Base seed; each run increments this seed")
     parser.add_argument("--train-fraction", "--train_fraction", type=float, default=0.8, help="Train split fraction")
@@ -784,6 +1083,9 @@ def main() -> None:
         print(DEFAULT_SWEEP_CONFIG)
         return
 
+    if args.config and args.sweep_config:
+        raise ValueError("Use either --config or --sweep-config, not both")
+
     if args.normalize_inputs_value is not None:
         args.normalize_inputs = bool(args.normalize_inputs_value)
     if args.normalize_targets_value is not None:
@@ -817,6 +1119,28 @@ def main() -> None:
         args.epochs_grid = str(args.epochs_single)
     if args.batch_size_single is not None:
         args.batch_size_grid = str(args.batch_size_single)
+
+    unified_config: dict[str, Any] | None = None
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config not found: {config_path}")
+        payload = json.loads(config_path.read_text())
+        if _looks_like_unified_config(payload):
+            preset_name = str(payload.get("preset", "baseline"))
+            presets = _unified_presets()
+            if preset_name not in presets:
+                raise ValueError(f"Unknown unified config preset '{preset_name}'")
+            unified_config = _deep_update(_default_unified_config(), presets[preset_name])
+            unified_config = _deep_update(unified_config, payload)
+            _apply_unified_config_to_args(args, unified_config)
+            if args.print_effective_config:
+                print(json.dumps(unified_config, indent=2))
+                return
+        else:
+            args.sweep_config = str(config_path)
+            if args.print_effective_config:
+                raise ValueError("--print-effective-config only supports the newer nested --config schema")
 
     default_zarr = _resolve_default_zarr_path()
     zarr_path = Path(args.zarr_path) if args.zarr_path else default_zarr
@@ -956,6 +1280,8 @@ def main() -> None:
         if not sweep_config_path.exists():
             raise FileNotFoundError(f"Sweep config not found: {sweep_config_path}")
         specs = _build_specs_from_config(sweep_config_path, defaults=base_spec, base_seed=int(args.seed))
+    elif unified_config is not None:
+        _, specs = _build_specs_from_unified_config(unified_config, defaults=base_spec)
     else:
         specs = _build_specs_from_cli(args)
 

@@ -76,6 +76,7 @@ CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
 MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-128}"
 ALLOW_MISSING="${ALLOW_MISSING:-0}"
 ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
+SKIP_BAD_SHARDS="${SKIP_BAD_SHARDS:-1}"
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
@@ -176,6 +177,7 @@ echo "[merge] Output: ${MERGED_ZARR}"
 echo "[merge] Chunk rows: ${MERGE_CHUNK_ROWS}"
 echo "[merge] Allow missing: ${ALLOW_MISSING}"
 echo "[merge] Allow incomplete provenance: ${ALLOW_INCOMPLETE_PROVENANCE}"
+echo "[merge] Skip bad shards: ${SKIP_BAD_SHARDS}"
 echo "[merge] TMPDIR: ${TMPDIR}"
 
 MERGE_CMD=(
@@ -192,6 +194,10 @@ fi
 
 if [[ "$(to_bool01 "${ALLOW_MISSING}")" == "1" ]]; then
     MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
+fi
+
+if [[ "$(to_bool01 "${SKIP_BAD_SHARDS}")" == "1" ]]; then
+    MERGE_CMD+=(--skip-invalid-shards)
 fi
 
 if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
