@@ -28,6 +28,7 @@ REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 DEFAULT_CONFIG_PATH = os.path.join(REPO_ROOT, "configs", "sampling", "config_ml_sampling.json")
 DEFAULT_ZARR_PATH = os.path.join(REPO_ROOT, "runs", "local-dev", "outputs", "grids", "ml_parameter_grid.zarr")
 ALLOWED_TURBVEL = {"01", "02", "03", "04", "05"}
+LEGACY_ABUNDANCE_KEYS = ("a", "c", "n", "o", "r", "s")
 
 
 def _configure_logging(log_level: str, log_file: str | None) -> logging.Logger:
@@ -213,13 +214,20 @@ def _resolve_bounds(config: Dict) -> List[Tuple[float, float]]:
     return bounds
 
 
+def _ordered_abundance_keys(abundances_cfg: Dict[str, Any]) -> List[str]:
+    configured = {str(key).strip() for key in (abundances_cfg or {}).keys() if str(key).strip()}
+    ordered: List[str] = [key for key in LEGACY_ABUNDANCE_KEYS if key in configured]
+    ordered.extend(sorted(configured.difference(ordered)))
+    return ordered
+
+
 def _resolve_sampling_dimensions(config: Dict) -> Tuple[List[Tuple[float, float]], List[str], Dict[str, str], List[str] | None]:
     bounds = _resolve_bounds(config)
 
     abundances_cfg = config.get("abundances", {})
     sampled_abundances: List[str] = []
     fixed_abundances: Dict[str, str] = {}
-    for element in ["a", "c", "n", "o", "r", "s"]:
+    for element in _ordered_abundance_keys(abundances_cfg):
         raw_val = abundances_cfg.get(element)
         if isinstance(raw_val, dict):
             if "min" not in raw_val or "max" not in raw_val:
@@ -432,6 +440,13 @@ def main() -> None:
     t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
 
     t_step = time.perf_counter()
+    abundance_columns = {
+        element: abundance_samples.get(
+            element,
+            np.full(sample_count_new, fixed_abundances.get(element, "+0.00"), dtype=object),
+        )
+        for element in _ordered_abundance_keys(abundances)
+    }
     df = pl.DataFrame(
         {
             "grid_version": np.full(sample_count_new, grid_version, dtype=object),
@@ -443,12 +458,7 @@ def main() -> None:
             "lam_step": np.full(sample_count_new, lam_step, dtype=float),
             "turbvel": turbvel_series,
             "t_value": t_value_series,
-            "a": abundance_samples.get("a", np.full(sample_count_new, fixed_abundances.get("a", "+0.00"), dtype=object)),
-            "c": abundance_samples.get("c", np.full(sample_count_new, fixed_abundances.get("c", "+0.00"), dtype=object)),
-            "n": abundance_samples.get("n", np.full(sample_count_new, fixed_abundances.get("n", "+0.00"), dtype=object)),
-            "o": abundance_samples.get("o", np.full(sample_count_new, fixed_abundances.get("o", "+0.00"), dtype=object)),
-            "r": abundance_samples.get("r", np.full(sample_count_new, fixed_abundances.get("r", "+0.00"), dtype=object)),
-            "s": abundance_samples.get("s", np.full(sample_count_new, fixed_abundances.get("s", "+0.00"), dtype=object)),
+            **abundance_columns,
             "output_mode": np.full(sample_count_new, output_mode, dtype=object),
             "mode": np.full(sample_count_new, mode, dtype=object),
             "calculation_mode": np.full(sample_count_new, calculation_mode, dtype=object),
