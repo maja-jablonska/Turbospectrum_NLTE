@@ -260,6 +260,26 @@ def _write_fixed_string_scalar(root, name: str, value: str, min_width: int, comp
         _write_string_scalar(root, name, sval, compression_kwargs=compression_kwargs)
 
 
+def _write_parameter_columns(
+    root,
+    *,
+    params: np.ndarray,
+    param_names: Sequence[str],
+    chunk_rows: int,
+    compression_kwargs: Mapping[str, Any],
+) -> None:
+    """Expose packed params as named 1D arrays for easier downstream lookup."""
+    group = root.create_group("parameter_columns")
+    for col_idx, name in enumerate(param_names):
+        values = params[:, col_idx].astype(np.float32, copy=False)
+        group.create_array(
+            str(name),
+            data=values,
+            chunks=(min(chunk_rows, len(values)) if len(values) else 1,),
+            **compression_kwargs,
+        )
+
+
 def _to_u32_param_names(values: Sequence[str]) -> np.ndarray:
     names = [str(v) for v in values]
     too_long = [n for n in names if len(n) > 32]
@@ -1178,6 +1198,13 @@ def main() -> None:
         chunks=(min(int(args.chunk_rows), len(model_id)) if len(model_id) else 1,),
         **compression_kwargs,
     )
+    _write_parameter_columns(
+        root_out,
+        params=params,
+        param_names=param_name_list,
+        chunk_rows=int(args.chunk_rows),
+        compression_kwargs=compression_kwargs,
+    )
     _write_fixed_string_scalar(root_out, "physics_hash", physics_hash, min_width=64, compression_kwargs=compression_kwargs)
     _write_fixed_string_scalar(root_out, "schema_version", args.schema_version, min_width=16, compression_kwargs=compression_kwargs)
 
@@ -1309,6 +1336,7 @@ def main() -> None:
         "wavelength_unit": "angstrom",
         "flux_unit": "relative",
         "parameter_units": param_units,
+        "parameter_columns_group": "parameter_columns",
         "physics_hash": physics_hash,
         "git_commit": git_commit,
         "git_sha": git_commit,

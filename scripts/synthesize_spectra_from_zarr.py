@@ -41,7 +41,7 @@ from run_turbospectrum import (  # noqa: E402
     create_linelist_file,
     determine_worker_count,
     ensure_directories,
-    get_model_filename,
+    get_synthesis_stem,
     resolve_linelist_paths,
     run_single_synthesis,
 )
@@ -402,43 +402,97 @@ def _compute_physics_hash(config: TurbospectrumConfig, column_data: Mapping[str,
 
 
 def _write_string_scalar(root, name: str, value: str, compression_kwargs: Mapping[str, Any]) -> None:
-    import zarr.codecs as zc  # type: ignore
-    from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
+    if hasattr(root, "create_array"):
+        import zarr.codecs as zc  # type: ignore
+        from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
 
+        try:
+            arr = root.create_array(
+                name,
+                shape=(),
+                dtype=VariableLengthUTF8(),
+                serializer=zc.VLenUTF8Codec(),
+                **compression_kwargs,
+            )
+            arr[...] = str(value)
+            return
+        except Exception:
+            arr = root.create_array(
+                name,
+                shape=(1,),
+                dtype=VariableLengthUTF8(),
+                serializer=zc.VLenUTF8Codec(),
+                chunks=1,
+                **compression_kwargs,
+            )
+            arr[0] = str(value)
+            return
+
+    from numcodecs import VLenUTF8  # type: ignore
+
+    root.array(
+        name,
+        np.array(str(value), dtype=object),
+        dtype=object,
+        object_codec=VLenUTF8(),
+        **compression_kwargs,
+    )
+
+
+def _create_array_compat(group, name: str, *, data=None, shape=None, dtype=None, chunks=None, **kwargs):
+    if hasattr(group, "create_array"):
+        create_kwargs: Dict[str, Any] = {"name": name, **kwargs}
+        if data is not None:
+            create_kwargs["data"] = data
+        if shape is not None:
+            create_kwargs["shape"] = shape
+        if dtype is not None:
+            create_kwargs["dtype"] = dtype
+        if chunks is not None:
+            create_kwargs["chunks"] = chunks
+        return group.create_array(**create_kwargs)
+
+    if data is not None:
+        return group.create_dataset(name, data=data, shape=shape, dtype=dtype, chunks=chunks, **kwargs)
+    return group.create_dataset(name, shape=shape, dtype=dtype, chunks=chunks, **kwargs)
+
+
+def _open_root_group(store):
     try:
-        arr = root.create_array(
-            name,
-            shape=(),
-            dtype=VariableLengthUTF8(),
-            serializer=zc.VLenUTF8Codec(),
-            **compression_kwargs,
-        )
-        arr[...] = str(value)
-    except Exception:
-        arr = root.create_array(
-            name,
-            shape=(1,),
-            dtype=VariableLengthUTF8(),
-            serializer=zc.VLenUTF8Codec(),
-            chunks=1,
-            **compression_kwargs,
-        )
-        arr[0] = str(value)
+        return zarr.group(store=store, overwrite=True, zarr_format=3)
+    except TypeError:
+        return zarr.group(store=store, overwrite=True)
 
 
 def _write_fixed_string_scalar(root, name: str, value: str, min_width: int, compression_kwargs: Mapping[str, Any]) -> None:
     sval = str(value)
     width = max(int(min_width), len(sval), 1)
     try:
-        arr = root.create_array(
-            name,
-            shape=(),
-            dtype=f"<U{width}",
-            **compression_kwargs,
-        )
+        arr = _create_array_compat(root, name, shape=(), dtype=f"<U{width}", **compression_kwargs)
         arr[...] = sval
     except Exception:
         _write_string_scalar(root, name, sval, compression_kwargs=compression_kwargs)
+
+
+def _write_parameter_columns(
+    root,
+    *,
+    params: np.ndarray,
+    param_names: Sequence[str],
+    chunk_rows: int,
+    compression_kwargs: Mapping[str, Any],
+) -> None:
+    """Expose packed params as named 1D arrays for easier downstream lookup."""
+    group = root.create_group("parameter_columns")
+    for col_idx, name in enumerate(param_names):
+        values = params[:, col_idx].astype(np.float32, copy=False)
+        _create_array_compat(
+            group,
+            str(name),
+            data=values,
+            chunks=(min(chunk_rows, len(values)) if len(values) else 1,),
+            **compression_kwargs,
+        )
 
 
 def _finalize_zarr_store(write_path: str, final_path: str, *, logger: logging.Logger, label: str) -> None:
@@ -586,9 +640,27 @@ def _synthesis_task(args) -> Dict:
         mu_sampling["mode"] = "random"
     cfg.mu_sampling = mu_sampling
 
-    base_name = get_model_filename(teff, logg, feh, turb_str)
+    abundance_values = {
+        key: value
+        for key, value in row_values.items()
+        if key
+        not in {
+            "teff",
+            "logg",
+            "feh",
+            "turb",
+            "lam_min",
+            "lam_max",
+            "lam_step",
+            "output_mode",
+            "calculation_mode",
+            "mode",
+            "grid_version",
+        }
+    }
+    base_name = get_synthesis_stem(teff, logg, feh, turb_str, abundance_values)
     start = time.perf_counter()
-    result = run_single_synthesis(((teff, logg, feh, turb_str), cfg))
+    result = run_single_synthesis((row_values, cfg))
     duration = time.perf_counter() - start
 
     suffix = ".intensity.spec" if is_intensity else ".spec"
@@ -717,7 +789,7 @@ def _write_zarr_output(
 ) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     store = _zarr_store(output_path)
-    root = zarr.group(store=store, overwrite=True, zarr_format=3)
+    root = _open_root_group(store)
 
     compression_kwargs = _zarr_compression_kwargs(compression_cfg)
     chunk_shape = (min(chunk_rows, fluxes.shape[0]), fluxes.shape[1]) if fluxes.shape[0] else (1, fluxes.shape[1])
@@ -727,33 +799,44 @@ def _write_zarr_output(
     param_names_u32 = _to_u32_param_names(param_name_list)
 
     # DATA_SCHEMA.md synthesis layout
-    root.create_array("wavelength", data=wl, chunks=wl.shape if wl.size else (1,), **compression_kwargs)
-    root.create_array("flux", data=fluxes, chunks=chunk_shape, **compression_kwargs)
-    root.create_array("continuum", data=continua, chunks=chunk_shape, **compression_kwargs)
-    root.create_array(
+    _create_array_compat(root, "wavelength", data=wl, chunks=wl.shape if wl.size else (1,), **compression_kwargs)
+    _create_array_compat(root, "flux", data=fluxes, chunks=chunk_shape, **compression_kwargs)
+    _create_array_compat(root, "continuum", data=continua, chunks=chunk_shape, **compression_kwargs)
+    _create_array_compat(
+        root,
         "mu_selected",
         data=mu_selected.astype(np.float32, copy=False),
         chunks=(min(chunk_rows, len(mu_selected)) if len(mu_selected) else 1,),
         **compression_kwargs,
     )
-    root.create_array(
+    _create_array_compat(
+        root,
         "mu_selected_index",
         data=mu_selected_index.astype(np.int16, copy=False),
         chunks=(min(chunk_rows, len(mu_selected_index)) if len(mu_selected_index) else 1,),
         **compression_kwargs,
     )
-    root.create_array("params", data=params.astype(np.float32, copy=False), chunks=param_chunk_shape, **compression_kwargs)
-    root.create_array(
+    _create_array_compat(root, "params", data=params.astype(np.float32, copy=False), chunks=param_chunk_shape, **compression_kwargs)
+    _create_array_compat(
+        root,
         "param_names",
         data=param_names_u32,
         chunks=(min(max(1, params.shape[1]), len(param_names_u32)) if len(param_names_u32) else 1,),
         **compression_kwargs,
     )
-    root.create_array(
+    _create_array_compat(
+        root,
         "model_id",
         data=model_id.astype(np.uint64, copy=False),
         chunks=(min(chunk_rows, len(model_id)) if len(model_id) else 1,),
         **compression_kwargs,
+    )
+    _write_parameter_columns(
+        root,
+        params=params,
+        param_names=param_name_list,
+        chunk_rows=chunk_rows,
+        compression_kwargs=compression_kwargs,
     )
     _write_fixed_string_scalar(root, "physics_hash", physics_hash, min_width=64, compression_kwargs=compression_kwargs)
     _write_fixed_string_scalar(root, "schema_version", schema_version, min_width=16, compression_kwargs=compression_kwargs)
@@ -783,6 +866,7 @@ def _write_zarr_output(
         "wavelength_unit": "angstrom",
         "flux_unit": "relative",
         "parameter_units": param_units,
+        "parameter_columns_group": "parameter_columns",
         "physics_hash": physics_hash,
         "git_commit": git_commit,
         "git_sha": git_commit,
@@ -820,11 +904,46 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
         for optional_key in ("output_mode", "calculation_mode"):
             if optional_key in column_data:
                 row_values[optional_key] = column_data[optional_key][idx]
-        base_name = get_model_filename(
+        for passthrough_key, values in column_data.items():
+            if passthrough_key in {
+                "teff",
+                "logg",
+                "feh",
+                "turb",
+                "lam_min",
+                "lam_max",
+                "lam_step",
+                "output_mode",
+                "calculation_mode",
+                "mode",
+                "grid_version",
+            }:
+                continue
+            row_values[passthrough_key] = values[idx]
+        abundance_values = {
+            key: value
+            for key, value in row_values.items()
+            if key
+            not in {
+                "teff",
+                "logg",
+                "feh",
+                "turb",
+                "lam_min",
+                "lam_max",
+                "lam_step",
+                "output_mode",
+                "calculation_mode",
+                "mode",
+                "grid_version",
+            }
+        }
+        base_name = get_synthesis_stem(
             int(row_values["teff"]),
             float(row_values["logg"]),
             float(row_values["feh"]),
             str(row_values["turb"]).strip(),
+            abundance_values,
         )
         base_name_counts[base_name] = base_name_counts.get(base_name, 0) + 1
         tasks.append((idx, row_values))

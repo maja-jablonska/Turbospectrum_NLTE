@@ -8,7 +8,7 @@ import re
 import dataclasses
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple, Optional, Dict, Iterator
+from typing import Any, List, Tuple, Optional, Dict, Iterator, Mapping
 import json
 import csv
 from datetime import datetime
@@ -649,6 +649,147 @@ def get_model_filename(teff, logg, feh, turb_str):
     filename = f"p{teff}_g{logg_str}_m0.0_t{turb_str}_st_z{feh_str}_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod"
     return filename
 
+
+PERIODIC_TABLE = {
+    "h": 1, "he": 2, "li": 3, "be": 4, "b": 5, "c": 6, "n": 7, "o": 8, "f": 9, "ne": 10,
+    "na": 11, "mg": 12, "al": 13, "si": 14, "p": 15, "s": 16, "cl": 17, "ar": 18, "k": 19, "ca": 20,
+    "sc": 21, "ti": 22, "v": 23, "cr": 24, "mn": 25, "fe": 26, "co": 27, "ni": 28, "cu": 29, "zn": 30,
+    "ga": 31, "ge": 32, "as": 33, "se": 34, "br": 35, "kr": 36, "rb": 37, "sr": 38, "y": 39, "zr": 40,
+    "nb": 41, "mo": 42, "tc": 43, "ru": 44, "rh": 45, "pd": 46, "ag": 47, "cd": 48, "in": 49, "sn": 50,
+    "sb": 51, "te": 52, "i": 53, "xe": 54, "cs": 55, "ba": 56, "la": 57, "ce": 58, "pr": 59, "nd": 60,
+    "pm": 61, "sm": 62, "eu": 63, "gd": 64, "tb": 65, "dy": 66, "ho": 67, "er": 68, "tm": 69, "yb": 70,
+    "lu": 71, "hf": 72, "ta": 73, "w": 74, "re": 75, "os": 76, "ir": 77, "pt": 78, "au": 79, "hg": 80,
+    "tl": 81, "pb": 82, "bi": 83, "po": 84, "at": 85, "rn": 86, "fr": 87, "ra": 88, "ac": 89, "th": 90,
+    "pa": 91, "u": 92,
+}
+
+SPECIAL_ABUNDANCE_ALIASES = {
+    "a": "a",
+    "alpha": "a",
+    "afe": "a",
+    "alphafe": "a",
+    "r": "r",
+    "rfe": "r",
+    "rprocess": "r",
+    "rproc": "r",
+    "s": "s",
+    "sfe": "s",
+    "sprocess": "s",
+    "sproc": "s",
+    "c": "c",
+    "cfe": "c",
+    "n": "n",
+    "nfe": "n",
+    "o": "o",
+    "ofe": "o",
+}
+
+RESERVED_SYNTHESIS_KEYS = {
+    "teff",
+    "logg",
+    "feh",
+    "turb",
+    "turbvel",
+    "t_value",
+    "microturb",
+    "microturb_str",
+    "lam_min",
+    "lam_max",
+    "lam_step",
+    "output_mode",
+    "calculation_mode",
+    "mode",
+    "grid_version",
+    "row_index",
+    "global_index",
+}
+
+
+def _normalize_abundance_key(raw_key: str) -> str:
+    key = "".join(ch for ch in str(raw_key).strip().lower() if ch.isalnum())
+    if not key:
+        return ""
+    if key in SPECIAL_ABUNDANCE_ALIASES:
+        return SPECIAL_ABUNDANCE_ALIASES[key]
+    if key.endswith("fe") and key[:-2] in PERIODIC_TABLE:
+        return key[:-2]
+    return key
+
+
+def _format_abundance_value(raw_value: Any) -> str:
+    try:
+        return f"{float(raw_value):+0.2f}"
+    except Exception:
+        return str(raw_value).strip()
+
+
+def _collect_synthesis_abundances(params: Mapping[str, Any]) -> Dict[str, str]:
+    abundances: Dict[str, str] = {}
+    unsupported: List[str] = []
+    for raw_key, raw_value in params.items():
+        if raw_key in RESERVED_SYNTHESIS_KEYS:
+            continue
+        key = _normalize_abundance_key(str(raw_key))
+        if not key:
+            continue
+        if key in {"a", "r", "s", "c", "n", "o"} or key in PERIODIC_TABLE:
+            abundances[key] = _format_abundance_value(raw_value)
+        else:
+            unsupported.append(str(raw_key))
+    if unsupported:
+        raise ValueError(
+            "Unsupported abundance column(s) for synthesis: "
+            + ", ".join(sorted(unsupported))
+        )
+    return abundances
+
+
+def _build_abundance_controls(abundances: Mapping[str, Any]) -> Tuple[str, str, str, str]:
+    normalized = {
+        _normalize_abundance_key(name): _format_abundance_value(value)
+        for name, value in abundances.items()
+        if _normalize_abundance_key(name)
+    }
+    alpha = normalized.get("a", "+0.00")
+    r_proc = normalized.get("r", "+0.00")
+    s_proc = normalized.get("s", "+0.00")
+
+    individual: Dict[str, str] = {}
+    for key in ("c", "n", "o"):
+        if key in normalized:
+            individual[key] = normalized[key]
+    for key, value in normalized.items():
+        if key in {"a", "r", "s", "c", "n", "o"}:
+            continue
+        if key in PERIODIC_TABLE:
+            individual[key] = value
+
+    lines = [
+        f"{PERIODIC_TABLE[key]:>3d}  {value}"
+        for key, value in sorted(individual.items(), key=lambda item: PERIODIC_TABLE[item[0]])
+    ]
+    block = "\n".join(lines)
+    if block:
+        block += "\n"
+    return alpha, r_proc, s_proc, block
+
+
+def get_synthesis_stem(teff, logg, feh, turb_str, abundances: Optional[Mapping[str, Any]] = None):
+    logg_str = f"{logg:+.1f}"
+    feh_str = f"{feh:+.2f}"
+    parts = [f"p{teff}", f"g{logg_str}", "m0.0", f"t{str(turb_str).strip()}", "st", f"z{feh_str}"]
+
+    normalized = {
+        _normalize_abundance_key(name): _format_abundance_value(value)
+        for name, value in (abundances or {}).items()
+        if _normalize_abundance_key(name)
+    }
+    legacy = {"a": "+0.00", "c": "+0.00", "n": "+0.00", "o": "+0.00", "r": "+0.00", "s": "+0.00"}
+    legacy.update({key: value for key, value in normalized.items() if key in legacy})
+    parts.extend(f"{key}{legacy[key]}" for key in ("a", "c", "n", "o", "r", "s"))
+    parts.extend(f"{key}{normalized[key]}" for key in sorted(key for key in normalized if key not in legacy))
+    return "_".join(parts)
+
 class ModelInterpolator:
     def __init__(self, config: TurbospectrumConfig):
         self.config = config
@@ -819,7 +960,25 @@ class ModelInterpolator:
 
 def run_single_synthesis(args):
     params, config = args
-    teff, logg, feh, turb_str = params
+    if isinstance(params, Mapping):
+        teff = int(params["teff"])
+        logg = float(params["logg"])
+        feh = float(params["feh"])
+        turb_str = str(
+            params.get("microturb_str")
+            or params.get("t_value")
+            or params.get("turbvel")
+            or params.get("turb")
+            or "01"
+        ).strip()
+        synthesis_abundances = _collect_synthesis_abundances(params)
+    else:
+        teff, logg, feh, turb_str = params
+        teff = int(teff)
+        logg = float(logg)
+        feh = float(feh)
+        turb_str = str(turb_str).strip()
+        synthesis_abundances = {}
 
     def build_result(status: str, message: str):
         return {
@@ -829,6 +988,7 @@ def run_single_synthesis(args):
                 "logg": logg,
                 "feh": feh,
                 "turb": turb_str,
+                "abundances": dict(synthesis_abundances),
             },
             "status": status,
             "message": message,
@@ -846,12 +1006,16 @@ def run_single_synthesis(args):
     model_file = get_model_filename(teff, logg, feh, turb_str)
     model_path = os.path.join(config.model_atmosphere_path, model_file)
     
-    base_name = os.path.splitext(model_file)[0]
+    base_name = get_synthesis_stem(teff, logg, feh, turb_str, synthesis_abundances)
     log_file = os.path.join(config.log_dir, f"{base_name}.log")
     opac_path = os.path.join(config.project_root, config.model_opac_dir, f"{base_name}opac")
     result_file = os.path.join(config.output_dir, f"{base_name}.spec")
     output_mode = _normalize_output_mode(getattr(config, "output_mode", "Flux"))
     is_intensity = output_mode == "Intensity"
+    alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(synthesis_abundances)
+    individual_abundance_count = len(
+        [line for line in individual_abundance_block.splitlines() if line.strip()]
+    )
     
     # Check if output exists and skip if force is False
     expected_outputs = []
@@ -904,12 +1068,12 @@ def run_single_synthesis(args):
 'MODELOPAC:' '{opac_path}'
 'ABUND_SOURCE:' 'magg'
 'METALLICITY:'    '{feh}'
-'ALPHA/Fe   :'    '0.00'
+'ALPHA/Fe   :'    '{alpha_fe}'
 'HELIUM     :'    '0.00'
-'R-PROCESS  :'    '0.00'
-'S-PROCESS  :'    '0.00'
-'INDIVIDUAL ABUNDANCES:'   '0'
-'XIFIX:' 'T'
+'R-PROCESS  :'    '{r_proc}'
+'S-PROCESS  :'    '{s_proc}'
+'INDIVIDUAL ABUNDANCES:'   '{individual_abundance_count}'
+{individual_abundance_block}'XIFIX:' 'T'
 {turb_val}
 """
         log.write("\n--- BABSMA INPUT ---\n")
@@ -967,12 +1131,12 @@ def run_single_synthesis(args):
 'RESULTFILE :' '{current_result_file}'
 'ABUND_SOURCE:'   'magg'
 'METALLICITY:'    '{feh}'
-'ALPHA/Fe   :'    '0.00'
+'ALPHA/Fe   :'    '{alpha_fe}'
 'HELIUM     :'    '0.00'
-'R-PROCESS  :'    '0.00'
-'S-PROCESS  :'    '0.00'
-'INDIVIDUAL ABUNDANCES:'   '0'
-'ISOTOPES : ' '0'
+'R-PROCESS  :'    '{r_proc}'
+'S-PROCESS  :'    '{s_proc}'
+'INDIVIDUAL ABUNDANCES:'   '{individual_abundance_count}'
+{individual_abundance_block}'ISOTOPES : ' '0'
 'LIST_OF_LINELISTS:' '{config.linelist_file_path}'
 'SPHERICAL:'  'F'
   30
