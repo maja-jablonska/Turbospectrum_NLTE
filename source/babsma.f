@@ -21,10 +21,11 @@
       DIMENSION TAU(NDP),PGL(NDP),XI(NDP),X(20*numbset),
      &          S(20*numbset),TAUS(NDP),taur(ndp)
       DIMENSION XLP(20*numbset),RHO(NDP),DUMDUM(NDP),RR(NDP),drr(ndp)
+      integer nnlp,iidum(16)
       real dumdumm(ndp)
       real Teff,metallicity,kboltz,mh
       dimension rhobow(ndp),coldens(ndp),xe(ndp),ghoefner(ndp)
-      dimension comparison(30),iidum(16),xlr(20)
+      dimension comparison(30),xlr(20)
       real abskk(ndp),spridd(ndp),pgk(ndp),absk(1),sprid(1)
       character*8 abname,source
       character*9 key
@@ -428,7 +429,14 @@ cccc          print*,'reading ntau again ',ntau
           read(imod)(iidum(i),i=1,nel),nnlp,(xlr(i),i=1,nnlp),
      &     jdum,idum,idum,(abname(kp),source(kp),kp=1,jdum)
 *
+
+!          print*,'wavelengths ',nnlp, (xlr(i),i=1,nnlp)
           xls=xlr(nnlp)
+
+          if (nnlp.gt.100000) xls=5000.
+! strange condition happening with older models where nnlp is very large and obviously wrong.
+! we have always used 5000\AA as standard wavelength
+
           Print*, ' Lambda standard = ',xls
 *
           if(.not.xifix) then
