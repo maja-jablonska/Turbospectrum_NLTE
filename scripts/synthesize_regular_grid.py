@@ -17,7 +17,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 
@@ -206,6 +206,22 @@ def _verify_continuum_saved(spectra_zarr: str) -> None:
             f"Synthesis output {path} has mismatched shapes: "
             f"flux={flux_shape}, continuum={continuum_shape}"
         )
+    status_counts = root.attrs.get("status_counts")
+    if isinstance(status_counts, Mapping):
+        bad = {}
+        for key, value in status_counts.items():
+            try:
+                count = int(value)
+            except Exception:
+                continue
+            if count <= 0:
+                continue
+            if str(key).strip().lower() not in {"success", "skipped"}:
+                bad[str(key)] = count
+        if bad:
+            raise ValueError(
+                f"Synthesis output {path} recorded failed rows in status_counts: {bad}"
+            )
 
 
 def _write_mu_range_config(

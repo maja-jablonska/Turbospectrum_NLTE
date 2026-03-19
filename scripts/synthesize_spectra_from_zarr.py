@@ -44,6 +44,7 @@ from run_turbospectrum import (  # noqa: E402
     get_synthesis_stem,
     resolve_linelist_paths,
     run_single_synthesis,
+    validate_runtime_environment,
 )
 from provenance_contract import (  # noqa: E402
     assert_required_provenance_fields,
@@ -131,6 +132,8 @@ DEFAULT_CONFIG_PATH = os.path.abspath(
 DEFAULT_OUTPUT_PATH = os.path.abspath(
     os.path.join(SCRIPT_DIR, "..", "runs", "local-dev", "outputs", "zarr", "synthesized_spectra.zarr")
 )
+
+_SUCCESS_STATUSES = {"success", "skipped"}
 
 _WORKER_CONFIG: TurbospectrumConfig | None = None
 
@@ -750,6 +753,17 @@ def _synthesis_task(args) -> Dict:
                 "mu_selected": float("nan"),
                 "mu_selected_index": -1,
             }
+    elif str(result.get("status", "")).lower() in _SUCCESS_STATUSES:
+        return {
+            "index": index,
+            "base_name": base_name,
+            "status": "error",
+            "message": f"Missing spectrum output: {spec_path}",
+            "duration": duration,
+            "spectrum": None,
+            "mu_selected": float("nan"),
+            "mu_selected_index": -1,
+        }
 
     return {
         "index": index,
@@ -957,6 +971,88 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
     return tasks
 
 
+def _status_counts(statuses: Sequence[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for status in statuses:
+        key = str(status)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _format_row_samples(
+    indices: np.ndarray,
+    statuses: Sequence[str],
+    messages: Sequence[str],
+    *,
+    label: str,
+    limit: int = 5,
+) -> str:
+    if indices.size == 0:
+        return ""
+
+    parts: List[str] = []
+    for idx in indices[:limit].tolist():
+        message = str(messages[int(idx)]).strip()
+        if len(message) > 160:
+            message = f"{message[:157]}..."
+        parts.append(f"row={int(idx)} status={statuses[int(idx)]} msg={message or '<none>'}")
+
+    suffix = "" if indices.size <= limit else f" (+{int(indices.size - limit)} more)"
+    return f"{label}: " + "; ".join(parts) + suffix
+
+
+def _validate_synthesis_results(
+    *,
+    statuses: Sequence[str],
+    messages: Sequence[str],
+    fluxes: np.ndarray,
+    continua: np.ndarray,
+) -> Dict[str, int]:
+    """Reject silently broken runs before they are written to the final Zarr."""
+    counts = _status_counts(statuses)
+
+    bad_status_rows = np.asarray(
+        [idx for idx, status in enumerate(statuses) if str(status).lower() not in _SUCCESS_STATUSES],
+        dtype=np.int64,
+    )
+    invalid_flux_rows = np.where(~np.all(np.isfinite(fluxes), axis=1))[0].astype(np.int64, copy=False)
+    invalid_cont_rows = np.where(~np.any(np.isfinite(continua), axis=1))[0].astype(np.int64, copy=False)
+
+    if bad_status_rows.size == 0 and invalid_flux_rows.size == 0 and invalid_cont_rows.size == 0:
+        return counts
+
+    details = [f"status_counts={json.dumps(counts, sort_keys=True)}"]
+    if bad_status_rows.size:
+        details.append(
+            _format_row_samples(
+                bad_status_rows,
+                statuses,
+                messages,
+                label=f"failed rows={int(bad_status_rows.size)}",
+            )
+        )
+    if invalid_flux_rows.size:
+        details.append(
+            _format_row_samples(
+                invalid_flux_rows,
+                statuses,
+                messages,
+                label=f"rows with non-finite flux={int(invalid_flux_rows.size)}",
+            )
+        )
+    if invalid_cont_rows.size:
+        details.append(
+            _format_row_samples(
+                invalid_cont_rows,
+                statuses,
+                messages,
+                label=f"rows with no finite continuum={int(invalid_cont_rows.size)}",
+            )
+        )
+
+    raise RuntimeError("Synthesis produced invalid spectra; aborting write. " + " | ".join(details))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grid-zarr", required=True, help="Input Zarr grid path")
@@ -1002,6 +1098,7 @@ def main() -> None:
         config.output_dir = os.path.join(scratch, "spectra")
         config.model_opac_dir = os.path.join(scratch, "opac")
     ensure_directories(config)
+    validate_runtime_environment(config)
     try:
         config.linelist_file_path = create_linelist_file(config)
     except LinelistValidationError as exc:
@@ -1088,9 +1185,12 @@ def main() -> None:
     config_payload = dataclasses.asdict(config)
     config_hash = canonical_json_sha256(config_payload)
     grid_definition_hash = compute_grid_definition_hash(column_data)
-    status_counts: Dict[str, int] = {}
-    for s in statuses:
-        status_counts[s] = status_counts.get(s, 0) + 1
+    status_counts = _validate_synthesis_results(
+        statuses=statuses,
+        messages=messages,
+        fluxes=fluxes,
+        continua=continua,
+    )
 
     linelist_files_abs = _resolve_linelist_paths(config)
     linelist_files_manifest: List[Dict[str, Any]] = []

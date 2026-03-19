@@ -463,6 +463,52 @@ def ensure_directories(config: TurbospectrumConfig):
     os.makedirs(opac_full_path, exist_ok=True)
 
 
+def validate_runtime_environment(config: TurbospectrumConfig) -> None:
+    """Fail fast when the Turbospectrum runtime is incomplete."""
+    problems: List[str] = []
+
+    required_execs = [
+        ("babsma", getattr(config, "babsma_path", "")),
+        ("bsyn", getattr(config, "bsyn_path", "")),
+        ("interpolator", getattr(config, "interpol_path", "")),
+    ]
+    for label, path in required_execs:
+        resolved = str(path or "").strip()
+        if not resolved:
+            problems.append(f"{label} executable path is empty")
+            continue
+        if not os.path.isfile(resolved):
+            problems.append(f"{label} executable not found: {resolved}")
+            continue
+        if not os.access(resolved, os.X_OK):
+            problems.append(f"{label} executable is not runnable: {resolved}")
+
+    model_root = os.path.abspath(str(config.model_atmosphere_path or "").strip())
+    if not model_root:
+        problems.append("model_atmosphere_path is empty")
+    elif not os.path.isdir(model_root):
+        problems.append(f"model atmosphere directory not found: {model_root}")
+    else:
+        try:
+            if not glob.glob(os.path.join(model_root, "*.mod")):
+                problems.append(f"model atmosphere directory contains no .mod files: {model_root}")
+        except OSError as exc:
+            problems.append(f"could not inspect model atmosphere directory {model_root}: {exc}")
+
+    if config.nlte and config.nlte_info_file:
+        nlte_info = os.path.abspath(str(config.nlte_info_file))
+        if not os.path.isfile(nlte_info):
+            problems.append(f"NLTE info file not found: {nlte_info}")
+
+    if problems:
+        bullet_list = "\n".join(f"- {problem}" for problem in problems)
+        raise FileNotFoundError(
+            "Invalid Turbospectrum runtime configuration. "
+            "Fix the missing binaries/data paths before rerunning:\n"
+            f"{bullet_list}"
+        )
+
+
 def _parse_int_env(var_name: str) -> Optional[int]:
     """Parse integer-like environment variables robustly."""
     raw_value = os.environ.get(var_name)
