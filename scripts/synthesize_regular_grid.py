@@ -13,6 +13,7 @@ Workflow:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -224,37 +225,85 @@ def _verify_continuum_saved(spectra_zarr: str) -> None:
             )
 
 
-def _write_mu_range_config(
+def _deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+    return copy.deepcopy(override)
+
+
+def _normalize_synthesis_overrides(overrides: Mapping[str, Any], cfg_dir: str) -> Dict[str, Any]:
+    normalized = copy.deepcopy(dict(overrides))
+
+    project_root = normalized.get("project_root")
+    if isinstance(project_root, str) and project_root.strip():
+        normalized["project_root"] = _abs_from(cfg_dir, project_root)
+
+    paths = normalized.get("paths")
+    if isinstance(paths, dict):
+        for key in ("model_atmosphere_path", "linelist_path", "output_dir", "log_dir", "tmp_dir"):
+            value = paths.get(key)
+            if isinstance(value, str) and value.strip():
+                paths[key] = _abs_from(cfg_dir, value)
+
+    return normalized
+
+
+def _materialize_synthesis_config(
     *,
     base_config_path: str,
     run_root: str,
-    mu_axis: np.ndarray,
+    overrides: Mapping[str, Any] | None = None,
+    overrides_base_dir: str | None = None,
+    mu_axis: np.ndarray | None = None,
 ) -> str:
-    mu_min = float(np.min(mu_axis))
-    mu_max = float(np.max(mu_axis))
-    if mu_min < -1e-8 or mu_max > 1.0 + 1e-8:
-        raise ValueError(f"mu range must stay within [0, 1], got {mu_min}..{mu_max}")
+    needs_write = bool(overrides) or mu_axis is not None
+    if not needs_write:
+        return base_config_path
 
     cfg = _load_json(base_config_path)
-    synthesis = cfg.setdefault("synthesis_parameters", {})
-    if not isinstance(synthesis, dict):
-        raise ValueError("synthesis_parameters must be a JSON object in synthesis config")
-    mu_sampling = synthesis.setdefault("mu_sampling", {})
-    if not isinstance(mu_sampling, dict):
-        raise ValueError("synthesis_parameters.mu_sampling must be a JSON object in synthesis config")
-    mode = str(mu_sampling.get("mode", "none")).strip().lower()
-    if mode in {"", "none"}:
-        mu_sampling["mode"] = "random"
-    mu_sampling.setdefault("count", 1)
-    mu_sampling["min"] = mu_min
-    mu_sampling["max"] = mu_max
+    if overrides:
+        if not isinstance(overrides, Mapping):
+            raise ValueError("turbospectrum.overrides must be a JSON object")
+        override_cfg = dict(overrides)
+        if overrides_base_dir:
+            override_cfg = _normalize_synthesis_overrides(override_cfg, overrides_base_dir)
+        cfg = _deep_merge(cfg, override_cfg)
+
+    if mu_axis is not None:
+        mu_min = float(np.min(mu_axis))
+        mu_max = float(np.max(mu_axis))
+        if mu_min < -1e-8 or mu_max > 1.0 + 1e-8:
+            raise ValueError(f"mu range must stay within [0, 1], got {mu_min}..{mu_max}")
+
+        synthesis = cfg.setdefault("synthesis_parameters", {})
+        if not isinstance(synthesis, dict):
+            raise ValueError("synthesis_parameters must be a JSON object in synthesis config")
+        mu_sampling = synthesis.setdefault("mu_sampling", {})
+        if not isinstance(mu_sampling, dict):
+            raise ValueError("synthesis_parameters.mu_sampling must be a JSON object in synthesis config")
+        mode = str(mu_sampling.get("mode", "none")).strip().lower()
+        if mode in {"", "none"}:
+            mu_sampling["mode"] = "random"
+        mu_sampling.setdefault("count", 1)
+        mu_sampling["min"] = mu_min
+        mu_sampling["max"] = mu_max
 
     cfg_dir = os.path.join(run_root, "config")
     os.makedirs(cfg_dir, exist_ok=True)
-    dst = os.path.join(cfg_dir, "synthesis_config.mu_range.json")
+    dst = os.path.join(cfg_dir, "synthesis_config.regular_grid.json")
     with open(dst, "w", encoding="utf-8") as handle:
         json.dump(cfg, handle, indent=2, sort_keys=True)
     return dst
+
+
+def _default_shard_template(run_root: str) -> str:
+    return os.path.join(run_root, "outputs", "shards", "spectra_shard_{shard_index}.zarr")
 
 
 def main() -> None:
@@ -300,6 +349,11 @@ def main() -> None:
     parser.add_argument("--output-tmp", default=None, help="Atomic tmp output path passed as --output-tmp")
     parser.add_argument("--log-level", default=None, help="Logging level for synthesis script")
     parser.add_argument("--log-file", default=None, help="Optional synthesis log file path")
+    parser.add_argument(
+        "--print-runtime-json",
+        action="store_true",
+        help="Print resolved regular-grid runtime settings as JSON and exit.",
+    )
     args = parser.parse_args()
 
     cfg: Dict[str, Any] = {}
@@ -385,11 +439,18 @@ def main() -> None:
         ("outputs", "spectra_zarr"),
         os.path.join(run_root, "outputs", "zarr", "regular_synthesized_spectra.zarr"),
     )
+    shard_template_cfg = _cfg_get(cfg, ("outputs", "spectra_shard_template"), None)
+    if shard_template_cfg is not None:
+        spectra_shard_template = _abs_from(cfg_dir, str(shard_template_cfg))
+    else:
+        spectra_shard_template = os.path.abspath(_default_shard_template(run_root))
+    spectra_shards_dir = os.path.dirname(spectra_shard_template)
 
     synthesis_cfg_default = os.path.join(REPO_ROOT, "configs", "synthesis", "config_sample_comprehensive.json")
     synthesis_cfg_from_template = _cfg_get(cfg, ("turbospectrum", "config"), None)
     if synthesis_cfg_from_template is None:
         synthesis_cfg_from_template = _cfg_get(cfg, ("runtime", "config"), None)
+    synthesis_overrides = _cfg_get(cfg, ("turbospectrum", "overrides"), None)
     if args.config is not None:
         config_path = _as_abspath(args.config)
     elif synthesis_cfg_from_template is not None:
@@ -426,8 +487,37 @@ def main() -> None:
 
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"Synthesis config not found: {config_path}")
-    if mu_axis is not None:
-        config_path = _write_mu_range_config(base_config_path=config_path, run_root=run_root, mu_axis=mu_axis)
+    config_path = _materialize_synthesis_config(
+        base_config_path=config_path,
+        run_root=run_root,
+        overrides=synthesis_overrides,
+        overrides_base_dir=cfg_dir,
+        mu_axis=mu_axis,
+    )
+
+    resolved_runtime = {
+        "run_root": run_root,
+        "grid_zarr": grid_zarr,
+        "grid_csv": grid_csv,
+        "index_parquet": index_parquet,
+        "spectra_zarr": spectra_zarr,
+        "spectra_shard_template": spectra_shard_template,
+        "spectra_shards_dir": spectra_shards_dir,
+        "synthesis_config_path": config_path,
+        "scratch": scratch,
+        "output_tmp": output_tmp,
+        "workers": workers,
+        "chunk_rows": chunk_rows,
+        "log_level": log_level,
+        "log_file": log_file,
+        "skip_synthesis": bool(skip_synthesis),
+        "output_mode": output_mode,
+        "calculation_mode": calculation_mode,
+    }
+
+    if args.print_runtime_json:
+        print(json.dumps(resolved_runtime, sort_keys=True))
+        return
 
     abundances = {
         "a": str(_coalesce(args.a, cfg, ("grid", "abundances", "a"), "+0.00")),

@@ -1,11 +1,12 @@
 import os
 import tempfile
 import unittest
+import json
 
 import numpy as np
 import zarr
 
-from scripts.synthesize_regular_grid import _verify_continuum_saved
+from scripts.synthesize_regular_grid import _materialize_synthesis_config, _verify_continuum_saved
 from scripts.synthesize_spectra_from_zarr import _validate_synthesis_results
 
 
@@ -81,6 +82,71 @@ class RegularGridValidationTests(unittest.TestCase):
             root.attrs["status_counts"] = {"success": 1}
 
             _verify_continuum_saved(tmpdir)
+
+    def test_materialize_synthesis_config_applies_inline_linelist_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_cfg_path = os.path.join(tmpdir, "base.json")
+            run_root = os.path.join(tmpdir, "run")
+            cfg_dir = os.path.join(tmpdir, "configs", "pipeline")
+            linelist_dir = os.path.join(tmpdir, "input_files", "linelists")
+            os.makedirs(cfg_dir, exist_ok=True)
+            os.makedirs(linelist_dir, exist_ok=True)
+
+            with open(base_cfg_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "project_root": "",
+                        "paths": {
+                            "linelist_path": "",
+                            "linelist_files": ["base_list"],
+                        },
+                        "synthesis_parameters": {
+                            "output_mode": "Flux",
+                        },
+                    },
+                    handle,
+                )
+
+            materialized = _materialize_synthesis_config(
+                base_config_path=base_cfg_path,
+                run_root=run_root,
+                overrides={
+                    "paths": {
+                        "linelist_path": "../../input_files/linelists",
+                        "linelist_files": ["custom_list"],
+                    }
+                },
+                overrides_base_dir=cfg_dir,
+            )
+
+            self.assertTrue(materialized.startswith(os.path.join(run_root, "config")))
+            with open(materialized, "r", encoding="utf-8") as handle:
+                cfg = json.load(handle)
+
+            self.assertEqual(cfg["paths"]["linelist_path"], linelist_dir)
+            self.assertEqual(cfg["paths"]["linelist_files"], ["custom_list"])
+
+    def test_materialize_synthesis_config_applies_mu_range_to_written_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_cfg_path = os.path.join(tmpdir, "base.json")
+            run_root = os.path.join(tmpdir, "run")
+            with open(base_cfg_path, "w", encoding="utf-8") as handle:
+                json.dump({"synthesis_parameters": {}}, handle)
+
+            materialized = _materialize_synthesis_config(
+                base_config_path=base_cfg_path,
+                run_root=run_root,
+                mu_axis=np.asarray([0.2, 0.5, 0.8], dtype=np.float64),
+            )
+
+            with open(materialized, "r", encoding="utf-8") as handle:
+                cfg = json.load(handle)
+
+            mu_sampling = cfg["synthesis_parameters"]["mu_sampling"]
+            self.assertEqual(mu_sampling["mode"], "random")
+            self.assertEqual(mu_sampling["count"], 1)
+            self.assertEqual(mu_sampling["min"], 0.2)
+            self.assertEqual(mu_sampling["max"], 0.8)
 
 
 if __name__ == "__main__":

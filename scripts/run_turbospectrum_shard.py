@@ -34,6 +34,7 @@ from run_turbospectrum import (  # noqa: E402
     get_model_filename,
     resolve_linelist_paths,
     run_single_synthesis,
+    validate_runtime_environment,
 )
 from provenance_contract import (  # noqa: E402
     assert_required_provenance_fields,
@@ -257,6 +258,54 @@ def _write_string_scalar(root, name: str, value: str) -> None:
             arr[0] = str(value)
             return
     _write_string_1d(root, name, [str(value)], chunks=1)
+
+
+def _existing_shard_is_usable(path: str, expected_global_indices: np.ndarray) -> bool:
+    try:
+        root = _open_shard(path)
+    except Exception:
+        return False
+
+    required = ("wavelength", "global_index", "flux", "status", "message")
+    if any(name not in root for name in required):
+        return False
+
+    try:
+        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
+        flux = np.asarray(root["flux"][:], dtype=np.float32)
+    except Exception:
+        return False
+
+    if gidx.ndim != 1 or flux.ndim != 2 or flux.shape[0] != gidx.size:
+        return False
+
+    if not np.array_equal(gidx, expected_global_indices.astype(np.int64, copy=False)):
+        return False
+
+    try:
+        statuses = [str(x).strip().lower() for x in np.asarray(root["status"][:]).tolist()]
+    except Exception:
+        return False
+
+    if len(statuses) != gidx.size:
+        return False
+    if any(status not in {"success", "skipped"} for status in statuses):
+        return False
+
+    if not np.all(np.isfinite(flux)):
+        return False
+
+    if "continuum" in root:
+        try:
+            continuum = np.asarray(root["continuum"][:], dtype=np.float32)
+        except Exception:
+            return False
+        if continuum.shape != flux.shape:
+            return False
+        if not np.all(np.any(np.isfinite(continuum), axis=1)):
+            return False
+
+    return True
 
 
 def _finalize_zarr_store(write_path: str, final_path: str, *, logger: logging.Logger, label: str) -> None:
@@ -650,14 +699,6 @@ def main():
         write_path = final_path
 
     ############################################
-    # Idempotency
-    ############################################
-
-    if os.path.exists(final_path):
-        logger.warning("Shard output already exists — skipping.")
-        return
-
-    ############################################
     # Auto scratch
     ############################################
 
@@ -710,6 +751,7 @@ def main():
         config.model_opac_dir = os.path.join(scratch, "opac")
 
     ensure_directories(config)
+    validate_runtime_environment(config)
     try:
         config.linelist_file_path = create_linelist_file(config)
     except LinelistValidationError as exc:
@@ -856,6 +898,20 @@ def main():
         args.shard_count,
         len(indices),
     )
+
+    ############################################
+    # Idempotency
+    ############################################
+
+    if os.path.exists(final_path):
+        if _existing_shard_is_usable(final_path, indices):
+            logger.warning("Shard output already exists and is valid — skipping.")
+            return
+        logger.warning("Shard output exists but is incomplete/invalid; removing and recomputing: %s", final_path)
+        shutil.rmtree(final_path, ignore_errors=True)
+    if write_path != final_path and os.path.exists(write_path):
+        logger.warning("Removing stale shard tmp output before recompute: %s", write_path)
+        shutil.rmtree(write_path, ignore_errors=True)
 
     # If the shard is empty (common when shard_count > row_count), write an empty
     # but valid shard store and exit cleanly.
