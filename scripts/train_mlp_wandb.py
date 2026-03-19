@@ -1,0 +1,1795 @@
+#!/usr/bin/env python3
+"""Train FLAX MLP models over hyperparameter sweeps and log to Weights & Biases.
+
+This script is designed for local testing and HPC scheduling (including Gadi):
+- Runs one or many hyperparameter configurations from CLI grids or JSON sweep config.
+- Supports `--run-index` (or env-driven index) so each array task can run a single config.
+- Logs per-epoch metrics to Weights & Biases (online/offline/disabled).
+- Trains on spectra targets resampled to a configurable linear/log wavelength axis.
+
+Example
+-------
+python scripts/train_mlp_wandb.py \
+  --zarr-path spectra_tiny.zarr \
+  --wandb-project turbospectrum-mlp \
+  --wandb-mode offline \
+  --hidden-dims-grid 128x256,256x256 \
+  --learning-rate-grid 1e-3,3e-4 \
+  --epochs-grid 20 \
+  --batch-size-grid 32
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import importlib.metadata
+import itertools
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
+import zarr
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "runs" / "mlp_wandb"
+DEFAULT_SWEEP_CONFIG = REPO_ROOT / "configs" / "training" / "mlp_wandb_sweep.example.json"
+
+
+@dataclasses.dataclass(frozen=True)
+class RunSpec:
+    hidden_dims: tuple[int, ...]
+    learning_rate: float
+    weight_decay: float
+    lambda_hi: float
+    lambda_lo: float
+    lambda_smooth: float
+    huber_delta: float
+    warmup_fraction: float
+    min_lr_ratio: float
+    epochs: int
+    batch_size: int
+    seed: int
+    run_name: str | None = None
+
+
+def _configure_logging(level: str) -> logging.Logger:
+    logger = logging.getLogger("train_mlp_wandb")
+    if logger.handlers:
+        return logger
+
+    log_level = getattr(logging, (level or "INFO").upper(), logging.INFO)
+    logger.setLevel(log_level)
+    logger.propagate = False
+
+    handler = logging.StreamHandler()
+    handler.setLevel(log_level)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+    return logger
+
+
+def _zarr_store(path: str):
+    if hasattr(zarr, "DirectoryStore"):
+        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
+    from zarr import storage as zstorage  # type: ignore
+
+    if hasattr(zstorage, "DirectoryStore"):
+        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
+    if hasattr(zstorage, "LocalStore"):
+        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
+    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+
+
+def _installed_version(package_name: str) -> str:
+    try:
+        return importlib.metadata.version(package_name)
+    except Exception:  # noqa: BLE001
+        return "not installed"
+
+
+def _open_zarr_root(path: Path):
+    return zarr.open_group(store=_zarr_store(str(path)), mode="r")
+
+
+def _decode_strings(values: np.ndarray) -> tuple[str, ...]:
+    out: list[str] = []
+    for item in np.asarray(values).tolist():
+        if isinstance(item, bytes):
+            out.append(item.decode("utf-8"))
+        else:
+            out.append(str(item))
+    return tuple(out)
+
+
+def _split_csv(raw: str) -> list[str]:
+    return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
+def _env_or_default(name: str, default: str | None = None) -> str | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if value == "":
+        return default if default is not None else None
+    return value
+
+
+def _parse_float_grid(raw: str) -> list[float]:
+    values = [float(v) for v in _split_csv(raw)]
+    if not values:
+        raise ValueError("Expected at least one floating-point value in grid")
+    return values
+
+
+def _parse_int_grid(raw: str) -> list[int]:
+    values = [int(v) for v in _split_csv(raw)]
+    if not values:
+        raise ValueError("Expected at least one integer value in grid")
+    return values
+
+
+def _parse_hidden_dims(value: Any) -> tuple[int, ...]:
+    if isinstance(value, str):
+        tokens = [tok for tok in value.strip().lower().split("x") if tok]
+    elif isinstance(value, Sequence):
+        tokens = [str(tok).strip() for tok in value if str(tok).strip()]
+    else:
+        raise TypeError(f"Cannot parse hidden_dims from type {type(value)!r}")
+
+    dims = tuple(int(tok) for tok in tokens)
+    if not dims:
+        raise ValueError("hidden_dims must have at least one layer")
+    if any(dim <= 0 for dim in dims):
+        raise ValueError(f"hidden_dims must be positive, got {dims}")
+    return dims
+
+
+def _parse_hidden_dims_grid(raw: str) -> list[tuple[int, ...]]:
+    dims = [_parse_hidden_dims(token) for token in _split_csv(raw)]
+    if not dims:
+        raise ValueError("hidden_dims grid is empty")
+    return dims
+
+
+def _parse_bool(raw: Any) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value from '{raw}'")
+
+
+def _sanitize_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", name).strip("-") or "run"
+
+
+def _spec_to_compact_name(spec: RunSpec, run_index: int) -> str:
+    if spec.run_name:
+        return _sanitize_name(spec.run_name)
+    h = "x".join(str(x) for x in spec.hidden_dims)
+    return _sanitize_name(
+        f"run{run_index:03d}_h{h}_lr{spec.learning_rate:g}_wd{spec.weight_decay:g}"
+        f"_bs{spec.batch_size}_lh{spec.lambda_hi:g}_ll{spec.lambda_lo:g}"
+        f"_ls{spec.lambda_smooth:g}_hd{spec.huber_delta:g}_ep{spec.epochs}"
+    )
+
+
+def _resolve_default_zarr_path() -> Path | None:
+    candidates = (
+        REPO_ROOT / "spectra_tiny.zarr",
+        REPO_ROOT / "scripts" / "synthesized_spectra.zarr",
+        REPO_ROOT / "runs" / "local-dev" / "outputs" / "zarr" / "synthesized_spectra.zarr",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def _parse_input_features(raw: str | None, available: Sequence[str]) -> list[str] | None:
+    if raw is None:
+        return list(available) if available else None
+    values = _split_csv(raw)
+    if not values:
+        return None
+    return values
+
+
+def _run_spec_from_mapping(raw: Mapping[str, Any], defaults: RunSpec, seed_fallback: int) -> RunSpec:
+    hidden_dims = _parse_hidden_dims(raw.get("hidden_dims", defaults.hidden_dims))
+    learning_rate = float(raw.get("learning_rate", defaults.learning_rate))
+    weight_decay = float(raw.get("weight_decay", defaults.weight_decay))
+    lambda_hi = float(raw.get("lambda_hi", defaults.lambda_hi))
+    lambda_lo = float(raw.get("lambda_lo", defaults.lambda_lo))
+    lambda_smooth = float(raw.get("lambda_smooth", defaults.lambda_smooth))
+    huber_delta = float(raw.get("huber_delta", defaults.huber_delta))
+    warmup_fraction = float(raw.get("warmup_fraction", defaults.warmup_fraction))
+    min_lr_ratio = float(raw.get("min_lr_ratio", defaults.min_lr_ratio))
+    epochs = int(raw.get("epochs", defaults.epochs))
+    batch_size = int(raw.get("batch_size", defaults.batch_size))
+    seed = int(raw.get("seed", seed_fallback))
+    run_name = raw.get("run_name")
+
+    if epochs <= 0:
+        raise ValueError(f"epochs must be positive, got {epochs}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if lambda_smooth < 0.0:
+        raise ValueError(f"lambda_smooth must be >= 0, got {lambda_smooth}")
+    if huber_delta <= 0.0:
+        raise ValueError(f"huber_delta must be > 0, got {huber_delta}")
+    if not 0.0 <= warmup_fraction < 1.0:
+        raise ValueError(f"warmup_fraction must be in [0, 1), got {warmup_fraction}")
+    if not 0.0 < min_lr_ratio <= 1.0:
+        raise ValueError(f"min_lr_ratio must be in (0, 1], got {min_lr_ratio}")
+
+    return RunSpec(
+        hidden_dims=hidden_dims,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        lambda_hi=lambda_hi,
+        lambda_lo=lambda_lo,
+        lambda_smooth=lambda_smooth,
+        huber_delta=huber_delta,
+        warmup_fraction=warmup_fraction,
+        min_lr_ratio=min_lr_ratio,
+        epochs=epochs,
+        batch_size=batch_size,
+        seed=seed,
+        run_name=str(run_name) if run_name is not None else None,
+    )
+
+
+def _build_specs_from_cli(args: argparse.Namespace) -> list[RunSpec]:
+    hidden_dims_grid = _parse_hidden_dims_grid(args.hidden_dims_grid)
+    learning_rate_grid = _parse_float_grid(args.learning_rate_grid)
+    weight_decay_grid = _parse_float_grid(args.weight_decay_grid)
+    lambda_hi_grid = _parse_float_grid(args.lambda_hi_grid)
+    lambda_lo_grid = _parse_float_grid(args.lambda_lo_grid)
+    lambda_smooth_grid = _parse_float_grid(args.lambda_smooth_grid)
+    huber_delta_grid = _parse_float_grid(args.huber_delta_grid)
+    warmup_fraction_grid = _parse_float_grid(args.warmup_fraction_grid)
+    min_lr_ratio_grid = _parse_float_grid(args.min_lr_ratio_grid)
+    epochs_grid = _parse_int_grid(args.epochs_grid)
+    batch_size_grid = _parse_int_grid(args.batch_size_grid)
+
+    specs: list[RunSpec] = []
+    for combo in itertools.product(
+        hidden_dims_grid,
+        learning_rate_grid,
+        weight_decay_grid,
+        lambda_hi_grid,
+        lambda_lo_grid,
+        lambda_smooth_grid,
+        huber_delta_grid,
+        warmup_fraction_grid,
+        min_lr_ratio_grid,
+        epochs_grid,
+        batch_size_grid,
+    ):
+        hidden_dims, lr, wd, lhi, llo, lsmooth, hdelta, warmup, min_lr, epochs, batch_size = combo
+        specs.append(
+            RunSpec(
+                hidden_dims=tuple(hidden_dims),
+                learning_rate=float(lr),
+                weight_decay=float(wd),
+                lambda_hi=float(lhi),
+                lambda_lo=float(llo),
+                lambda_smooth=float(lsmooth),
+                huber_delta=float(hdelta),
+                warmup_fraction=float(warmup),
+                min_lr_ratio=float(min_lr),
+                epochs=int(epochs),
+                batch_size=int(batch_size),
+                seed=0,  # filled below
+            )
+        )
+
+    for idx, spec in enumerate(specs):
+        specs[idx] = dataclasses.replace(spec, seed=int(args.seed + idx))
+    return specs
+
+
+def _build_specs_from_config(config_path: Path, defaults: RunSpec, base_seed: int) -> list[RunSpec]:
+    payload = json.loads(config_path.read_text())
+
+    if isinstance(payload, list):
+        runs = payload
+        return [_run_spec_from_mapping(run, defaults=defaults, seed_fallback=base_seed + i) for i, run in enumerate(runs)]
+
+    if not isinstance(payload, dict):
+        raise ValueError("Sweep config must be a mapping or a list of run mappings")
+
+    if "runs" in payload:
+        runs = payload["runs"]
+        if not isinstance(runs, list):
+            raise ValueError("'runs' in sweep config must be a list")
+        return [_run_spec_from_mapping(run, defaults=defaults, seed_fallback=base_seed + i) for i, run in enumerate(runs)]
+
+    if "grid" not in payload:
+        raise ValueError("Sweep config must contain either 'runs' or 'grid'")
+
+    grid = payload["grid"]
+    if not isinstance(grid, dict):
+        raise ValueError("'grid' in sweep config must be a mapping")
+    config_defaults = payload.get("defaults", {})
+    if config_defaults and not isinstance(config_defaults, dict):
+        raise ValueError("'defaults' in sweep config must be a mapping")
+
+    merged_defaults = _run_spec_from_mapping(config_defaults or {}, defaults=defaults, seed_fallback=base_seed)
+
+    hidden_dims_values = grid.get("hidden_dims", [merged_defaults.hidden_dims])
+    learning_rate_values = grid.get("learning_rate", [merged_defaults.learning_rate])
+    weight_decay_values = grid.get("weight_decay", [merged_defaults.weight_decay])
+    lambda_hi_values = grid.get("lambda_hi", [merged_defaults.lambda_hi])
+    lambda_lo_values = grid.get("lambda_lo", [merged_defaults.lambda_lo])
+    lambda_smooth_values = grid.get("lambda_smooth", [merged_defaults.lambda_smooth])
+    huber_delta_values = grid.get("huber_delta", [merged_defaults.huber_delta])
+    warmup_fraction_values = grid.get("warmup_fraction", [merged_defaults.warmup_fraction])
+    min_lr_ratio_values = grid.get("min_lr_ratio", [merged_defaults.min_lr_ratio])
+    epochs_values = grid.get("epochs", [merged_defaults.epochs])
+    batch_size_values = grid.get("batch_size", [merged_defaults.batch_size])
+
+    specs: list[RunSpec] = []
+    for i, combo in enumerate(
+        itertools.product(
+            hidden_dims_values,
+            learning_rate_values,
+            weight_decay_values,
+            lambda_hi_values,
+            lambda_lo_values,
+            lambda_smooth_values,
+            huber_delta_values,
+            warmup_fraction_values,
+            min_lr_ratio_values,
+            epochs_values,
+            batch_size_values,
+        )
+    ):
+        hidden_dims, lr, wd, lhi, llo, lsmooth, hdelta, warmup, min_lr, epochs, batch_size = combo
+        spec = _run_spec_from_mapping(
+            {
+                "hidden_dims": hidden_dims,
+                "learning_rate": lr,
+                "weight_decay": wd,
+                "lambda_hi": lhi,
+                "lambda_lo": llo,
+                "lambda_smooth": lsmooth,
+                "huber_delta": hdelta,
+                "warmup_fraction": warmup,
+                "min_lr_ratio": min_lr,
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "seed": base_seed + i,
+            },
+            defaults=merged_defaults,
+            seed_fallback=base_seed + i,
+        )
+        specs.append(spec)
+    return specs
+
+
+def _deep_update(base: dict[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_update(dict(merged[key]), value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _default_unified_config() -> dict[str, Any]:
+    return {
+        "preset": "baseline",
+        "data": {
+            "zarr_path": None,
+            "input_features": None,
+            "include_mu": True,
+            "mu_key": "auto",
+            "train_fraction": 0.8,
+            "val_fraction": 0.1,
+            "normalize_inputs": True,
+            "normalize_targets": True,
+            "axis": {
+                "name": "log_wavelength",
+                "target_points": 1024,
+                "min": None,
+                "max": None,
+            },
+        },
+        "model": {
+            "type": "mlp",
+            "hidden_dims": [128, 256],
+        },
+        "training": {
+            "seed": 7,
+            "epochs": 30,
+            "batch_size": 32,
+            "optimizer": {
+                "name": "adamw",
+                "learning_rate": 1e-3,
+                "weight_decay": 0.0,
+                "grad_clip_norm": 1.0,
+            },
+            "scheduler": {
+                "name": "warmup_cosine",
+                "warmup_fraction": 0.1,
+                "min_lr_ratio": 0.05,
+            },
+            "loss": {
+                "name": "dual_huber",
+                "huber_delta": 1.0,
+                "lambda_hi": 0.1,
+                "lambda_lo": 0.0,
+                "lambda_smooth": 1e-3,
+            },
+        },
+        "logging": {
+            "output_dir": str(DEFAULT_OUTPUT_DIR),
+            "save_checkpoints": False,
+            "jax_platform": "cpu",
+            "wandb": {
+                "enabled": True,
+                "project": "turbospectrum-mlp",
+                "entity": None,
+                "group": None,
+                "tags": [],
+                "mode": "online",
+                "dir": None,
+                "sync_after_run": False,
+                "sync_dir": None,
+                "sync_include_offline": True,
+                "sync_best_effort": True,
+            },
+        },
+        "sweep": None,
+    }
+
+
+def _unified_presets() -> dict[str, dict[str, Any]]:
+    return {
+        "baseline": {},
+        "dev": {
+            "training": {
+                "epochs": 5,
+                "batch_size": 16,
+            },
+            "logging": {
+                "wandb": {
+                    "mode": "offline",
+                }
+            },
+        },
+        "hpc": {
+            "logging": {
+                "save_checkpoints": True,
+                "wandb": {
+                    "mode": "offline",
+                    "sync_include_offline": True,
+                    "sync_best_effort": True,
+                },
+            }
+        },
+        "sweep-small": {
+            "logging": {
+                "wandb": {
+                    "mode": "offline",
+                }
+            },
+            "sweep": {
+                "parameters": {
+                    "model.hidden_dims": [[128, 256], [256, 256]],
+                    "training.optimizer.learning_rate": [1e-3, 3e-4],
+                    "training.batch_size": [32, 64],
+                    "training.loss.lambda_smooth": [1e-3, 1e-2],
+                }
+            },
+        },
+    }
+
+
+def _looks_like_unified_config(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    unified_keys = {"preset", "data", "model", "training", "logging", "sweep"}
+    return any(key in payload for key in unified_keys)
+
+
+def _normalize_wandb_tags(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, Sequence):
+        return ",".join(str(item).strip() for item in raw if str(item).strip())
+    raise TypeError(f"Unsupported wandb tags type: {type(raw)!r}")
+
+
+def _run_mapping_from_unified_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    model = dict(config.get("model", {}))
+    training = dict(config.get("training", {}))
+    optimizer = dict(training.get("optimizer", {}))
+    scheduler = dict(training.get("scheduler", {}))
+    loss = dict(training.get("loss", {}))
+    return {
+        "hidden_dims": model.get("hidden_dims", [128, 256]),
+        "learning_rate": optimizer.get("learning_rate", 1e-3),
+        "weight_decay": optimizer.get("weight_decay", 0.0),
+        "lambda_hi": loss.get("lambda_hi", 0.1),
+        "lambda_lo": loss.get("lambda_lo", 0.0),
+        "lambda_smooth": loss.get("lambda_smooth", 1e-3),
+        "huber_delta": loss.get("huber_delta", 1.0),
+        "warmup_fraction": scheduler.get("warmup_fraction", 0.1),
+        "min_lr_ratio": scheduler.get("min_lr_ratio", 0.05),
+        "epochs": training.get("epochs", 30),
+        "batch_size": training.get("batch_size", 32),
+        "seed": training.get("seed", 7),
+        "run_name": config.get("run_name"),
+    }
+
+
+def _set_path_value(target: dict[str, Any], path: str, value: Any) -> None:
+    parts = [part.strip() for part in path.split(".") if part.strip()]
+    if not parts:
+        raise ValueError(f"Invalid empty path in sweep parameter '{path}'")
+    cursor = target
+    for part in parts[:-1]:
+        next_value = cursor.get(part)
+        if next_value is None:
+            next_value = {}
+            cursor[part] = next_value
+        if not isinstance(next_value, dict):
+            raise ValueError(f"Cannot set nested path '{path}' because '{part}' is already a leaf")
+        cursor = next_value
+    cursor[parts[-1]] = value
+
+
+def _build_specs_from_unified_config(payload: Mapping[str, Any], defaults: RunSpec) -> tuple[dict[str, Any], list[RunSpec]]:
+    preset_name = str(payload.get("preset", "baseline"))
+    presets = _unified_presets()
+    if preset_name not in presets:
+        raise ValueError(f"Unknown unified config preset '{preset_name}'")
+    base_config = _deep_update(_default_unified_config(), presets[preset_name])
+    base_config = _deep_update(base_config, payload)
+    base_seed = int(dict(base_config.get("training", {})).get("seed", defaults.seed))
+    sweep = base_config.get("sweep")
+    if sweep in (None, {}):
+        run_mapping = _run_mapping_from_unified_config(base_config)
+        return base_config, [_run_spec_from_mapping(run_mapping, defaults=defaults, seed_fallback=base_seed)]
+    if not isinstance(sweep, Mapping):
+        raise ValueError("'sweep' must be a mapping when provided")
+    parameters = sweep.get("parameters", {})
+    if not isinstance(parameters, Mapping) or not parameters:
+        raise ValueError("'sweep.parameters' must be a non-empty mapping")
+
+    items: list[tuple[str, list[Any]]] = []
+    for key, raw_values in parameters.items():
+        if not isinstance(key, str):
+            raise ValueError("Sweep parameter keys must be strings")
+        if not isinstance(raw_values, Sequence) or isinstance(raw_values, (str, bytes)):
+            raise ValueError(f"Sweep parameter '{key}' must be a list of values")
+        values = list(raw_values)
+        if not values:
+            raise ValueError(f"Sweep parameter '{key}' cannot be empty")
+        items.append((key, values))
+
+    max_runs = sweep.get("max_runs")
+    specs: list[RunSpec] = []
+    for run_offset, combo in enumerate(itertools.product(*(values for _, values in items))):
+        override: dict[str, Any] = {}
+        for (path, _), value in zip(items, combo, strict=False):
+            _set_path_value(override, path, value)
+        run_config = _deep_update(base_config, override)
+        run_mapping = _run_mapping_from_unified_config(run_config)
+        run_mapping["seed"] = int(base_seed + run_offset)
+        specs.append(_run_spec_from_mapping(run_mapping, defaults=defaults, seed_fallback=base_seed + run_offset))
+        if max_runs is not None and len(specs) >= int(max_runs):
+            break
+    return base_config, specs
+
+
+def _apply_unified_config_to_args(args: argparse.Namespace, config: Mapping[str, Any]) -> None:
+    data = dict(config.get("data", {}))
+    model = dict(config.get("model", {}))
+    training = dict(config.get("training", {}))
+    optimizer = dict(training.get("optimizer", {}))
+    scheduler = dict(training.get("scheduler", {}))
+    loss = dict(training.get("loss", {}))
+    logging_cfg = dict(config.get("logging", {}))
+    wandb_cfg = dict(logging_cfg.get("wandb", {}))
+    axis = dict(data.get("axis", {}))
+
+    if data.get("zarr_path") is not None:
+        args.zarr_path = str(data["zarr_path"])
+    args.input_features = data.get("input_features")
+    args.include_mu = bool(data.get("include_mu", args.include_mu))
+    args.mu_key = str(data.get("mu_key", args.mu_key))
+    args.train_fraction = float(data.get("train_fraction", args.train_fraction))
+    args.val_fraction = float(data.get("val_fraction", args.val_fraction))
+    args.normalize_inputs = bool(data.get("normalize_inputs", args.normalize_inputs))
+    args.normalize_targets = bool(data.get("normalize_targets", args.normalize_targets))
+
+    axis_name = axis.get("name")
+    if axis_name is not None:
+        if axis_name not in {"wavelength", "log_wavelength"}:
+            raise ValueError(f"Unsupported data.axis.name '{axis_name}'")
+        args.axis_name = str(axis_name)
+        args.use_log_wavelength = bool(axis_name == "log_wavelength")
+    args.target_points = int(axis.get("target_points", args.target_points))
+    args.target_axis_min = axis.get("min", args.target_axis_min)
+    args.target_axis_max = axis.get("max", args.target_axis_max)
+
+    if model.get("type", "mlp") != "mlp":
+        raise ValueError(f"Unsupported model.type '{model.get('type')}', only 'mlp' is supported")
+
+    hidden_dims = model.get("hidden_dims")
+    if hidden_dims is not None:
+        args.hidden_dims_grid = "x".join(str(v) for v in hidden_dims)
+    args.seed = int(training.get("seed", args.seed))
+    args.epochs_grid = str(training.get("epochs", args.epochs_grid))
+    args.batch_size_grid = str(training.get("batch_size", args.batch_size_grid))
+    args.learning_rate_grid = str(optimizer.get("learning_rate", args.learning_rate_grid))
+    args.weight_decay_grid = str(optimizer.get("weight_decay", args.weight_decay_grid))
+    args.lambda_hi_grid = str(loss.get("lambda_hi", args.lambda_hi_grid))
+    args.lambda_lo_grid = str(loss.get("lambda_lo", args.lambda_lo_grid))
+    args.lambda_smooth_grid = str(loss.get("lambda_smooth", args.lambda_smooth_grid))
+    args.huber_delta_grid = str(loss.get("huber_delta", args.huber_delta_grid))
+    args.warmup_fraction_grid = str(scheduler.get("warmup_fraction", args.warmup_fraction_grid))
+    args.min_lr_ratio_grid = str(scheduler.get("min_lr_ratio", args.min_lr_ratio_grid))
+
+    if logging_cfg.get("output_dir") is not None:
+        args.output_dir = str(logging_cfg["output_dir"])
+    args.save_checkpoints = bool(logging_cfg.get("save_checkpoints", args.save_checkpoints))
+    args.jax_platform = str(logging_cfg.get("jax_platform", args.jax_platform))
+
+    wandb_enabled = bool(wandb_cfg.get("enabled", True))
+    args.wandb_mode = "disabled" if not wandb_enabled else str(wandb_cfg.get("mode", args.wandb_mode))
+    args.wandb_project = str(wandb_cfg.get("project", args.wandb_project))
+    args.wandb_entity = wandb_cfg.get("entity", args.wandb_entity)
+    args.wandb_group = wandb_cfg.get("group", args.wandb_group)
+    args.wandb_tags = _normalize_wandb_tags(wandb_cfg.get("tags", args.wandb_tags))
+    args.wandb_dir = wandb_cfg.get("dir", args.wandb_dir)
+    args.wandb_sync_after_run = bool(wandb_cfg.get("sync_after_run", args.wandb_sync_after_run))
+    args.wandb_sync_dir = wandb_cfg.get("sync_dir", args.wandb_sync_dir)
+    args.wandb_sync_include_offline = bool(
+        wandb_cfg.get("sync_include_offline", args.wandb_sync_include_offline)
+    )
+    args.wandb_sync_best_effort = bool(wandb_cfg.get("sync_best_effort", args.wandb_sync_best_effort))
+
+
+def _resolve_run_index(args: argparse.Namespace) -> int | None:
+    if args.run_index is not None:
+        return int(args.run_index)
+    if not args.run_index_env:
+        return None
+    raw = os.environ.get(args.run_index_env)
+    if raw is None:
+        raise ValueError(f"Environment variable '{args.run_index_env}' is not set")
+    env_value = int(raw)
+    return env_value - int(args.run_index_offset)
+
+
+class FluxResampler:
+    """Vectorized 1D linear interpolation from source axis to target axis."""
+
+    def __init__(self, source_axis: np.ndarray, target_points: int, source_indices: np.ndarray | None = None):
+        axis = np.asarray(source_axis, dtype=np.float64)
+        if axis.ndim != 1:
+            raise ValueError(f"source axis must be 1D, got shape {axis.shape}")
+        if axis.size < 2:
+            raise ValueError("source axis must have at least 2 values")
+        if target_points <= 0:
+            raise ValueError("target_points must be positive")
+        if np.any(~np.isfinite(axis)):
+            raise ValueError("source axis contains non-finite values")
+
+        if axis[0] > axis[-1]:
+            axis = axis[::-1]
+            self.reverse_flux = True
+        else:
+            self.reverse_flux = False
+
+        diffs = np.diff(axis)
+        if np.any(diffs <= 0.0):
+            raise ValueError("source axis must be strictly increasing")
+
+        n_target = min(int(target_points), int(axis.size))
+        target_axis = np.linspace(axis[0], axis[-1], num=n_target, dtype=np.float64)
+        left = np.searchsorted(axis, target_axis, side="right") - 1
+        left = np.clip(left, 0, axis.size - 2)
+        right = left + 1
+        den = axis[right] - axis[left]
+        alpha = np.divide(target_axis - axis[left], den, out=np.zeros_like(target_axis), where=den > 0.0)
+
+        self.source_axis = axis
+        self.target_axis = target_axis
+        self.source_indices = None if source_indices is None else np.asarray(source_indices, dtype=np.int64)
+        self.left = left.astype(np.int64)
+        self.right = right.astype(np.int64)
+        self.alpha = alpha.astype(np.float32)
+
+    def resample(self, flux_batch: np.ndarray) -> np.ndarray:
+        y = np.asarray(flux_batch, dtype=np.float32)
+        if y.ndim == 1:
+            y = y[:, None]
+        if self.source_indices is not None:
+            y = y[:, self.source_indices]
+        if self.reverse_flux:
+            y = y[:, ::-1]
+        y_left = y[:, self.left]
+        y_right = y[:, self.right]
+        out = (1.0 - self.alpha[None, :]) * y_left + self.alpha[None, :] * y_right
+        return out.astype(np.float32, copy=False)
+
+
+def _take_rows(array, row_ids: np.ndarray) -> np.ndarray:
+    ridx = np.asarray(row_ids, dtype=np.int64)
+    try:
+        return np.asarray(array.oindex[ridx, :], dtype=np.float32)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        return np.asarray(array[ridx, :], dtype=np.float32)
+    except Exception:
+        rows = [np.asarray(array[int(i), :], dtype=np.float32) for i in ridx]
+        if rows:
+            return np.stack(rows, axis=0)
+        return np.empty((0, int(array.shape[1])), dtype=np.float32)
+
+
+class BatchAdapter:
+    """Convert dataloader batches to model-ready arrays."""
+
+    def __init__(
+        self,
+        *,
+        root,
+        train_indices: np.ndarray,
+        row_count: int,
+        resampler: FluxResampler,
+        normalize_targets: bool,
+        include_mu: bool,
+        mu_key: str,
+        logger: logging.Logger,
+    ):
+        self.root = root
+        self.resampler = resampler
+        self.normalize_targets = bool(normalize_targets)
+        self.target_points = int(resampler.target_axis.size)
+        self.target_dim = 2 * self.target_points
+        self.include_mu = include_mu
+        self.mu_source = "disabled"
+        self.mu_feature = np.zeros((row_count,), dtype=np.float32)
+        self.continuum_source = self._resolve_continuum_source(root=root)
+        if self.continuum_source == "unity_fallback":
+            logger.warning(
+                "No continuum/flux_norm array found; using unity continuum fallback (normalized target equals flux)."
+            )
+        self.target_mean = np.zeros((self.target_dim,), dtype=np.float32)
+        self.target_std = np.ones((self.target_dim,), dtype=np.float32)
+        self.norm_hi_bound = np.ones((self.target_points,), dtype=np.float32)
+        self.norm_lo_bound = np.zeros((self.target_points,), dtype=np.float32)
+
+        if include_mu:
+            self.mu_feature, self.mu_source = self._build_mu_feature(
+                root=root,
+                train_indices=train_indices,
+                row_count=row_count,
+                mu_key=mu_key,
+                logger=logger,
+            )
+        if self.normalize_targets:
+            self.target_mean, self.target_std = self._compute_target_stats(
+                root=root,
+                train_indices=np.asarray(train_indices, dtype=np.int64),
+            )
+            mean_norm = self.target_mean[self.target_points :]
+            std_norm = self.target_std[self.target_points :]
+            self.norm_hi_bound = (1.0 - mean_norm) / std_norm
+            self.norm_lo_bound = (0.0 - mean_norm) / std_norm
+
+    @staticmethod
+    def _resolve_continuum_source(*, root) -> str:
+        if "continuum" in root:
+            return "continuum"
+
+        for key in root.array_keys():
+            key_name = str(key)
+            if key_name.lower().startswith("continuum"):
+                return key_name
+
+        if "flux_norm" in root:
+            return "flux_norm"
+        return "unity_fallback"
+
+    def _continuum_rows(self, row_ids: np.ndarray, flux_full: np.ndarray) -> np.ndarray:
+        if self.continuum_source == "flux_norm":
+            flux_norm = _take_rows(self.root["flux_norm"], row_ids)
+            cont = np.divide(
+                flux_full,
+                flux_norm,
+                out=np.zeros_like(flux_full, dtype=np.float32),
+                where=np.abs(flux_norm) > np.float32(1e-6),
+            )
+            return np.nan_to_num(cont, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.continuum_source == "unity_fallback":
+            return np.ones_like(flux_full, dtype=np.float32)
+        cont = _take_rows(self.root[self.continuum_source], row_ids)
+        return np.nan_to_num(cont, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compose_targets(self, flux_full: np.ndarray, continuum_full: np.ndarray, *, normalize: bool) -> np.ndarray:
+        flux = self.resampler.resample(flux_full)
+        cont = self.resampler.resample(continuum_full)
+        norm = np.divide(
+            flux,
+            cont,
+            out=np.zeros_like(flux, dtype=np.float32),
+            where=np.abs(cont) > np.float32(1e-6),
+        )
+
+        cont = np.nan_to_num(cont, nan=0.0, posinf=0.0, neginf=0.0)
+        norm = np.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
+        y = np.concatenate([cont, norm], axis=1).astype(np.float32, copy=False)
+        if normalize and self.normalize_targets:
+            y = (y - self.target_mean[None, :]) / self.target_std[None, :]
+        return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+    def _compute_target_stats(self, *, root, train_indices: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if train_indices.size == 0:
+            raise ValueError("Cannot compute target stats with an empty training split")
+
+        sum_vec = np.zeros((self.target_dim,), dtype=np.float64)
+        sumsq_vec = np.zeros((self.target_dim,), dtype=np.float64)
+        count_vec = np.zeros((self.target_dim,), dtype=np.int64)
+
+        block_rows = 128
+        for start in range(0, int(train_indices.size), block_rows):
+            row_ids = train_indices[start : start + block_rows]
+            flux_full = _take_rows(root["flux"], row_ids)
+            cont_full = self._continuum_rows(row_ids, flux_full)
+            y = self._compose_targets(flux_full, cont_full, normalize=False).astype(np.float64, copy=False)
+
+            finite = np.isfinite(y)
+            clean = np.where(finite, y, 0.0)
+            sum_vec += clean.sum(axis=0)
+            sumsq_vec += np.square(clean).sum(axis=0)
+            count_vec += finite.sum(axis=0, dtype=np.int64)
+
+        mean = np.divide(sum_vec, count_vec, out=np.zeros_like(sum_vec), where=count_vec > 0)
+        var = np.divide(sumsq_vec, count_vec, out=np.zeros_like(sumsq_vec), where=count_vec > 0) - np.square(mean)
+        var = np.clip(var, 0.0, None)
+        std = np.sqrt(var)
+        std = np.where((count_vec <= 1) | (std < 1e-6), 1.0, std)
+        return mean.astype(np.float32), std.astype(np.float32)
+
+    @staticmethod
+    def _build_mu_feature(
+        *,
+        root,
+        train_indices: np.ndarray,
+        row_count: int,
+        mu_key: str,
+        logger: logging.Logger,
+    ) -> tuple[np.ndarray, str]:
+        chosen_key = mu_key
+        if chosen_key == "auto":
+            chosen_key = "mu_selected" if "mu_selected" in root else ("mu" if "mu" in root else "")
+        if not chosen_key:
+            logger.warning("No mu key found; using constant-zero mu feature")
+            return np.zeros((row_count,), dtype=np.float32), "constant_zero_fallback"
+
+        if chosen_key not in root:
+            logger.warning("mu key '%s' not found; using constant-zero mu feature", chosen_key)
+            return np.zeros((row_count,), dtype=np.float32), "constant_zero_fallback"
+
+        mu_raw = np.asarray(root[chosen_key][:], dtype=np.float32)
+        mu_source = chosen_key
+
+        if not np.isfinite(mu_raw).any():
+            if "mu_selected_index" in root:
+                mu_idx = np.asarray(root["mu_selected_index"][:], dtype=np.float32)
+                if np.isfinite(mu_idx).any() and np.any(mu_idx >= 0):
+                    mu_raw = mu_idx
+                    mu_source = "mu_selected_index"
+                else:
+                    mu_raw = np.zeros((row_count,), dtype=np.float32)
+                    mu_source = "constant_zero_fallback"
+            else:
+                mu_raw = np.zeros((row_count,), dtype=np.float32)
+                mu_source = "constant_zero_fallback"
+
+        mu_train = mu_raw[np.asarray(train_indices, dtype=np.int64)]
+        finite = np.isfinite(mu_train)
+        if finite.any():
+            mu_mean = float(np.mean(mu_train[finite]))
+            mu_std = float(np.std(mu_train[finite]))
+        else:
+            mu_mean = 0.0
+            mu_std = 1.0
+        if mu_std < 1e-6:
+            mu_std = 1.0
+
+        mu_feature = (np.nan_to_num(mu_raw, nan=mu_mean, posinf=mu_mean, neginf=mu_mean) - mu_mean) / mu_std
+        mu_feature = np.asarray(mu_feature, dtype=np.float32)
+        return mu_feature, mu_source
+
+    def batch_to_xy(self, batch: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        x_params = np.asarray(batch["inputs"], dtype=np.float32)
+        if x_params.ndim == 1:
+            x_params = x_params[:, None]
+
+        if self.include_mu:
+            row_ids = np.asarray(batch["indices"], dtype=np.int64)
+            mu = self.mu_feature[row_ids][:, None]
+            x = np.concatenate([x_params, mu], axis=1)
+        else:
+            x = x_params
+        x = np.nan_to_num(x.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+
+        if "targets" not in batch:
+            raise ValueError("Training requires batches with 'targets'")
+        y_flux_full = np.asarray(batch["targets"], dtype=np.float32)
+        if y_flux_full.ndim == 1:
+            y_flux_full = y_flux_full[:, None]
+
+        row_ids = np.asarray(batch["indices"], dtype=np.int64)
+        y_cont_full = self._continuum_rows(row_ids, y_flux_full)
+        y = self._compose_targets(y_flux_full, y_cont_full, normalize=True)
+        return x, y
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--zarr-path", "--zarr_path", default=None, help="Path to synthesized spectra Zarr store")
+    parser.add_argument(
+        "--output-dir",
+        default=_env_or_default("RUN_DIR", str(DEFAULT_OUTPUT_DIR)),
+        help="Output directory for run artifacts",
+    )
+    parser.add_argument("--sweep-config", default=None, help="JSON file with either 'runs' or 'grid' definitions")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Config file in either the current sweep format or the newer nested preset/data/model/training/logging shape",
+    )
+    parser.add_argument("--example-sweep-config", action="store_true", help="Print example sweep config path and exit")
+    parser.add_argument(
+        "--print-effective-config",
+        action="store_true",
+        help="Print the resolved nested config when using --config and exit",
+    )
+
+    parser.add_argument("--seed", type=int, default=7, help="Base seed; each run increments this seed")
+    parser.add_argument("--train-fraction", "--train_fraction", type=float, default=0.8, help="Train split fraction")
+    parser.add_argument("--val-fraction", "--val_fraction", type=float, default=0.1, help="Validation split fraction")
+    parser.add_argument("--normalize-inputs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--normalize_inputs", dest="normalize_inputs_value", default=None, type=_parse_bool, help=argparse.SUPPRESS)
+    parser.add_argument("--normalize-targets", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--normalize_targets", dest="normalize_targets_value", default=None, type=_parse_bool, help=argparse.SUPPRESS)
+    parser.add_argument("--input-features", default=None, help="Comma-separated subset of param_names (default: all)")
+    parser.add_argument("--include-mu", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include_mu", dest="include_mu_value", default=None, type=_parse_bool, help=argparse.SUPPRESS)
+    parser.add_argument("--mu-key", "--mu_key", default="auto", help="mu array key: auto|mu_selected|mu|<custom>")
+    parser.add_argument("--target-points", "--target_points", type=int, default=1024, help="Output points after axis resampling")
+    parser.add_argument("--use-log-wavelength", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use_log_wavelength", dest="use_log_wavelength_value", default=None, type=_parse_bool, help=argparse.SUPPRESS)
+    parser.add_argument("--axis-name", "--axis_name", choices=("wavelength", "log_wavelength"), default=None, help="Optional alias to control output axis")
+    parser.add_argument("--target-axis-min", "--target_axis_min", type=float, default=None, help="Optional lower bound for training axis domain")
+    parser.add_argument("--target-axis-max", "--target_axis_max", type=float, default=None, help="Optional upper bound for training axis domain")
+    parser.add_argument("--jax-platform", "--jax_platform", default="cpu", help="Value for JAX_PLATFORMS before JAX import")
+
+    parser.add_argument("--hidden-dims-grid", default="128x256", help="Comma-separated hidden layer configs, e.g. 128x256,256x256")
+    parser.add_argument("--hidden-dims", "--hidden_dims", dest="hidden_dims_single", default=None, help="Single hidden layer config, e.g. 128x256")
+    parser.add_argument("--learning-rate-grid", default="1e-3", help="Comma-separated learning rates")
+    parser.add_argument("--learning-rate", "--learning_rate", dest="learning_rate_single", type=float, default=None, help="Single learning rate")
+    parser.add_argument("--weight-decay-grid", default="0.0", help="Comma-separated weight decay values")
+    parser.add_argument("--weight-decay", "--weight_decay", dest="weight_decay_single", type=float, default=None, help="Single weight decay")
+    parser.add_argument("--lambda-hi-grid", default="0.1", help="Comma-separated weights for flux>1 penalty")
+    parser.add_argument("--lambda-hi", "--lambda_hi", dest="lambda_hi_single", type=float, default=None, help="Single lambda_hi")
+    parser.add_argument("--lambda-lo-grid", default="0.0", help="Comma-separated weights for flux<0 penalty")
+    parser.add_argument("--lambda-lo", "--lambda_lo", dest="lambda_lo_single", type=float, default=None, help="Single lambda_lo")
+    parser.add_argument("--lambda-smooth-grid", default="1e-3", help="Comma-separated second-derivative smoothness weights")
+    parser.add_argument("--lambda-smooth", "--lambda_smooth", dest="lambda_smooth_single", type=float, default=None, help="Single lambda_smooth")
+    parser.add_argument("--huber-delta-grid", default="1.0", help="Comma-separated Huber deltas")
+    parser.add_argument("--huber-delta", "--huber_delta", dest="huber_delta_single", type=float, default=None, help="Single huber_delta")
+    parser.add_argument("--warmup-fraction-grid", default="0.1", help="Comma-separated warmup fractions for LR schedule")
+    parser.add_argument("--warmup-fraction", "--warmup_fraction", dest="warmup_fraction_single", type=float, default=None, help="Single warmup_fraction")
+    parser.add_argument("--min-lr-ratio-grid", default="0.05", help="Comma-separated minimum LR ratios for cosine schedule")
+    parser.add_argument("--min-lr-ratio", "--min_lr_ratio", dest="min_lr_ratio_single", type=float, default=None, help="Single min_lr_ratio")
+    parser.add_argument("--epochs-grid", default="30", help="Comma-separated epoch counts")
+    parser.add_argument("--epochs", dest="epochs_single", type=int, default=None, help="Single epoch count")
+    parser.add_argument("--batch-size-grid", default="32", help="Comma-separated batch sizes")
+    parser.add_argument("--batch-size", "--batch_size", dest="batch_size_single", type=int, default=None, help="Single batch size")
+    parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on number of runs (before run-index filtering)")
+    parser.add_argument("--run-index", type=int, default=None, help="Run only one 0-based index from the generated sweep")
+    parser.add_argument("--run-index-env", default="", help="Read run index from env var (e.g. PBS_ARRAY_INDEX)")
+    parser.add_argument("--run-index-offset", type=int, default=0, help="Subtract this offset from env run index")
+
+    parser.add_argument(
+        "--wandb-project",
+        default=_env_or_default("WANDB_PROJECT", "turbospectrum-mlp"),
+        help="Weights & Biases project",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        default=_env_or_default("WANDB_ENTITY", None),
+        help="Weights & Biases entity/user/team",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        default=_env_or_default("WANDB_GROUP", None),
+        help="Weights & Biases group name",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        default=_env_or_default("WANDB_TAGS", ""),
+        help="Comma-separated W&B tags",
+    )
+    parser.add_argument(
+        "--wandb-dir",
+        default=_env_or_default("WANDB_LOCAL_DIR", _env_or_default("WANDB_DIR", None)),
+        help="Directory for local W&B run files (default: <output-dir>/wandb)",
+    )
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="online")
+    parser.add_argument(
+        "--wandb-sync-after-run",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run `wandb sync` at the end (useful for offline runs on nodes with internet access).",
+    )
+    parser.add_argument(
+        "--wandb-sync-dir",
+        default=_env_or_default("WANDB_SYNC_DIR", None),
+        help="Directory passed to `wandb sync` (default: --wandb-dir).",
+    )
+    parser.add_argument(
+        "--wandb-sync-include-offline",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include offline runs when syncing (`wandb sync --include-offline`).",
+    )
+    parser.add_argument(
+        "--wandb-sync-best-effort",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Do not fail the job if `wandb sync` fails.",
+    )
+    parser.add_argument("--save-checkpoints", action="store_true", help="Save best params for each run")
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+    logger = _configure_logging(args.log_level)
+
+    if args.example_sweep_config:
+        print(DEFAULT_SWEEP_CONFIG)
+        return
+
+    if args.config and args.sweep_config:
+        raise ValueError("Use either --config or --sweep-config, not both")
+
+    if args.normalize_inputs_value is not None:
+        args.normalize_inputs = bool(args.normalize_inputs_value)
+    if args.normalize_targets_value is not None:
+        args.normalize_targets = bool(args.normalize_targets_value)
+    if args.include_mu_value is not None:
+        args.include_mu = bool(args.include_mu_value)
+    if args.use_log_wavelength_value is not None:
+        args.use_log_wavelength = bool(args.use_log_wavelength_value)
+    if args.axis_name is not None:
+        args.use_log_wavelength = bool(args.axis_name == "log_wavelength")
+
+    if args.hidden_dims_single is not None:
+        args.hidden_dims_grid = str(args.hidden_dims_single)
+    if args.learning_rate_single is not None:
+        args.learning_rate_grid = str(args.learning_rate_single)
+    if args.weight_decay_single is not None:
+        args.weight_decay_grid = str(args.weight_decay_single)
+    if args.lambda_hi_single is not None:
+        args.lambda_hi_grid = str(args.lambda_hi_single)
+    if args.lambda_lo_single is not None:
+        args.lambda_lo_grid = str(args.lambda_lo_single)
+    if args.lambda_smooth_single is not None:
+        args.lambda_smooth_grid = str(args.lambda_smooth_single)
+    if args.huber_delta_single is not None:
+        args.huber_delta_grid = str(args.huber_delta_single)
+    if args.warmup_fraction_single is not None:
+        args.warmup_fraction_grid = str(args.warmup_fraction_single)
+    if args.min_lr_ratio_single is not None:
+        args.min_lr_ratio_grid = str(args.min_lr_ratio_single)
+    if args.epochs_single is not None:
+        args.epochs_grid = str(args.epochs_single)
+    if args.batch_size_single is not None:
+        args.batch_size_grid = str(args.batch_size_single)
+
+    unified_config: dict[str, Any] | None = None
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config not found: {config_path}")
+        payload = json.loads(config_path.read_text())
+        if _looks_like_unified_config(payload):
+            preset_name = str(payload.get("preset", "baseline"))
+            presets = _unified_presets()
+            if preset_name not in presets:
+                raise ValueError(f"Unknown unified config preset '{preset_name}'")
+            unified_config = _deep_update(_default_unified_config(), presets[preset_name])
+            unified_config = _deep_update(unified_config, payload)
+            _apply_unified_config_to_args(args, unified_config)
+            if args.print_effective_config:
+                print(json.dumps(unified_config, indent=2))
+                return
+        else:
+            args.sweep_config = str(config_path)
+            if args.print_effective_config:
+                raise ValueError("--print-effective-config only supports the newer nested --config schema")
+
+    default_zarr = _resolve_default_zarr_path()
+    zarr_path = Path(args.zarr_path) if args.zarr_path else default_zarr
+    if zarr_path is None:
+        raise FileNotFoundError("No default Zarr dataset found. Pass --zarr-path explicitly.")
+    if not zarr_path.exists():
+        raise FileNotFoundError(f"Zarr dataset not found: {zarr_path}")
+
+    os.environ["JAX_PLATFORMS"] = str(args.jax_platform)
+
+    sys.path.insert(0, str(REPO_ROOT))
+
+    try:
+        import jax
+        import jax.numpy as jnp
+        import flax.linen as nn
+        from flax import serialization
+        from flax.training import train_state
+        import optax
+    except Exception as exc:  # noqa: BLE001
+        raise ImportError(
+            "Missing or incompatible JAX/FLAX stack. "
+            "Install e.g. `pip install -r requirements-flax-ml.txt`."
+        ) from exc
+
+    from scripts.jax_spectra_dataloader import create_jax_spectra_dataloaders
+
+    wandb = None
+    if args.wandb_mode != "disabled":
+        try:
+            import wandb as _wandb
+        except Exception as exc:  # noqa: BLE001
+            raise ImportError("wandb is required unless --wandb-mode=disabled") from exc
+        wandb = _wandb
+
+    versions = {
+        "numpy": _installed_version("numpy"),
+        "jax": _installed_version("jax"),
+        "jaxlib": _installed_version("jaxlib"),
+        "flax": _installed_version("flax"),
+        "optax": _installed_version("optax"),
+    }
+
+    try:
+        # Basic runtime math preflight.
+        _ = (jnp.asarray([1.0], dtype=jnp.float32) + 1.0).block_until_ready()
+        # RNG preflight catches common JAX/NumPy mismatches early (before starting W&B runs).
+        key = jax.random.PRNGKey(0)
+        _ = jax.random.normal(key, shape=(1,), dtype=jnp.float32).block_until_ready()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"JAX runtime failed for platform '{args.jax_platform}'. "
+            f"Installed versions: {versions}. "
+            "Set --jax-platform cpu or fix the local JAX/NumPy stack. "
+            "Recommended: `pip install --upgrade --force-reinstall -r requirements-flax-ml.txt`."
+        ) from exc
+
+    root = _open_zarr_root(zarr_path)
+    arrays = set(root.array_keys())
+    required = {"params", "flux"}
+    missing = [name for name in required if name not in arrays]
+    if missing:
+        raise KeyError(f"Dataset {zarr_path} missing required arrays: {missing}")
+    if "wavelength" not in arrays:
+        raise KeyError("Dataset must include 'wavelength' for axis-resampled targets")
+
+    param_names: tuple[str, ...] = ()
+    if "param_names" in root:
+        param_names = _decode_strings(np.asarray(root["param_names"][:]))
+    input_features = _parse_input_features(args.input_features, param_names)
+    wavelength = np.asarray(root["wavelength"][:], dtype=np.float64)
+    if np.any(~np.isfinite(wavelength)):
+        raise ValueError("wavelength contains non-finite values")
+
+    axis_name = "log_wavelength" if bool(args.use_log_wavelength) else "wavelength"
+    if args.use_log_wavelength:
+        if np.any(wavelength <= 0.0):
+            raise ValueError("wavelength must be strictly positive for log-axis targets")
+        source_axis = np.log(wavelength)
+    else:
+        source_axis = wavelength
+    source_indices = np.arange(source_axis.size, dtype=np.int64)
+    if args.target_axis_min is not None or args.target_axis_max is not None:
+        lo = float(source_axis[0]) if args.target_axis_min is None else float(args.target_axis_min)
+        hi = float(source_axis[-1]) if args.target_axis_max is None else float(args.target_axis_max)
+        if lo > hi:
+            lo, hi = hi, lo
+        mask = (source_axis >= lo) & (source_axis <= hi)
+        if int(mask.sum()) < 2:
+            raise ValueError(
+                f"Axis clip [{lo}, {hi}] leaves fewer than 2 points for interpolation "
+                f"(axis range: {float(source_axis[0])}..{float(source_axis[-1])})"
+            )
+        source_axis = source_axis[mask]
+        source_indices = source_indices[mask]
+    resampler = FluxResampler(
+        source_axis=source_axis,
+        target_points=int(args.target_points),
+        source_indices=source_indices,
+    )
+
+    base_spec = _run_spec_from_mapping(
+        {
+            "hidden_dims": _parse_hidden_dims_grid(args.hidden_dims_grid)[0],
+            "learning_rate": _parse_float_grid(args.learning_rate_grid)[0],
+            "weight_decay": _parse_float_grid(args.weight_decay_grid)[0],
+            "lambda_hi": _parse_float_grid(args.lambda_hi_grid)[0],
+            "lambda_lo": _parse_float_grid(args.lambda_lo_grid)[0],
+            "lambda_smooth": _parse_float_grid(args.lambda_smooth_grid)[0],
+            "huber_delta": _parse_float_grid(args.huber_delta_grid)[0],
+            "warmup_fraction": _parse_float_grid(args.warmup_fraction_grid)[0],
+            "min_lr_ratio": _parse_float_grid(args.min_lr_ratio_grid)[0],
+            "epochs": _parse_int_grid(args.epochs_grid)[0],
+            "batch_size": _parse_int_grid(args.batch_size_grid)[0],
+            "seed": int(args.seed),
+        },
+        defaults=RunSpec(
+            hidden_dims=(128, 256),
+            learning_rate=1e-3,
+            weight_decay=0.0,
+            lambda_hi=0.1,
+            lambda_lo=0.0,
+            lambda_smooth=1e-3,
+            huber_delta=1.0,
+            warmup_fraction=0.1,
+            min_lr_ratio=0.05,
+            epochs=30,
+            batch_size=32,
+            seed=int(args.seed),
+            run_name=None,
+        ),
+        seed_fallback=int(args.seed),
+    )
+
+    if args.sweep_config:
+        sweep_config_path = Path(args.sweep_config)
+        if not sweep_config_path.exists():
+            raise FileNotFoundError(f"Sweep config not found: {sweep_config_path}")
+        specs = _build_specs_from_config(sweep_config_path, defaults=base_spec, base_seed=int(args.seed))
+    elif unified_config is not None:
+        _, specs = _build_specs_from_unified_config(unified_config, defaults=base_spec)
+    else:
+        specs = _build_specs_from_cli(args)
+
+    if not specs:
+        raise ValueError("No run specs were generated")
+
+    if args.max_runs is not None:
+        specs = specs[: max(0, int(args.max_runs))]
+    if not specs:
+        raise ValueError("No run specs remain after applying --max-runs")
+
+    run_index = _resolve_run_index(args)
+    if run_index is not None:
+        if run_index < 0 or run_index >= len(specs):
+            raise IndexError(f"run_index={run_index} is out of range [0, {len(specs) - 1}]")
+        indexed_specs = [(run_index, specs[run_index])]
+    else:
+        indexed_specs = list(enumerate(specs))
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    wandb_dir = Path(args.wandb_dir) if args.wandb_dir else (output_dir / "wandb")
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["WANDB_DIR"] = str(wandb_dir)
+
+    logger.info("Dataset: %s", zarr_path)
+    logger.info("Rows: %d | Flux dim: %d | Target axis points: %d | Axis: %s", int(root["flux"].shape[0]), int(root["flux"].shape[1]), int(resampler.target_axis.size), axis_name)
+    logger.info("W&B local dir: %s", wandb_dir)
+    logger.info("Generated %d run specs; executing %d run(s)", len(specs), len(indexed_specs))
+
+    loader_cache: dict[int, Mapping[str, Any]] = {}
+    adapter_cache: dict[int, BatchAdapter] = {}
+
+    def get_loaders(batch_size: int):
+        if batch_size not in loader_cache:
+            loaders = create_jax_spectra_dataloaders(
+                zarr_path=str(zarr_path),
+                batch_size=int(batch_size),
+                input_key="params",
+                target_key="flux",
+                input_features=input_features,
+                train_fraction=float(args.train_fraction),
+                val_fraction=float(args.val_fraction),
+                shuffle_train=True,
+                drop_last=False,
+                seed=int(args.seed),
+                normalize_inputs=bool(args.normalize_inputs),
+                # Dual targets are assembled/resampled in BatchAdapter, so normalize there.
+                normalize_targets=False,
+            )
+            loader_cache[batch_size] = loaders
+        return loader_cache[batch_size]
+
+    def get_adapter(batch_size: int):
+        if batch_size not in adapter_cache:
+            loaders = get_loaders(batch_size)
+            row_count = int(root["flux"].shape[0])
+            adapter_cache[batch_size] = BatchAdapter(
+                root=root,
+                train_indices=np.asarray(loaders["train"].indices, dtype=np.int64),
+                row_count=row_count,
+                resampler=resampler,
+                normalize_targets=bool(args.normalize_targets),
+                include_mu=bool(args.include_mu),
+                mu_key=str(args.mu_key),
+                logger=logger,
+            )
+        return adapter_cache[batch_size]
+
+    class FluxMLP(nn.Module):
+        hidden_dims: tuple[int, ...]
+        output_dim: int
+
+        @nn.compact
+        def __call__(self, x):
+            h = x
+            for width in self.hidden_dims:
+                h = nn.Dense(width)(h)
+                h = nn.relu(h)
+            return nn.Dense(self.output_dim)(h)
+
+    def create_train_state(
+        rng,
+        model,
+        input_dim: int,
+        learning_rate: float,
+        weight_decay: float,
+        total_steps: int,
+        warmup_fraction: float,
+        min_lr_ratio: float,
+    ):
+        total_steps = max(1, int(total_steps))
+        if total_steps <= 1:
+            warmup_steps = 0
+        else:
+            warmup_steps = int(total_steps * float(warmup_fraction))
+            warmup_steps = min(max(warmup_steps, 1), total_steps - 1)
+
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=float(learning_rate) * 0.1,
+            peak_value=float(learning_rate),
+            warmup_steps=warmup_steps,
+            decay_steps=max(total_steps - warmup_steps, 1),
+            end_value=float(learning_rate) * float(min_lr_ratio),
+        )
+        params = model.init(rng, jnp.ones((1, input_dim), dtype=jnp.float32))["params"]
+        tx = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=lr_schedule, weight_decay=weight_decay),
+        )
+        state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+        return state, lr_schedule
+
+    def loss_components(pred, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+        norm_dim = int(norm_hi_bound.shape[0])
+        if norm_dim <= 0 or pred.shape[1] <= norm_dim:
+            raise ValueError("Dual-output layout must include continuum and normalized spectrum blocks")
+
+        pred_cont = pred[:, :-norm_dim]
+        pred_norm = pred[:, -norm_dim:]
+        y_cont = y[:, :-norm_dim]
+        y_norm = y[:, -norm_dim:]
+
+        recon_cont = jnp.mean(optax.huber_loss(pred_cont - y_cont, delta=huber_delta))
+        recon_norm = jnp.mean(optax.huber_loss(pred_norm - y_norm, delta=huber_delta))
+        mse_cont = jnp.mean((pred_cont - y_cont) ** 2)
+        mse_norm = jnp.mean((pred_norm - y_norm) ** 2)
+        recon = 0.5 * (recon_cont + recon_norm)
+        mse = 0.5 * (mse_cont + mse_norm)
+
+        hi_pen = jnp.mean(jax.nn.relu(pred_norm - norm_hi_bound[None, :]) ** 2)
+        lo_pen = jnp.mean(jax.nn.relu(norm_lo_bound[None, :] - pred_norm) ** 2)
+
+        if pred_norm.shape[1] >= 3:
+            d2_norm = pred_norm[:, 2:] - 2.0 * pred_norm[:, 1:-1] + pred_norm[:, :-2]
+            smooth_norm = jnp.mean(d2_norm**2)
+        else:
+            smooth_norm = jnp.asarray(0.0, dtype=pred.dtype)
+        if pred_cont.shape[1] >= 3:
+            d2_cont = pred_cont[:, 2:] - 2.0 * pred_cont[:, 1:-1] + pred_cont[:, :-2]
+            smooth_cont = jnp.mean(d2_cont**2)
+        else:
+            smooth_cont = jnp.asarray(0.0, dtype=pred.dtype)
+        smooth_pen = 0.5 * (smooth_norm + smooth_cont)
+
+        total = recon + lambda_hi * hi_pen + lambda_lo * lo_pen + lambda_smooth * smooth_pen
+        return total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen
+
+    @jax.jit
+    def train_step(state, x, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+        def loss_fn(params):
+            pred = state.apply_fn({"params": params}, x)
+            total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen = loss_components(
+                pred, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+            )
+            return total, (recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen)
+
+        (loss, (recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen)), grads = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(state.params)
+        state = state.apply_gradients(grads=grads)
+        return state, loss, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen
+
+    @jax.jit
+    def eval_step(state, x, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta):
+        pred = state.apply_fn({"params": state.params}, x)
+        return loss_components(pred, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta)
+
+    def evaluate_loader(
+        state,
+        loader,
+        adapter: BatchAdapter,
+        norm_hi_bound,
+        norm_lo_bound,
+        lambda_hi: float,
+        lambda_lo: float,
+        lambda_smooth: float,
+        huber_delta: float,
+    ) -> dict[str, float]:
+        totals, recons, mses = [], [], []
+        recon_conts, recon_norms, mse_conts, mse_norms = [], [], [], []
+        hi_pens, lo_pens, smooth_pens = [], [], []
+        lh = jnp.asarray(lambda_hi, dtype=jnp.float32)
+        ll = jnp.asarray(lambda_lo, dtype=jnp.float32)
+        ls = jnp.asarray(lambda_smooth, dtype=jnp.float32)
+        hd = jnp.asarray(huber_delta, dtype=jnp.float32)
+        for batch in loader:
+            x_np, y_np = adapter.batch_to_xy(batch)
+            x = jnp.asarray(x_np, dtype=jnp.float32)
+            y = jnp.asarray(y_np, dtype=jnp.float32)
+            total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen = eval_step(
+                state, x, y, norm_hi_bound, norm_lo_bound, lh, ll, ls, hd
+            )
+            totals.append(float(total))
+            recons.append(float(recon))
+            mses.append(float(mse))
+            recon_conts.append(float(recon_cont))
+            recon_norms.append(float(recon_norm))
+            mse_conts.append(float(mse_cont))
+            mse_norms.append(float(mse_norm))
+            hi_pens.append(float(hi_pen))
+            lo_pens.append(float(lo_pen))
+            smooth_pens.append(float(smooth_pen))
+        if not totals:
+            return {
+                "total": float("nan"),
+                "recon": float("nan"),
+                "mse": float("nan"),
+                "recon_cont": float("nan"),
+                "recon_norm": float("nan"),
+                "mse_cont": float("nan"),
+                "mse_norm": float("nan"),
+                "hi_pen": float("nan"),
+                "lo_pen": float("nan"),
+                "smooth_pen": float("nan"),
+            }
+        return {
+            "total": float(np.mean(totals)),
+            "recon": float(np.mean(recons)),
+            "mse": float(np.mean(mses)),
+            "recon_cont": float(np.mean(recon_conts)),
+            "recon_norm": float(np.mean(recon_norms)),
+            "mse_cont": float(np.mean(mse_conts)),
+            "mse_norm": float(np.mean(mse_norms)),
+            "hi_pen": float(np.mean(hi_pens)),
+            "lo_pen": float(np.mean(lo_pens)),
+            "smooth_pen": float(np.mean(smooth_pens)),
+        }
+
+    for run_idx, spec in indexed_specs:
+        run_name = _spec_to_compact_name(spec, run_idx)
+        run_dir = output_dir / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        run_cfg = {
+            "run_index": int(run_idx),
+            "zarr_path": str(zarr_path),
+            "axis_name": axis_name,
+            "target_points": int(resampler.target_axis.size),
+            "target_axis_min": float(resampler.target_axis[0]),
+            "target_axis_max": float(resampler.target_axis[-1]),
+            "output_heads": ["continuum", "flux_normalized"],
+            "include_mu": bool(args.include_mu),
+            "mu_key": str(args.mu_key),
+            "input_features": input_features,
+            "train_fraction": float(args.train_fraction),
+            "val_fraction": float(args.val_fraction),
+            "normalize_inputs": bool(args.normalize_inputs),
+            "normalize_targets": bool(args.normalize_targets),
+            "seed": int(spec.seed),
+            "hidden_dims": list(spec.hidden_dims),
+            "learning_rate": float(spec.learning_rate),
+            "weight_decay": float(spec.weight_decay),
+            "lambda_hi": float(spec.lambda_hi),
+            "lambda_lo": float(spec.lambda_lo),
+            "lambda_smooth": float(spec.lambda_smooth),
+            "huber_delta": float(spec.huber_delta),
+            "warmup_fraction": float(spec.warmup_fraction),
+            "min_lr_ratio": float(spec.min_lr_ratio),
+            "epochs": int(spec.epochs),
+            "batch_size": int(spec.batch_size),
+            "jax_platform": str(args.jax_platform),
+        }
+
+        loaders = get_loaders(spec.batch_size)
+        if hasattr(loaders["train"], "_epoch"):
+            loaders["train"]._epoch = 0  # type: ignore[attr-defined]
+        adapter = get_adapter(spec.batch_size)
+        run_cfg["continuum_source"] = str(adapter.continuum_source)
+        run_cfg["target_layout"] = "concatenate([continuum, flux/continuum], axis=1)"
+        (run_dir / "config.json").write_text(json.dumps(run_cfg, indent=2))
+        wb_run = None
+        if wandb is not None:
+            wb_run = wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                group=args.wandb_group,
+                tags=[t for t in _split_csv(args.wandb_tags) if t],
+                mode=args.wandb_mode,
+                name=run_name,
+                dir=str(wandb_dir),
+                config=run_cfg,
+                reinit=True,
+            )
+
+        probe = next(iter(loaders["train"]))
+        x0, y0 = adapter.batch_to_xy(probe)
+        norm_hi_bound = jnp.asarray(
+            np.nan_to_num(adapter.norm_hi_bound, nan=1.0, posinf=1.0, neginf=1.0),
+            dtype=jnp.float32,
+        )
+        norm_lo_bound = jnp.asarray(
+            np.nan_to_num(adapter.norm_lo_bound, nan=0.0, posinf=0.0, neginf=0.0),
+            dtype=jnp.float32,
+        )
+
+        steps_per_epoch = max(1, len(loaders["train"]))
+        total_steps = int(spec.epochs) * steps_per_epoch
+
+        model = FluxMLP(hidden_dims=spec.hidden_dims, output_dim=int(y0.shape[1]))
+        state, lr_schedule = create_train_state(
+            jax.random.PRNGKey(int(spec.seed)),
+            model=model,
+            input_dim=int(x0.shape[1]),
+            learning_rate=float(spec.learning_rate),
+            weight_decay=float(spec.weight_decay),
+            total_steps=total_steps,
+            warmup_fraction=float(spec.warmup_fraction),
+            min_lr_ratio=float(spec.min_lr_ratio),
+        )
+
+        lambda_hi = jnp.asarray(spec.lambda_hi, dtype=jnp.float32)
+        lambda_lo = jnp.asarray(spec.lambda_lo, dtype=jnp.float32)
+        lambda_smooth = jnp.asarray(spec.lambda_smooth, dtype=jnp.float32)
+        huber_delta = jnp.asarray(spec.huber_delta, dtype=jnp.float32)
+
+        logger.info(
+            "Run %d/%d: %s | h=%s lr=%g wd=%g bs=%d ep=%d lhi=%g llo=%g ls=%g hd=%g warm=%g minlr=%g mu_source=%s continuum_source=%s",
+            run_idx + 1,
+            len(specs),
+            run_name,
+            spec.hidden_dims,
+            spec.learning_rate,
+            spec.weight_decay,
+            spec.batch_size,
+            spec.epochs,
+            spec.lambda_hi,
+            spec.lambda_lo,
+            spec.lambda_smooth,
+            spec.huber_delta,
+            spec.warmup_fraction,
+            spec.min_lr_ratio,
+            adapter.mu_source,
+            adapter.continuum_source,
+        )
+
+        best_val = float("inf")
+        best_val_mse = float("nan")
+        best_epoch = -1
+        best_params = None
+        metrics_path = run_dir / "metrics.jsonl"
+        with metrics_path.open("w", encoding="utf-8") as mf:
+            for epoch in range(1, spec.epochs + 1):
+                epoch_start = time.time()
+                train_totals, train_recons, train_mses = [], [], []
+                train_recon_conts, train_recon_norms, train_mse_conts, train_mse_norms = [], [], [], []
+                train_hi_pens, train_lo_pens, train_smooth_pens = [], [], []
+                for batch in loaders["train"]:
+                    x_np, y_np = adapter.batch_to_xy(batch)
+                    x = jnp.asarray(x_np, dtype=jnp.float32)
+                    y = jnp.asarray(y_np, dtype=jnp.float32)
+                    state, total, recon, mse, recon_cont, recon_norm, mse_cont, mse_norm, hi_pen, lo_pen, smooth_pen = train_step(
+                        state, x, y, norm_hi_bound, norm_lo_bound, lambda_hi, lambda_lo, lambda_smooth, huber_delta
+                    )
+                    train_totals.append(float(total))
+                    train_recons.append(float(recon))
+                    train_mses.append(float(mse))
+                    train_recon_conts.append(float(recon_cont))
+                    train_recon_norms.append(float(recon_norm))
+                    train_mse_conts.append(float(mse_cont))
+                    train_mse_norms.append(float(mse_norm))
+                    train_hi_pens.append(float(hi_pen))
+                    train_lo_pens.append(float(lo_pen))
+                    train_smooth_pens.append(float(smooth_pen))
+
+                train_stats = {
+                    "total": float(np.mean(train_totals)) if train_totals else float("nan"),
+                    "recon": float(np.mean(train_recons)) if train_recons else float("nan"),
+                    "mse": float(np.mean(train_mses)) if train_mses else float("nan"),
+                    "recon_cont": float(np.mean(train_recon_conts)) if train_recon_conts else float("nan"),
+                    "recon_norm": float(np.mean(train_recon_norms)) if train_recon_norms else float("nan"),
+                    "mse_cont": float(np.mean(train_mse_conts)) if train_mse_conts else float("nan"),
+                    "mse_norm": float(np.mean(train_mse_norms)) if train_mse_norms else float("nan"),
+                    "hi_pen": float(np.mean(train_hi_pens)) if train_hi_pens else float("nan"),
+                    "lo_pen": float(np.mean(train_lo_pens)) if train_lo_pens else float("nan"),
+                    "smooth_pen": float(np.mean(train_smooth_pens)) if train_smooth_pens else float("nan"),
+                }
+                val_stats = evaluate_loader(
+                    state,
+                    loaders["val"],
+                    adapter,
+                    norm_hi_bound,
+                    norm_lo_bound,
+                    spec.lambda_hi,
+                    spec.lambda_lo,
+                    spec.lambda_smooth,
+                    spec.huber_delta,
+                )
+                current_lr = float(lr_schedule(state.step))
+
+                if val_stats["recon"] < best_val:
+                    best_val = val_stats["recon"]
+                    best_val_mse = val_stats["mse"]
+                    best_epoch = epoch
+                    best_params = state.params
+
+                metrics = {
+                    "epoch": int(epoch),
+                    "seconds": float(time.time() - epoch_start),
+                    "Relative Time (Process)": float(time.time() - epoch_start),
+                    "learning_rate": current_lr,
+                    "train_total": train_stats["total"],
+                    "train_recon": train_stats["recon"],
+                    "train_mse": train_stats["mse"],
+                    "train_recon_cont": train_stats["recon_cont"],
+                    "train_recon_norm": train_stats["recon_norm"],
+                    "train_mse_cont": train_stats["mse_cont"],
+                    "train_mse_norm": train_stats["mse_norm"],
+                    "train_hi_pen": train_stats["hi_pen"],
+                    "train_lo_pen": train_stats["lo_pen"],
+                    "train_smooth_pen": train_stats["smooth_pen"],
+                    "val_total": val_stats["total"],
+                    "val_recon": val_stats["recon"],
+                    "val_mse": val_stats["mse"],
+                    "val_recon_cont": val_stats["recon_cont"],
+                    "val_recon_norm": val_stats["recon_norm"],
+                    "val_mse_cont": val_stats["mse_cont"],
+                    "val_mse_norm": val_stats["mse_norm"],
+                    "val_hi_pen": val_stats["hi_pen"],
+                    "val_lo_pen": val_stats["lo_pen"],
+                    "val_smooth_pen": val_stats["smooth_pen"],
+                }
+                mf.write(json.dumps(metrics) + "\n")
+                mf.flush()
+
+                if wb_run is not None:
+                    wb_run.log(metrics, step=epoch)
+
+                if epoch == 1 or epoch == spec.epochs or epoch % 5 == 0:
+                    logger.info(
+                        "[%s] epoch=%03d lr=%.6e train_recon=%.6f val_recon=%.6f val_recon_cont=%.6f val_recon_norm=%.6f val_smooth_pen=%.6f",
+                        run_name,
+                        epoch,
+                        current_lr,
+                        train_stats["recon"],
+                        val_stats["recon"],
+                        val_stats["recon_cont"],
+                        val_stats["recon_norm"],
+                        val_stats["smooth_pen"],
+                    )
+
+        test_stats = evaluate_loader(
+            state,
+            loaders["test"],
+            adapter,
+            norm_hi_bound,
+            norm_lo_bound,
+            spec.lambda_hi,
+            spec.lambda_lo,
+            spec.lambda_smooth,
+            spec.huber_delta,
+        )
+
+        summary = {
+            "run_name": run_name,
+            "run_index": int(run_idx),
+            "best_val_recon": float(best_val),
+            "best_val_mse": float(best_val_mse) if np.isfinite(best_val_mse) else float("nan"),
+            "best_epoch": int(best_epoch),
+            "final_val_recon": float(val_stats["recon"]) if np.isfinite(val_stats["recon"]) else float("nan"),
+            "final_val_mse": float(val_stats["mse"]) if np.isfinite(val_stats["mse"]) else float("nan"),
+            "final_val_recon_cont": float(val_stats["recon_cont"]) if np.isfinite(val_stats["recon_cont"]) else float("nan"),
+            "final_val_recon_norm": float(val_stats["recon_norm"]) if np.isfinite(val_stats["recon_norm"]) else float("nan"),
+            "final_val_mse_cont": float(val_stats["mse_cont"]) if np.isfinite(val_stats["mse_cont"]) else float("nan"),
+            "final_val_mse_norm": float(val_stats["mse_norm"]) if np.isfinite(val_stats["mse_norm"]) else float("nan"),
+            "test_total": float(test_stats["total"]),
+            "test_recon": float(test_stats["recon"]),
+            "test_mse": float(test_stats["mse"]),
+            "test_recon_cont": float(test_stats["recon_cont"]),
+            "test_recon_norm": float(test_stats["recon_norm"]),
+            "test_mse_cont": float(test_stats["mse_cont"]),
+            "test_mse_norm": float(test_stats["mse_norm"]),
+            "test_hi_pen": float(test_stats["hi_pen"]),
+            "test_lo_pen": float(test_stats["lo_pen"]),
+            "test_smooth_pen": float(test_stats["smooth_pen"]),
+            "final_learning_rate": float(lr_schedule(state.step)),
+            "mu_source": adapter.mu_source,
+            "continuum_source": adapter.continuum_source,
+        }
+        (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+        if args.save_checkpoints and best_params is not None:
+            ckpt_bytes = serialization.to_bytes(best_params)
+            (run_dir / "best_params.msgpack").write_bytes(ckpt_bytes)
+
+        if wb_run is not None:
+            wb_run.summary.update(summary)
+            wb_run.finish()
+
+    logger.info("Completed %d run(s)", len(indexed_specs))
+
+    if args.wandb_sync_after_run and args.wandb_mode != "disabled":
+        sync_dir = Path(args.wandb_sync_dir) if args.wandb_sync_dir else wandb_dir
+        cmd = [sys.executable, "-m", "wandb", "sync"]
+        if args.wandb_sync_include_offline:
+            cmd.append("--include-offline")
+        cmd.append(str(sync_dir))
+        logger.info("Running W&B sync: %s", " ".join(cmd))
+        try:
+            subprocess.run(cmd, check=True)
+            logger.info("W&B sync completed for %s", sync_dir)
+        except subprocess.CalledProcessError as exc:
+            msg = f"W&B sync failed (exit code {exc.returncode}) for {sync_dir}"
+            if args.wandb_sync_best_effort:
+                logger.warning(msg)
+            else:
+                raise RuntimeError(msg) from exc
+
+
+if __name__ == "__main__":
+    main()
