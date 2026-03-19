@@ -15,7 +15,7 @@ set -euo pipefail
 cd "${PBS_O_WORKDIR}"
 
 ############################################
-# Thread caps (prevent oversubscription)
+# Thread caps
 ############################################
 
 export OMP_NUM_THREADS=1
@@ -78,7 +78,7 @@ echo "[regular-grid] Mamba env: ${MAMBA_ENV_NAME}"
 echo "[regular-grid] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 
 ############################################
-# Paths + runtime knobs
+# Paths
 ############################################
 
 PROJECT="${PROJECT:-mk27}"
@@ -88,6 +88,10 @@ REPO="${REPO:-${PBS_O_WORKDIR}}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_regular_grid.example.json}"
 WORKERS_OVERRIDE="${WORKERS:-}"
 SKIP_SYNTHESIS_OVERRIDE="${SKIP_SYNTHESIS:-}"
+FORCE_RESTART="${FORCE_RESTART:-0}"
+ALLOW_PARTIAL_MERGE="${ALLOW_PARTIAL_MERGE:-1}"
+ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
+SKIP_BAD_SHARDS="${SKIP_BAD_SHARDS:-1}"
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
@@ -102,136 +106,135 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
     exit 1
 fi
 
-CONFIG_VALUES=$(
-    "${PYTHON}" - <<PY
-import json
-import os
-
-cfg_path = os.path.abspath(r"${CONFIG_PATH}")
-cfg_dir = os.path.dirname(cfg_path)
-with open(cfg_path, "r", encoding="utf-8") as handle:
-    cfg = json.load(handle)
-outputs = cfg.get("outputs", {}) or {}
-runtime = cfg.get("runtime", {}) or {}
-
-def _abs(p):
-    if not p:
-        return ""
-    return p if os.path.isabs(p) else os.path.abspath(os.path.join(cfg_dir, p))
-
-cfg_run_root = _abs(outputs.get("run_root"))
-grid_zarr = _abs(outputs.get("grid_zarr"))
-spectra_zarr = _abs(outputs.get("spectra_zarr"))
-output_tmp = _abs(runtime.get("output_tmp"))
-workers = runtime.get("workers")
-workers_out = ""
-if workers not in (None, ""):
-    try:
-        workers_out = str(int(workers))
-    except Exception:
-        workers_out = ""
-
-def _boolish(v):
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    return str(v).strip().lower() in {"1", "true", "yes", "on"}
-
-skip_synthesis = "1" if _boolish(runtime.get("skip_synthesis", False)) else "0"
-
-print(cfg_run_root)
-print(grid_zarr)
-print(spectra_zarr)
-print(output_tmp)
-print(workers_out)
-print(skip_synthesis)
-PY
-)
-mapfile -t _cfg_lines <<< "${CONFIG_VALUES}"
-CFG_RUN_ROOT="${_cfg_lines[0]:-}"
-CFG_GRID_ZARR="${_cfg_lines[1]:-}"
-CFG_SPECTRA_ZARR="${_cfg_lines[2]:-}"
-CFG_OUTPUT_TMP="${_cfg_lines[3]:-}"
-CFG_WORKERS="${_cfg_lines[4]:-}"
-CFG_SKIP_SYNTHESIS="${_cfg_lines[5]:-0}"
-
-if [[ -n "${CFG_RUN_ROOT}" ]]; then
-    RUN_ROOT="${CFG_RUN_ROOT}"
-fi
-WORKERS="${WORKERS_OVERRIDE:-${CFG_WORKERS:-${PBS_NCPUS:-32}}}"
-
 to_bool01() {
     local val
-    val="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
     case "${val}" in
         1|true|yes|on) echo 1 ;;
         *) echo 0 ;;
     esac
 }
 
-SKIP_SYNTHESIS_EFFECTIVE="${CFG_SKIP_SYNTHESIS:-0}"
+print_log_excerpt() {
+    local log_path="$1"
+    local label="$2"
+    if [[ -f "${log_path}" ]]; then
+        echo "[regular-grid] ${label}: ${log_path}" >&2
+        sed -n '1,120p' "${log_path}" >&2 || true
+    fi
+}
+
+REGULAR_RUNTIME_JSON="$(
+    "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py" \
+        --config-json "${CONFIG_PATH}" \
+        --print-runtime-json
+)"
+
+RUNTIME_VALUES="$(
+    "${PYTHON}" - <<PY
+import json
+
+payload = json.loads(r'''${REGULAR_RUNTIME_JSON}''')
+fields = [
+    "run_root",
+    "grid_zarr",
+    "spectra_zarr",
+    "spectra_shard_template",
+    "spectra_shards_dir",
+    "synthesis_config_path",
+    "scratch",
+    "output_tmp",
+    "workers",
+    "chunk_rows",
+    "log_level",
+    "log_file",
+    "skip_synthesis",
+]
+for field in fields:
+    value = payload.get(field, "")
+    if value is None:
+        value = ""
+    print(value)
+PY
+)"
+
+mapfile -t _runtime_lines <<< "${RUNTIME_VALUES}"
+CFG_RUN_ROOT="${_runtime_lines[0]:-}"
+CFG_GRID_ZARR="${_runtime_lines[1]:-}"
+CFG_MERGED_ZARR="${_runtime_lines[2]:-}"
+CFG_SHARD_TEMPLATE="${_runtime_lines[3]:-}"
+CFG_SHARDS_DIR="${_runtime_lines[4]:-}"
+CFG_SYNTH_CONFIG="${_runtime_lines[5]:-}"
+CFG_SCRATCH="${_runtime_lines[6]:-}"
+CFG_OUTPUT_TMP="${_runtime_lines[7]:-}"
+CFG_WORKERS="${_runtime_lines[8]:-}"
+CFG_CHUNK_ROWS="${_runtime_lines[9]:-32}"
+CFG_LOG_LEVEL="${_runtime_lines[10]:-INFO}"
+CFG_LOG_FILE="${_runtime_lines[11]:-}"
+CFG_SKIP_SYNTHESIS="${_runtime_lines[12]:-False}"
+
+if [[ -n "${CFG_RUN_ROOT}" ]]; then
+    RUN_ROOT="${CFG_RUN_ROOT}"
+fi
+
+WORKERS="${WORKERS_OVERRIDE:-${CFG_WORKERS:-16}}"
+if ! [[ "${WORKERS}" =~ ^[0-9]+$ ]] || (( WORKERS < 1 )); then
+    echo "[regular-grid] WARN: invalid WORKERS='${WORKERS}', defaulting to 16." >&2
+    WORKERS=16
+fi
+
+DEFAULT_VALIDATE_WORKERS="${WORKERS}"
+if (( DEFAULT_VALIDATE_WORKERS > 32 )); then
+    DEFAULT_VALIDATE_WORKERS=32
+fi
+VALIDATE_WORKERS="${VALIDATE_WORKERS:-${DEFAULT_VALIDATE_WORKERS}}"
+if ! [[ "${VALIDATE_WORKERS}" =~ ^[0-9]+$ ]] || (( VALIDATE_WORKERS < 1 )); then
+    echo "[regular-grid] WARN: invalid VALIDATE_WORKERS='${VALIDATE_WORKERS}', defaulting to ${DEFAULT_VALIDATE_WORKERS}." >&2
+    VALIDATE_WORKERS="${DEFAULT_VALIDATE_WORKERS}"
+fi
+
+MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-128}"
+if ! [[ "${MERGE_CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( MERGE_CHUNK_ROWS < 1 )); then
+    echo "[regular-grid] WARN: invalid MERGE_CHUNK_ROWS='${MERGE_CHUNK_ROWS}', defaulting to 128." >&2
+    MERGE_CHUNK_ROWS=128
+fi
+
+SKIP_SYNTHESIS_EFFECTIVE="$(to_bool01 "${CFG_SKIP_SYNTHESIS}")"
 if [[ "$(to_bool01 "${SKIP_SYNTHESIS_OVERRIDE}")" == "1" ]]; then
     SKIP_SYNTHESIS_EFFECTIVE="1"
 fi
 
-RESUME="${RESUME:-1}"
-FORCE_RESTART="${FORCE_RESTART:-0}"
-
-GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR:-${RUN_ROOT}/outputs/grids/regular_parameter_grid.zarr}}"
-FINAL_ZARR="${FINAL_ZARR:-${CFG_SPECTRA_ZARR:-${RUN_ROOT}/outputs/zarr/regular_synthesized_spectra.zarr}}"
-SYNTH_OUTPUT_TMP="${SYNTH_OUTPUT_TMP:-${CFG_OUTPUT_TMP:-${RUN_ROOT}/tmp/regular_synthesized_spectra.output_tmp.zarr}}"
-
-if [[ "${GRID_ZARR}" != /* ]]; then
-    GRID_ZARR="${REPO}/${GRID_ZARR}"
-fi
-if [[ "${FINAL_ZARR}" != /* ]]; then
-    FINAL_ZARR="${REPO}/${FINAL_ZARR}"
-fi
-if [[ "${SYNTH_OUTPUT_TMP}" != /* ]]; then
-    SYNTH_OUTPUT_TMP="${REPO}/${SYNTH_OUTPUT_TMP}"
-fi
-
-LOG_DIR="${RUN_ROOT}/logs"
-STATE_DIR="${RUN_ROOT}/state/regular_grid"
-GRID_DONE_MARK="${STATE_DIR}/grid.done"
-SYNTH_DONE_MARK="${STATE_DIR}/synthesis.done"
-LAST_FAILURE_FILE="${STATE_DIR}/last_failure.txt"
-PHASE_LOG="${STATE_DIR}/phase.log"
+GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR}}"
+MERGED_ZARR="${MERGED_ZARR:-${CFG_MERGED_ZARR}}"
+SHARD_TEMPLATE="${SHARD_TEMPLATE:-${CFG_SHARD_TEMPLATE}}"
+SHARDS_DIR="${SHARDS_DIR:-${CFG_SHARDS_DIR}}"
+SYNTH_CONFIG_PATH="${SYNTH_CONFIG_PATH:-${CFG_SYNTH_CONFIG}}"
+SYNTH_SCRATCH="${SYNTH_SCRATCH:-${CFG_SCRATCH:-${RUN_ROOT}/tmp/synthesis}}"
+LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
 TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
-mkdir -p "${LOG_DIR}" "${STATE_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" \
-         "$(dirname "${GRID_ZARR}")" "$(dirname "${FINAL_ZARR}")" "$(dirname "${SYNTH_OUTPUT_TMP}")"
+PENDING_SHARDS_FILE="${PENDING_SHARDS_FILE:-${RUN_ROOT}/pending_shards.txt}"
+MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
+NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
+LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
+SYNTH_LOG_LEVEL="${SYNTH_LOG_LEVEL:-${CFG_LOG_LEVEL:-INFO}}"
+SYNTH_LOG_FILE="${SYNTH_LOG_FILE:-${CFG_LOG_FILE:-${LOG_DIR}/regular_grid_synthesis.log}}"
 
-# Force mkstemp()/tempfile users to write under designated scratch temp.
+mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${MERGED_ZARR}")" \
+         "$(dirname "${NEXT_WORK_ITEM}")" "$(dirname "${LOCK_FILE}")" \
+         "$(dirname "${PENDING_SHARDS_FILE}")" "$(dirname "${MISSING_FILE}")" \
+         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" "${SYNTH_SCRATCH}"
+
 export TMPDIR="${TMP_SYSTEM_DIR}"
 export TMP="${TMP_SYSTEM_DIR}"
 export TEMP="${TMP_SYSTEM_DIR}"
 
-log_phase() {
-    local phase="$1"
-    local status="$2"
-    local message="$3"
-    printf '%s phase=%s status=%s job=%s msg=%s\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        "${phase}" \
-        "${status}" \
-        "${PBS_JOBID:-unknown}" \
-        "${message}" >> "${PHASE_LOG}"
-}
-
-write_marker() {
-    local marker_path="$1"
-    local label="$2"
-    {
-        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "jobid=${PBS_JOBID:-unknown}"
-        echo "label=${label}"
-        echo "config=${CONFIG_PATH}"
-    } > "${marker_path}"
-}
+if [[ -z "${GRID_ZARR}" || -z "${MERGED_ZARR}" || -z "${SHARD_TEMPLATE}" || -z "${SHARDS_DIR}" || -z "${SYNTH_CONFIG_PATH}" ]]; then
+    echo "[regular-grid] ERROR: failed to resolve one or more required runtime paths." >&2
+    exit 1
+fi
 
 is_valid_grid_zarr() {
     local zarr_path="$1"
@@ -246,60 +249,130 @@ assert root["teff"].shape[0] > 0
 PY
 }
 
-is_valid_synth_zarr() {
+is_valid_merged_zarr() {
     local zarr_path="$1"
     if [[ ! -d "${zarr_path}" ]]; then
         return 1
     fi
     "${PYTHON}" - <<PY >/dev/null 2>&1
 import zarr
+
 root = zarr.open_group(r"${zarr_path}", mode="r")
 for key in ("wavelength", "flux", "continuum"):
     assert key in root, f"missing {key}"
 assert root["flux"].shape[0] > 0
 assert root["flux"].shape == root["continuum"].shape
+status_counts = root.attrs.get("status_counts")
+if isinstance(status_counts, dict):
+    bad = {
+        str(key): int(value)
+        for key, value in status_counts.items()
+        if str(key).strip().lower() not in {"success", "skipped"} and int(value) > 0
+    }
+    assert not bad, f"bad status_counts={bad}"
 PY
 }
 
-if [[ "$(to_bool01 "${FORCE_RESTART}")" == "1" ]]; then
-    rm -f "${GRID_DONE_MARK}" "${SYNTH_DONE_MARK}"
-    log_phase "bootstrap" "info" "force_restart=1 cleared checkpoints"
-fi
+grid_row_count() {
+    "${PYTHON}" - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
+print(int(root["teff"].shape[0]))
+PY
+}
 
-CURRENT_PHASE="bootstrap"
-trap 'rc=$?; if (( rc != 0 )); then log_phase "${CURRENT_PHASE}" "failed" "exit_code=${rc}"; printf "%s\n" "phase=${CURRENT_PHASE} exit_code=${rc} timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${LAST_FAILURE_FILE}"; fi' EXIT
+render_shard_path() {
+    local shard="$1"
+    printf '%s\n' "${SHARD_TEMPLATE//\{shard_index\}/${shard}}"
+}
+
+write_missing_shards_file() {
+    "${PYTHON}" - <<PY
+import os
+import re
+from pathlib import Path
+
+import numpy as np
+import zarr
+
+shard_dir = Path(r"${SHARDS_DIR}")
+expected = int(r"${ROW_COUNT}")
+out_path = Path(r"${MISSING_FILE}")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
+seen: set[int] = set()
+
+for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
+    match = pattern.match(shard_path.name)
+    if match is None:
+        continue
+    shard_idx = int(match.group(1))
+    if shard_idx < 0 or shard_idx >= expected:
+        continue
+    try:
+        root = zarr.open_group(str(shard_path), mode="r")
+        for key in ("global_index", "flux", "status", "message"):
+            if key not in root:
+                raise KeyError(key)
+        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
+        if gidx.shape != (1,) or int(gidx[0]) != shard_idx:
+            continue
+        statuses = [str(x).strip().lower() for x in np.asarray(root["status"][:]).tolist()]
+        if len(statuses) != 1 or statuses[0] not in {"success", "skipped"}:
+            continue
+        flux = np.asarray(root["flux"][:], dtype=np.float32)
+        if flux.shape[0] != 1 or not np.all(np.isfinite(flux)):
+            continue
+        if "continuum" in root:
+            continuum = np.asarray(root["continuum"][:], dtype=np.float32)
+            if continuum.shape != flux.shape or not np.any(np.isfinite(continuum[0])):
+                continue
+        seen.add(shard_idx)
+    except Exception:
+        continue
+
+missing = sorted(set(range(expected)) - seen)
+text = "\n".join(str(x) for x in missing)
+out_path.write_text(f"{text}\n" if text else "", encoding="utf-8")
+print(
+    f"[regular-grid missing] expected={expected} seen={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('spectra_shard_*.zarr')))}"
+)
+PY
+}
+
+############################################
+# Logging
+############################################
 
 echo "[regular-grid] Repo: ${REPO}"
 echo "[regular-grid] Config: ${CONFIG_PATH}"
 echo "[regular-grid] Run root: ${RUN_ROOT}"
 echo "[regular-grid] Grid Zarr: ${GRID_ZARR}"
-echo "[regular-grid] Final spectra Zarr: ${FINAL_ZARR}"
-echo "[regular-grid] Output tmp path: ${SYNTH_OUTPUT_TMP}"
+echo "[regular-grid] Shards: ${SHARDS_DIR}"
+echo "[regular-grid] Merged: ${MERGED_ZARR}"
+echo "[regular-grid] Synthesis config: ${SYNTH_CONFIG_PATH}"
 echo "[regular-grid] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
+echo "[regular-grid] Synthesis scratch root: ${SYNTH_SCRATCH}"
 echo "[regular-grid] Workers: ${WORKERS}"
+echo "[regular-grid] Validate workers: ${VALIDATE_WORKERS}"
+echo "[regular-grid] Merge chunk rows: ${MERGE_CHUNK_ROWS}"
 echo "[regular-grid] Skip synthesis: ${SKIP_SYNTHESIS_EFFECTIVE}"
-echo "[regular-grid] Resume: $(to_bool01 "${RESUME}")"
 echo "[regular-grid] Force restart: $(to_bool01 "${FORCE_RESTART}")"
+echo "[regular-grid] Missing shard report: ${MISSING_FILE}"
+echo "[regular-grid] Run policy: preserve valid shards and resume missing ones."
 
-if [[ "$(to_bool01 "${RESUME}")" == "1" && "${SKIP_SYNTHESIS_EFFECTIVE}" != "1" ]]; then
-    if is_valid_synth_zarr "${FINAL_ZARR}"; then
-        echo "[regular-grid] Valid synthesized spectra already present; skipping all work."
-        write_marker "${SYNTH_DONE_MARK}" "synthesis_preexisting"
-        log_phase "bootstrap" "skipped" "valid_final_zarr_present"
-        exit 0
-    fi
+############################################
+# Grid generation
+############################################
+
+if [[ "$(to_bool01 "${FORCE_RESTART}")" == "1" && -d "${GRID_ZARR}" ]]; then
+    echo "[regular-grid] Force restart requested; removing existing grid: ${GRID_ZARR}"
+    rm -rf "${GRID_ZARR}"
 fi
 
-NEED_GRID=1
-if [[ "$(to_bool01 "${RESUME}")" == "1" && -f "${GRID_DONE_MARK}" ]]; then
-    if is_valid_grid_zarr "${GRID_ZARR}"; then
-        NEED_GRID=0
-    fi
-fi
-
-if (( NEED_GRID == 1 )); then
-    CURRENT_PHASE="grid_generation"
-    log_phase "${CURRENT_PHASE}" "start" "building_regular_grid"
+if [[ ! -d "${GRID_ZARR}" ]]; then
+    echo "[regular-grid] Grid not found; generating regular grid."
     GRID_CMD=(
         "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
         --config-json "${CONFIG_PATH}"
@@ -309,71 +382,260 @@ if (( NEED_GRID == 1 )); then
         GRID_CMD+=(--workers "${WORKERS_OVERRIDE}")
     fi
     "${GRID_CMD[@]}"
-    if ! is_valid_grid_zarr "${GRID_ZARR}"; then
-        echo "[regular-grid] ERROR: grid generation finished but output is invalid: ${GRID_ZARR}" >&2
-        exit 1
-    fi
-    write_marker "${GRID_DONE_MARK}" "grid_generation_complete"
-    log_phase "${CURRENT_PHASE}" "ok" "grid_ready"
 else
-    echo "[regular-grid] Resume: skipping grid generation (checkpoint + valid grid found)."
-    log_phase "grid_generation" "skipped" "checkpoint_hit"
+    echo "[regular-grid] Using existing grid: ${GRID_ZARR}"
 fi
 
+if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+    echo "[regular-grid] ERROR: grid output is missing or invalid: ${GRID_ZARR}" >&2
+    exit 1
+fi
+
+ROW_COUNT="$(grid_row_count)"
+echo "Grid rows: ${ROW_COUNT}"
+
 if [[ "${SKIP_SYNTHESIS_EFFECTIVE}" == "1" ]]; then
-    CURRENT_PHASE="complete"
-    log_phase "synthesis" "skipped" "skip_synthesis_effective=1"
-    rm -f "${LAST_FAILURE_FILE}"
     echo "[regular-grid] Completed grid generation only."
     exit 0
 fi
 
-NEED_SYNTH=1
-if [[ "$(to_bool01 "${RESUME}")" == "1" && -f "${SYNTH_DONE_MARK}" ]]; then
-    if is_valid_synth_zarr "${FINAL_ZARR}"; then
-        NEED_SYNTH=0
+############################################
+# Fresh run / resume setup
+############################################
+
+if [[ "$(to_bool01 "${FORCE_RESTART}")" == "1" ]]; then
+    echo "[regular-grid] Force restart requested; clearing previous shard outputs."
+    find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
+    rm -f "${PENDING_SHARDS_FILE}" "${MISSING_FILE}" "${NEXT_WORK_ITEM}"
+    if [[ -d "${MERGED_ZARR}" ]]; then
+        rm -rf "${MERGED_ZARR}"
     fi
 fi
 
-if (( NEED_SYNTH == 1 )); then
-    CURRENT_PHASE="spectrum_synthesis"
-    log_phase "${CURRENT_PHASE}" "start" "launching_synthesis"
+write_missing_shards_file
+cp "${MISSING_FILE}" "${PENDING_SHARDS_FILE}"
+PENDING_COUNT="$(wc -l < "${PENDING_SHARDS_FILE}" | tr -d '[:space:]')"
+echo 0 > "${NEXT_WORK_ITEM}"
 
-    if [[ -d "${FINAL_ZARR}" ]] && ! is_valid_synth_zarr "${FINAL_ZARR}"; then
-        BROKEN_BACKUP="${FINAL_ZARR}.broken.$(date -u +%Y%m%dT%H%M%SZ)"
-        echo "[regular-grid] Found invalid final output, moving aside: ${FINAL_ZARR} -> ${BROKEN_BACKUP}"
-        mv "${FINAL_ZARR}" "${BROKEN_BACKUP}"
-        log_phase "${CURRENT_PHASE}" "info" "moved_invalid_final_to_backup"
+COMPLETED_COUNT=$((ROW_COUNT - PENDING_COUNT))
+echo "[regular-grid] Existing valid shard rows: ${COMPLETED_COUNT}/${ROW_COUNT}"
+
+if (( PENDING_COUNT == 0 )) && is_valid_merged_zarr "${MERGED_ZARR}"; then
+    echo "[regular-grid] All shard rows already present and merged output is valid; skipping work."
+    exit 0
+fi
+
+############################################
+# Walltime guard
+############################################
+
+walltime_to_seconds () {
+    local raw="$1"
+    if [[ -z "${raw}" ]]; then
+        echo ""
+        return 0
     fi
-
-    if [[ -e "${SYNTH_OUTPUT_TMP}" ]]; then
-        echo "[regular-grid] Removing stale synthesis tmp output: ${SYNTH_OUTPUT_TMP}"
-        rm -rf "${SYNTH_OUTPUT_TMP}"
+    if [[ "${raw}" =~ ^[0-9]+$ ]]; then
+        echo "${raw}"
+        return 0
     fi
-
-    SYNTH_CMD=(
-        "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
-        --config-json "${CONFIG_PATH}"
-        --spectra-zarr "${FINAL_ZARR}"
-        --output-tmp "${SYNTH_OUTPUT_TMP}"
-    )
-    if [[ -n "${WORKERS_OVERRIDE}" ]]; then
-        SYNTH_CMD+=(--workers "${WORKERS_OVERRIDE}")
+    if [[ "${raw}" =~ ^([0-9]+):([0-9]{2}):([0-9]{2})$ ]]; then
+        local hh mm ss
+        hh="${BASH_REMATCH[1]}"
+        mm="${BASH_REMATCH[2]}"
+        ss="${BASH_REMATCH[3]}"
+        echo $((10#${hh} * 3600 + 10#${mm} * 60 + 10#${ss}))
+        return 0
     fi
+    echo ""
+}
 
-    "${SYNTH_CMD[@]}"
+WALLTIME_RAW="${WALLTIME_SECONDS:-${PBS_WALLTIME:-${PBS_RESOURCE_LIST_WALLTIME:-}}}"
+WALLTIME_SECONDS="$(walltime_to_seconds "${WALLTIME_RAW}")"
+if ! [[ "${WALLTIME_SECONDS}" =~ ^[0-9]+$ ]] || (( WALLTIME_SECONDS < 1 )); then
+    WALLTIME_SECONDS=$((12*3600))
+    echo "[regular-grid] WARN: could not parse walltime from '${WALLTIME_RAW:-<unset>}' — defaulting to ${WALLTIME_SECONDS}s." >&2
+fi
+START_TIME=$(date +%s)
 
-    if ! is_valid_synth_zarr "${FINAL_ZARR}"; then
-        echo "[regular-grid] ERROR: synthesized spectra output is missing/invalid: ${FINAL_ZARR}" >&2
+SAFETY_BUFFER="${SAFETY_BUFFER:-900}"
+EST_RUNTIME="${EST_RUNTIME:-600}"
+SHARD_RETRY_ATTEMPTS="${SHARD_RETRY_ATTEMPTS:-3}"
+
+time_left () {
+    echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
+}
+
+run_shard_attempts () {
+    local shard="$1"
+    local max_attempts="$2"
+    local scratch_root="$3"
+    local log_file="$4"
+    local sleep_base="$5"
+
+    local shard_out tmp_out
+    shard_out="$(render_shard_path "${shard}")"
+    tmp_out="${TMP_OUTPUT_DIR}/spectra_shard_${shard}.a$$.tmp.zarr"
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        local start end attempt_scratch
+        start=$(date +%s)
+        attempt_scratch="${scratch_root}/shard_${shard}_a${attempt}"
+        mkdir -p "${attempt_scratch}"
+
+        if "${PYTHON}" "${REPO}/scripts/run_turbospectrum_shard.py" \
+            --grid-zarr "${GRID_ZARR}" \
+            --config "${SYNTH_CONFIG_PATH}" \
+            --output-zarr "${shard_out}" \
+            --output-tmp "${tmp_out}" \
+            --shard-index "${shard}" \
+            --shard-count "${ROW_COUNT}" \
+            --workers 1 \
+            --scratch "${attempt_scratch}" \
+            --log-level "${SYNTH_LOG_LEVEL}" \
+            >> "${log_file}" 2>&1; then
+            end=$(date +%s)
+            echo "runtime_seconds=$((end-start)) attempt=${attempt}" >> "${log_file}"
+            return 0
+        fi
+
+        rm -rf "${tmp_out}"
+        sleep $(( (RANDOM % 10) + attempt * sleep_base ))
+    done
+
+    return 1
+}
+
+############################################
+# Worker
+############################################
+
+worker() {
+    local jobfs_dir task_index shard
+    jobfs_dir="${TMP_WORK_DIR}/worker_${RANDOM}"
+    mkdir -p "${jobfs_dir}"
+
+    while true; do
+        if (( $(time_left) < EST_RUNTIME + SAFETY_BUFFER )); then
+            echo "Worker exiting safely before walltime."
+            break
+        fi
+
+        AVAILABLE=$(df -Pk "${jobfs_dir}" | awk 'NR==2 {print $4}')
+        if (( AVAILABLE < 5*1024*1024 )); then
+            echo "Low scratch — sleeping."
+            sleep 60
+            continue
+        fi
+
+        exec 9<>"${LOCK_FILE}"
+        flock -x 9
+        task_index=$(cat "${NEXT_WORK_ITEM}")
+        echo $((task_index + 1)) > "${NEXT_WORK_ITEM}"
+        flock -u 9
+        exec 9>&-
+
+        if (( task_index >= PENDING_COUNT )); then
+            break
+        fi
+
+        shard="$(sed -n "$((task_index + 1))p" "${PENDING_SHARDS_FILE}")"
+        if [[ -z "${shard}" ]]; then
+            break
+        fi
+
+        if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15; then
+            echo "Shard ${shard} failed after ${SHARD_RETRY_ATTEMPTS} attempts in main loop." >> "${LOG_DIR}/shard_${shard}.log"
+        fi
+    done
+}
+
+export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO PYTHON \
+       GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE
+
+############################################
+# Launch workers
+############################################
+
+if (( PENDING_COUNT > 0 )); then
+    echo "[regular-grid] Launching ${WORKERS} workers for ${PENDING_COUNT} pending shard rows..."
+    for ((i=0; i<WORKERS; i++)); do
+        worker &
+    done
+    wait
+else
+    echo "[regular-grid] No pending shard rows detected; moving directly to validation/merge."
+fi
+
+write_missing_shards_file
+FINAL_MISSING="$(wc -l < "${MISSING_FILE}" | tr -d '[:space:]')"
+
+echo "[regular-grid] Failed shard report written: ${MISSING_FILE} (count=${FINAL_MISSING})"
+if (( FINAL_MISSING > 0 )); then
+    echo "First 20 failed shard IDs:"
+    head -n 20 "${MISSING_FILE}"
+fi
+
+echo "[regular-grid] Validating shard outputs..."
+VALIDATE_CMD=(
+    "${PYTHON}" "${REPO}/scripts/validate_dataset.py"
+    --shard-dir "${SHARDS_DIR}"
+    --expected-shards "${ROW_COUNT}"
+    --workers "${VALIDATE_WORKERS}"
+)
+if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
+    VALIDATE_CMD+=(--allow-incomplete-provenance)
+fi
+set +e
+"${VALIDATE_CMD[@]}"
+VALIDATE_RC=$?
+set -e
+if (( VALIDATE_RC != 0 )); then
+    echo "[regular-grid] WARN: validation exited with code ${VALIDATE_RC}; continuing with merge policy."
+fi
+
+SHARD_STORE_COUNT=$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' | wc -l | tr -d '[:space:]')
+if (( SHARD_STORE_COUNT == 0 )); then
+    echo "[regular-grid] ERROR: no shard stores were produced in ${SHARDS_DIR}; skipping merge." >&2
+    echo "[regular-grid] ERROR: inspect ${LOG_DIR}/shard_*.log for worker failures." >&2
+    FIRST_SHARD_LOG=""
+    if compgen -G "${LOG_DIR}/shard_*.log" > /dev/null; then
+        FIRST_SHARD_LOG="$(printf '%s\n' "${LOG_DIR}"/shard_*.log | sort | head -n 1)"
+    fi
+    if [[ -n "${FIRST_SHARD_LOG}" && -f "${FIRST_SHARD_LOG}" ]]; then
+        echo "[regular-grid] ERROR: first shard log excerpt (${FIRST_SHARD_LOG}):" >&2
+        sed -n '1,120p' "${FIRST_SHARD_LOG}" >&2 || true
+    fi
+    exit 1
+fi
+
+MERGE_CMD=(
+    "${PYTHON}" "${REPO}/scripts/merge_spectra_shards.py"
+    --shard-dir "${SHARDS_DIR}"
+    --grid-zarr "${GRID_ZARR}"
+    --output-zarr "${MERGED_ZARR}"
+    --chunk-rows "${MERGE_CHUNK_ROWS}"
+    --tmp-dir "${TMP_SYSTEM_DIR}"
+)
+
+if [[ "$(to_bool01 "${SKIP_BAD_SHARDS}")" == "1" ]]; then
+    MERGE_CMD+=(--skip-invalid-shards)
+fi
+
+if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
+    MERGE_CMD+=(--allow-incomplete-provenance)
+fi
+
+if (( FINAL_MISSING > 0 )); then
+    if [[ "$(to_bool01 "${ALLOW_PARTIAL_MERGE}")" == "1" ]]; then
+        echo "[regular-grid] WARN: missing shard rows detected; enabling partial merge (--allow-missing --skip-nonexistent-shards)."
+        MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
+    else
+        echo "[regular-grid] ERROR: ${FINAL_MISSING} shard rows are still missing; merge aborted." >&2
         exit 1
     fi
-    write_marker "${SYNTH_DONE_MARK}" "synthesis_complete"
-    log_phase "${CURRENT_PHASE}" "ok" "synthesis_ready"
-else
-    echo "[regular-grid] Resume: skipping synthesis (checkpoint + valid spectra found)."
-    log_phase "synthesis" "skipped" "checkpoint_hit"
 fi
 
-CURRENT_PHASE="complete"
-rm -f "${LAST_FAILURE_FILE}"
-echo "[regular-grid] Completed synthesis: ${FINAL_ZARR}"
+echo "[regular-grid] Merging shard outputs..."
+"${MERGE_CMD[@]}"
+echo "[regular-grid] Merge complete: ${MERGED_ZARR}"

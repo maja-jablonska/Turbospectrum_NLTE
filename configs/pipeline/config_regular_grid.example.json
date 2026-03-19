@@ -45,8 +45,19 @@
     }
   },
   "turbospectrum": {
-    "_note": "Path to synthesis runtime config used by synthesize_spectra_from_zarr.py",
-    "config": "../synthesis/config_sample_comprehensive.json"
+    "_note": [
+      "Base synthesis runtime config used by synthesize_spectra_from_zarr.py.",
+      "overrides lets this regular-grid example carry its own linelist settings without duplicating the full synthesis schema."
+    ],
+    "config": "../synthesis/config_sample_comprehensive.json",
+    "overrides": {
+      "paths": {
+        "linelist_path": "../../input_files/linelists",
+        "linelist_files": [
+          "nlte_ges_linelist_jmg6may2025_I_II"
+        ]
+      }
+    }
   },
   "outputs": {
     "_note": "Paths resolved relative to this config unless absolute.",
@@ -54,7 +65,8 @@
     "grid_csv": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.csv",
     "grid_zarr": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.zarr",
     "grid_index_parquet": "../../runs/regular-grid/outputs/grids/index.parquet",
-    "spectra_zarr": "../../runs/regular-grid/outputs/zarr/regular_synthesized_spectra.zarr"
+    "spectra_zarr": "../../runs/regular-grid/outputs/zarr/regular_synthesized_spectra.zarr",
+    "spectra_shard_template": "../../runs/regular-grid/outputs/shards/spectra_shard_{shard_index}.zarr"
   },
   "runtime": {
     "workers": 16,

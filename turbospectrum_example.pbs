@@ -483,6 +483,14 @@ SHARD_STORE_COUNT=$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name '
 if (( SHARD_STORE_COUNT == 0 )); then
     echo "[turbospec] ERROR: no shard stores were produced in ${SHARDS_DIR}; skipping merge." >&2
     echo "[turbospec] ERROR: inspect ${LOG_DIR}/shard_*.log for worker failures." >&2
+    FIRST_SHARD_LOG=""
+    if compgen -G "${LOG_DIR}/shard_*.log" > /dev/null; then
+        FIRST_SHARD_LOG="$(printf '%s\n' "${LOG_DIR}"/shard_*.log | sort | head -n 1)"
+    fi
+    if [[ -n "${FIRST_SHARD_LOG}" && -f "${FIRST_SHARD_LOG}" ]]; then
+        echo "[turbospec] ERROR: first shard log excerpt (${FIRST_SHARD_LOG}):" >&2
+        sed -n '1,120p' "${FIRST_SHARD_LOG}" >&2 || true
+    fi
     exit 1
 fi
 
