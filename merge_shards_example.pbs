@@ -159,6 +159,16 @@ if ! [[ "${MERGE_CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( MERGE_CHUNK_ROWS < 1 )); then
     exit 1
 fi
 
+ALLOW_MISSING_BOOL="$(to_bool01 "${ALLOW_MISSING}")"
+ALLOW_INCOMPLETE_PROVENANCE_BOOL="$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")"
+SKIP_BAD_SHARDS_BOOL="$(to_bool01 "${SKIP_BAD_SHARDS}")"
+ALLOW_MISSING_EFFECTIVE_BOOL="${ALLOW_MISSING_BOOL}"
+
+if [[ "${SKIP_BAD_SHARDS_BOOL}" == "1" && "${ALLOW_MISSING_BOOL}" != "1" ]]; then
+    echo "[merge] WARN: SKIP_BAD_SHARDS=1 enables partial merge semantics so malformed shards can be skipped." >&2
+    ALLOW_MISSING_EFFECTIVE_BOOL=1
+fi
+
 if [[ ! -d "${SHARDS_DIR}" ]]; then
     echo "[merge] ERROR: shard directory not found: ${SHARDS_DIR}" >&2
     exit 1
@@ -175,9 +185,9 @@ echo "[merge] Shards: ${SHARDS_DIR}"
 echo "[merge] Grid: ${GRID_ZARR}"
 echo "[merge] Output: ${MERGED_ZARR}"
 echo "[merge] Chunk rows: ${MERGE_CHUNK_ROWS}"
-echo "[merge] Allow missing: ${ALLOW_MISSING}"
-echo "[merge] Allow incomplete provenance: ${ALLOW_INCOMPLETE_PROVENANCE}"
-echo "[merge] Skip bad shards: ${SKIP_BAD_SHARDS}"
+echo "[merge] Allow partial merge: ${ALLOW_MISSING_EFFECTIVE_BOOL}"
+echo "[merge] Allow incomplete provenance: ${ALLOW_INCOMPLETE_PROVENANCE_BOOL}"
+echo "[merge] Skip malformed/invalid shards: ${SKIP_BAD_SHARDS_BOOL}"
 echo "[merge] TMPDIR: ${TMPDIR}"
 
 MERGE_CMD=(
@@ -192,15 +202,18 @@ if [[ -d "${GRID_ZARR}" ]]; then
     MERGE_CMD+=(--grid-zarr "${GRID_ZARR}")
 fi
 
-if [[ "$(to_bool01 "${ALLOW_MISSING}")" == "1" ]]; then
+if [[ "${ALLOW_MISSING_BOOL}" == "1" ]]; then
     MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
 fi
 
-if [[ "$(to_bool01 "${SKIP_BAD_SHARDS}")" == "1" ]]; then
+if [[ "${SKIP_BAD_SHARDS_BOOL}" == "1" ]]; then
     MERGE_CMD+=(--skip-invalid-shards)
+    if [[ "${ALLOW_MISSING_BOOL}" != "1" ]]; then
+        MERGE_CMD+=(--allow-missing)
+    fi
 fi
 
-if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
+if [[ "${ALLOW_INCOMPLETE_PROVENANCE_BOOL}" == "1" ]]; then
     MERGE_CMD+=(--allow-incomplete-provenance)
 fi
 
