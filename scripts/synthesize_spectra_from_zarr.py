@@ -55,6 +55,7 @@ from provenance_contract import (  # noqa: E402
     file_sha256,
     is_meaningful_provenance_value,
 )
+from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
 
 
 def _read_mu_points(spec_path: str) -> np.ndarray:
@@ -114,16 +115,6 @@ def _choose_mu_indices(mu_points: np.ndarray, *, row_index: int, cfg: Turbospect
     mu_sel = mu_points[chosen]
     mu_summary = float(mu_sel[0]) if mu_sel.size == 1 else float(np.mean(mu_sel))
     return chosen, mu_summary
-
-
-def _reconstruct_continuum(abs_flux: np.ndarray, norm_flux: np.ndarray) -> np.ndarray:
-    """Reconstruct continuum from absolute and normalized quantities: cont = abs / norm."""
-    abs_arr = np.asarray(abs_flux, dtype=np.float32)
-    norm_arr = np.asarray(norm_flux, dtype=np.float32)
-    cont = np.full_like(abs_arr, np.nan, dtype=np.float32)
-    valid = np.isfinite(abs_arr) & np.isfinite(norm_arr) & (np.abs(norm_arr) > np.float32(1e-8))
-    np.divide(abs_arr, norm_arr, out=cont, where=valid)
-    return cont
 
 
 DEFAULT_CONFIG_PATH = os.path.abspath(
@@ -709,38 +700,12 @@ def _synthesis_task(args) -> Dict:
 
                 if chosen_idx.size > 0:
                     mu_selected_index = int(chosen_idx[0])
-                    abs_cols = [int(3 + 2 * i) for i in chosen_idx.tolist()]
-                    norm_cols = [int(4 + 2 * i) for i in chosen_idx.tolist()]
-                    if data.shape[1] <= max(abs_cols + norm_cols):
-                        raise ValueError(f"Intensity spectrum has too few columns: {data.shape}")
-                    i_abs = data[:, abs_cols].astype(np.float32)
-                    i_norm = data[:, norm_cols].astype(np.float32)
-                    if i_abs.ndim == 1:
-                        i_abs = i_abs[:, None]
-                        i_norm = i_norm[:, None]
-                    if reduce_mode == "mean" and i_abs.shape[1] > 1:
-                        flux = i_abs.mean(axis=1)
-                        norm = i_norm.mean(axis=1)
-                    else:
-                        flux = i_abs[:, 0]
-                        norm = i_norm[:, 0]
-                    cont = _reconstruct_continuum(flux, norm)
-                else:
-                    norm_flux = data[:, 1].astype(np.float32)
-                    flux = norm_flux
-                    if data.shape[1] > 2:
-                        abs_flux = data[:, 2].astype(np.float32)
-                        cont = _reconstruct_continuum(abs_flux, norm_flux)
-                    else:
-                        cont = np.full_like(flux, np.nan, dtype=np.float32)
-            else:
-                norm_flux = data[:, 1].astype(np.float32)
-                flux = norm_flux
-                if data.shape[1] > 2:
-                    abs_flux = data[:, 2].astype(np.float32)
-                    cont = _reconstruct_continuum(abs_flux, norm_flux)
-                else:
-                    cont = np.full_like(flux, np.nan, dtype=np.float32)
+                flux, cont = extract_flux_and_continuum(
+                    data,
+                    is_intensity=is_intensity,
+                    chosen_idx=chosen_idx,
+                    reduce_mode=reduce_mode,
+                )
             spectrum = (flux, cont)
         except Exception as exc:  # noqa: BLE001
             return {
@@ -794,6 +759,7 @@ def _write_zarr_output(
     contact: str,
     generator: str,
     flux_definition: str,
+    flux_unit: str,
     provenance_payload: Mapping[str, str],
     contract_provenance: Mapping[str, str],
     status_counts: Mapping[str, int],
@@ -878,7 +844,7 @@ def _write_zarr_output(
         "synthesis_timestamp": created_utc,
         "flux_definition": flux_definition,
         "wavelength_unit": "angstrom",
-        "flux_unit": "relative",
+        "flux_unit": flux_unit,
         "parameter_units": param_units,
         "parameter_columns_group": "parameter_columns",
         "physics_hash": physics_hash,
@@ -1074,7 +1040,11 @@ def main() -> None:
     parser.add_argument("--physics-hash", default=None, help="Optional override for physics hash")
     parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
     parser.add_argument("--generator", default="turbospectrum_nlte", help="Generator string for metadata")
-    parser.add_argument("--flux-definition", default="continuum_normalized", help="Flux definition metadata")
+    parser.add_argument(
+        "--flux-definition",
+        default="auto",
+        help="Flux definition metadata. Use 'auto' to infer from output_mode.",
+    )
     parser.add_argument(
         "--allow-incomplete-provenance",
         action="store_true",
@@ -1110,9 +1080,10 @@ def main() -> None:
     row_count, column_data = _validate_grid(grid_root)
     wavelengths, expected_points = _expected_wavelengths(column_data)
     logger.info("Grid rows=%d wavelength_points=%d", row_count, expected_points)
+    output_mode_values: List[str] = []
     if "output_mode" in column_data:
-        unique_modes = sorted({str(x) for x in np.unique(column_data["output_mode"])})
-        logger.info("Grid output_mode values: %s", unique_modes)
+        output_mode_values = sorted({str(x) for x in np.unique(column_data["output_mode"])})
+        logger.info("Grid output_mode values: %s", output_mode_values)
     if "calculation_mode" in column_data:
         unique_calc = sorted({str(x) for x in np.unique(column_data["calculation_mode"])})
         logger.info("Grid calculation_mode values: %s", unique_calc)
@@ -1182,6 +1153,10 @@ def main() -> None:
     physics_hash = args.physics_hash or _compute_physics_hash(config, column_data)
     created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     git_commit = _git_commit(project_root)
+    resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(
+        output_mode_values,
+        explicit_definition=args.flux_definition,
+    )
     config_payload = dataclasses.asdict(config)
     config_hash = canonical_json_sha256(config_payload)
     grid_definition_hash = compute_grid_definition_hash(column_data)
@@ -1360,7 +1335,8 @@ def main() -> None:
         git_commit=git_commit,
         contact=args.contact,
         generator=args.generator,
-        flux_definition=args.flux_definition,
+        flux_definition=resolved_flux_definition,
+        flux_unit=resolved_flux_unit,
         provenance_payload=provenance_payload,
         contract_provenance=contract_provenance,
         status_counts=status_counts,

@@ -44,6 +44,7 @@ from provenance_contract import (
     compute_grid_definition_hash,
     is_meaningful_provenance_value,
 )
+from spectrum_output import infer_flux_metadata
 
 PROVENANCE_FILENAMES: Tuple[str, ...] = (
     "canonical_config.yaml",
@@ -711,7 +712,11 @@ def main() -> None:
     parser.add_argument("--physics-hash", default=None, help="Optional override for physics hash")
     parser.add_argument("--contact", default=os.environ.get("SPICE_CONTACT", "unknown"), help="Contact metadata")
     parser.add_argument("--generator", default="turbospectrum_nlte.merge", help="Generator string for metadata")
-    parser.add_argument("--flux-definition", default="continuum_normalized", help="Flux definition metadata")
+    parser.add_argument(
+        "--flux-definition",
+        default="auto",
+        help="Flux definition metadata. Use 'auto' to infer from output_mode.",
+    )
     parser.add_argument(
         "--allow-incomplete-provenance",
         action="store_true",
@@ -751,6 +756,13 @@ def main() -> None:
         os.environ["TEMP"] = tmp_dir
         tempfile.tempdir = tmp_dir
 
+    partial_merge_requested = bool(
+        args.allow_missing or args.skip_nonexistent_shards or args.skip_invalid_shards
+    )
+    effective_skip_invalid_shards = bool(
+        args.skip_invalid_shards or args.allow_missing or args.skip_nonexistent_shards
+    )
+
     shards = _list_shards(args.shard, args.shard_dir)
     shards, skipped_nonexistent_shards = _filter_nonexistent_shards(
         shards,
@@ -758,16 +770,20 @@ def main() -> None:
     )
     shards, skipped_invalid_shards, validated_wavelengths, _validated_wavelength_path = _filter_invalid_shards(
         shards,
-        skip_invalid=bool(args.skip_invalid_shards),
+        skip_invalid=effective_skip_invalid_shards,
     )
     if not shards:
         raise FileNotFoundError(
-            "No readable shard stores remain after filtering. "
+            "No structurally valid shard stores remain after filtering. "
             "Either point --shard-dir to existing shard outputs or disable shard skipping flags."
         )
-    effective_allow_missing = bool(
-        args.allow_missing or args.skip_nonexistent_shards or args.skip_invalid_shards
-    )
+    effective_allow_missing = partial_merge_requested
+    if effective_skip_invalid_shards and not args.skip_invalid_shards:
+        print(
+            "WARNING: partial merge enabled; invalid shard stores will be skipped "
+            "as unavailable rows.",
+            file=sys.stderr,
+        )
     if (args.skip_nonexistent_shards or args.skip_invalid_shards) and not args.allow_missing:
         print(
             "WARNING: shard skipping enables partial merge semantics "
@@ -1239,6 +1255,12 @@ def main() -> None:
 
     attr_sources: List[Mapping[str, Any]] = [grid_attrs]
     attr_sources.extend(shard_attr_snapshots)
+    resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(
+        output_mode_values,
+        explicit_definition=args.flux_definition,
+        inherited_definition=_first_attr_value(attr_sources, keys=("flux_definition",)),
+        inherited_unit=_first_attr_value(attr_sources, keys=("flux_unit",)),
+    )
     try:
         linelist_manifest = json.loads(provenance_payload.get("linelist_manifest.json", "{}"))
     except Exception:
@@ -1332,9 +1354,9 @@ def main() -> None:
         "generator": args.generator,
         "created_utc": created_utc,
         "synthesis_timestamp": created_utc,
-        "flux_definition": args.flux_definition,
+        "flux_definition": resolved_flux_definition,
         "wavelength_unit": "angstrom",
-        "flux_unit": "relative",
+        "flux_unit": resolved_flux_unit,
         "parameter_units": param_units,
         "parameter_columns_group": "parameter_columns",
         "physics_hash": physics_hash,
@@ -1357,6 +1379,7 @@ def main() -> None:
         "allow_missing_requested": bool(args.allow_missing),
         "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
         "skip_invalid_shards": bool(args.skip_invalid_shards),
+        "skip_invalid_shards_effective": bool(effective_skip_invalid_shards),
         "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
         "skipped_invalid_shards": int(len(skipped_invalid_shards)),
         "expected_models": int(row_count),

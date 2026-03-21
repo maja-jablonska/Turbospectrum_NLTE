@@ -45,6 +45,7 @@ from provenance_contract import (  # noqa: E402
     file_sha256,
     is_meaningful_provenance_value,
 )
+from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
 
 
 def _read_mu_points(spec_path: str) -> np.ndarray:
@@ -118,15 +119,6 @@ def _choose_mu_indices(
     mu_summary = float(mu_sel[0]) if mu_sel.size == 1 else float(np.mean(mu_sel))
     return chosen, mu_summary
 
-
-def _reconstruct_continuum(abs_flux: np.ndarray, norm_flux: np.ndarray) -> np.ndarray:
-    """Reconstruct continuum from absolute and normalized quantities: cont = abs / norm."""
-    abs_arr = np.asarray(abs_flux, dtype=np.float32)
-    norm_arr = np.asarray(norm_flux, dtype=np.float32)
-    cont = np.full_like(abs_arr, np.nan, dtype=np.float32)
-    valid = np.isfinite(abs_arr) & np.isfinite(norm_arr) & (np.abs(norm_arr) > np.float32(1e-8))
-    np.divide(abs_arr, norm_arr, out=cont, where=valid)
-    return cont
 
 ############################################
 # Worker-global config
@@ -541,39 +533,12 @@ def _synthesis_task(batch):
 
                     if chosen_idx.size > 0:
                         mu_selected_index = int(chosen_idx[0])
-                        abs_cols = [int(3 + 2 * i) for i in chosen_idx.tolist()]
-                        norm_cols = [int(4 + 2 * i) for i in chosen_idx.tolist()]
-                        if data.shape[1] <= max(abs_cols + norm_cols):
-                            raise ValueError(f"Intensity spectrum has too few columns: {data.shape}")
-                        i_abs = data[:, abs_cols].astype(np.float32)
-                        i_norm = data[:, norm_cols].astype(np.float32)
-                        if i_abs.ndim == 1:
-                            i_abs = i_abs[:, None]
-                            i_norm = i_norm[:, None]
-                        if reduce_mode == "mean" and i_abs.shape[1] > 1:
-                            flux = i_abs.mean(axis=1)
-                            norm = i_norm.mean(axis=1)
-                        else:
-                            flux = i_abs[:, 0]
-                            norm = i_norm[:, 0]
-                        cont = _reconstruct_continuum(flux, norm)
-                    else:
-                        # Back-compat fallback to the flux columns.
-                        norm_flux = data[:, 1].astype(np.float32)
-                        flux = norm_flux
-                        if data.shape[1] > 2:
-                            abs_flux = data[:, 2].astype(np.float32)
-                            cont = _reconstruct_continuum(abs_flux, norm_flux)
-                        else:
-                            cont = np.full_like(flux, np.nan)
-                else:
-                    norm_flux = data[:, 1].astype(np.float32)
-                    flux = norm_flux
-                    if data.shape[1] > 2:
-                        abs_flux = data[:, 2].astype(np.float32)
-                        cont = _reconstruct_continuum(abs_flux, norm_flux)
-                    else:
-                        cont = np.full_like(flux, np.nan)
+                    flux, cont = extract_flux_and_continuum(
+                        data,
+                        is_intensity=is_intensity,
+                        chosen_idx=chosen_idx,
+                        reduce_mode=reduce_mode,
+                    )
 
                 spectrum = (flux, cont)
 
@@ -903,6 +868,19 @@ def main():
     # Idempotency
     ############################################
 
+    grid_output_mode_values: List[str] = []
+    if "output_mode" in grid:
+        grid_output_mode_values = sorted(
+            {
+                str(value).strip()
+                for value in np.asarray(grid["output_mode"][:]).tolist()
+                if str(value).strip()
+            }
+        )
+    elif str(getattr(config, "output_mode", "")).strip():
+        grid_output_mode_values = [str(getattr(config, "output_mode")).strip()]
+    resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(grid_output_mode_values)
+
     if os.path.exists(final_path):
         if _existing_shard_is_usable(final_path, indices):
             logger.warning("Shard output already exists and is valid — skipping.")
@@ -952,6 +930,9 @@ def main():
             "shard_count": args.shard_count,
             "grid": os.path.abspath(args.grid_zarr),
             "note": "empty shard (no rows assigned)",
+            "flux_definition": resolved_flux_definition,
+            "flux_unit": resolved_flux_unit,
+            "output_mode_values": grid_output_mode_values,
             "created_utc": created_utc,
             "git_sha": git_commit,
             "synthesis_timestamp": created_utc,
@@ -1144,10 +1125,24 @@ def main():
             except Exception:
                 pass
 
+    shard_output_mode_values = sorted(
+        {
+            str(value).strip()
+            for value in np.asarray(columns.get("output_mode", np.asarray([], dtype=object))).tolist()
+            if str(value).strip()
+        }
+    )
+    if not shard_output_mode_values:
+        shard_output_mode_values = grid_output_mode_values
+    resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(shard_output_mode_values)
+
     attrs_payload: Dict[str, Any] = {
         "shard_index": args.shard_index,
         "shard_count": args.shard_count,
         "grid": os.path.abspath(args.grid_zarr),
+        "flux_definition": resolved_flux_definition,
+        "flux_unit": resolved_flux_unit,
+        "output_mode_values": shard_output_mode_values,
         "mu_sampling": json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
         "created_utc": created_utc,
         "git_sha": git_commit,
