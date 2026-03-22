@@ -31,7 +31,7 @@ from run_turbospectrum import (  # noqa: E402
     create_linelist_file,
     determine_worker_count,
     ensure_directories,
-    get_model_filename,
+    get_synthesis_output_stem_from_params,
     resolve_linelist_paths,
     run_single_synthesis,
     validate_runtime_environment,
@@ -445,11 +445,6 @@ def _synthesis_task(batch):
     for global_index, row_values in batch:
         cfg = copy.deepcopy(_WORKER_CONFIG)
 
-        teff = int(row_values["teff"])
-        logg = float(row_values["logg"])
-        feh = float(row_values["feh"])
-        turb = str(row_values["turb"])
-
         cfg.lambda_min = float(row_values["lam_min"])
         cfg.lambda_max = float(row_values["lam_max"])
         cfg.lambda_step = float(row_values["lam_step"])
@@ -473,17 +468,15 @@ def _synthesis_task(batch):
             mu_sampling["mode"] = "random"
         cfg.mu_sampling = mu_sampling
 
-        base_name = get_model_filename(teff, logg, feh, turb)
-
         start = time.perf_counter()
-        result = run_single_synthesis(((teff, logg, feh, turb), cfg))
+        result = run_single_synthesis((row_values, cfg))
         duration = time.perf_counter() - start
 
-        suffix = ".intensity.spec" if is_intensity else ".spec"
-        spec_path = os.path.join(
-            cfg.output_dir,
-            f"{os.path.splitext(base_name)[0]}{suffix}"
-        )
+        spec_path = str(result.get("output_path", "") or "")
+        base_name = str(result.get("base_name", "") or os.path.splitext(os.path.basename(spec_path))[0])
+        if not spec_path:
+            suffix = ".intensity.spec" if is_intensity else ".spec"
+            spec_path = os.path.join(cfg.output_dir, f"{base_name}{suffix}")
 
         spectrum = None
         mu_selected = float("nan")
@@ -580,6 +573,43 @@ def _synthesis_task(batch):
         })
 
     return results
+
+
+def _build_task_batches(
+    indices: np.ndarray,
+    columns: Mapping[str, np.ndarray],
+    *,
+    batch_size: int,
+    config: TurbospectrumConfig,
+) -> tuple[list[list[tuple[int, dict[str, Any]]]], dict[int, int]]:
+    tasks: list[list[tuple[int, dict[str, Any]]]] = []
+    global_to_local = {int(g): i for i, g in enumerate(indices.tolist())}
+    output_name_counts: Dict[str, int] = {}
+
+    for batch_indices in _build_batches(indices, batch_size):
+        batch: list[tuple[int, dict[str, Any]]] = []
+        for global_i in batch_indices:
+            local_i = global_to_local[int(global_i)]
+            row_values = {k: columns[k][local_i] for k in columns}
+            output_stem = get_synthesis_output_stem_from_params(
+                row_values,
+                default_output_mode=getattr(config, "output_mode", "Flux"),
+                default_calculation_mode="NLTE" if config.nlte else "LTE",
+            )
+            output_name_counts[output_stem] = output_name_counts.get(output_stem, 0) + 1
+            batch.append((int(global_i), row_values))
+        tasks.append(batch)
+
+    duplicate_output_names = [name for name, count in output_name_counts.items() if count > 1]
+    if duplicate_output_names:
+        sample = ", ".join(sorted(duplicate_output_names)[:3])
+        raise ValueError(
+            "Grid rows collapse to duplicate Turbospectrum output filenames inside this shard, "
+            f"which can overwrite spectra/opacity files (examples: {sample}). "
+            "Preserve all distinguishing columns or adjust naming."
+        )
+
+    return tasks, global_to_local
 
 
 ############################################
@@ -965,15 +995,15 @@ def main():
     # Columns
     ############################################
 
-    turb_col = "turbvel" if "turbvel" in grid else "t_value"
+    required_cols = ["teff", "logg", "feh", "lam_min", "lam_max", "lam_step"]
+    optional_cols = [k for k in ("turbvel", "t_value", "output_mode", "calculation_mode", "mode", "grid_version") if k in grid]
+    if "turbvel" not in optional_cols and "t_value" not in optional_cols:
+        raise KeyError("Grid Zarr must include either 'turbvel' or 't_value' for synthesis")
 
-    base_cols = ["teff", "logg", "feh", "lam_min", "lam_max", "lam_step", turb_col]
-    # Optional columns can drive runtime behavior (Intensity/NLTE).
-    optional_cols = [k for k in ("output_mode", "calculation_mode", "grid_version") if k in grid]
-
-    columns = {k: np.asarray(grid[k][indices]) for k in base_cols + optional_cols}
-
-    columns["turb"] = columns.pop(turb_col)
+    passthrough_cols = sorted(
+        name for name in grid.keys() if name not in set(required_cols + optional_cols)
+    )
+    columns = {k: np.asarray(grid[k][indices]) for k in required_cols + optional_cols + passthrough_cols}
 
     ############################################
     # Workers
@@ -989,20 +1019,12 @@ def main():
     # Build adaptive batches
     ############################################
 
-    tasks = []
-    global_to_local = {int(g): i for i, g in enumerate(indices.tolist())}
-
-    for batch_indices in _build_batches(indices, args.batch_size):
-        batch = []
-
-        for global_i in batch_indices:
-            local_i = global_to_local[int(global_i)]
-
-            row_values = {k: columns[k][local_i] for k in columns}
-
-            batch.append((int(global_i), row_values))
-
-        tasks.append(batch)
+    tasks, global_to_local = _build_task_batches(
+        indices,
+        columns,
+        batch_size=args.batch_size,
+        config=config,
+    )
 
     ############################################
     # Run synthesis
@@ -1024,6 +1046,7 @@ def main():
     messages = [""] * len(indices)
     mu_selected = np.full(len(indices), np.nan, dtype=np.float32)
     mu_selected_index = np.full(len(indices), -1, dtype=np.int16)
+    base_names = [""] * len(indices)
 
     logger.info("Starting synthesis with %d workers", worker_count)
 
@@ -1059,6 +1082,7 @@ def main():
 
                 statuses[idx] = result["status"]
                 messages[idx] = result["message"]
+                base_names[idx] = str(result.get("base_name", "") or "")
                 try:
                     mu_selected[idx] = float(result.get("mu_selected", np.nan))
                 except Exception:
@@ -1103,10 +1127,9 @@ def main():
     _write_string_1d(root, "status", statuses, chunks=max(1, min(256, len(statuses))))
     _write_string_1d(root, "message", messages, chunks=max(1, min(256, len(messages))))
     # Optional: base model filenames for debugging/traceability.
-    if any(isinstance(m, str) and m for m in messages):
+    if any(isinstance(name, str) and name for name in base_names):
         try:
-            base_names = np.asarray([str(get_model_filename(int(columns["teff"][i]), float(columns["logg"][i]), float(columns["feh"][i]), str(columns["turb"][i]))) for i in range(len(indices))], dtype="U256")
-            _write_string_1d(root, "base_name", base_names.tolist(), chunks=max(1, min(256, len(base_names))))
+            _write_string_1d(root, "base_name", base_names, chunks=max(1, min(256, len(base_names))))
         except Exception:
             pass
 

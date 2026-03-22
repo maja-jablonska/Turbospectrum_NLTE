@@ -769,6 +769,34 @@ def _format_abundance_value(raw_value: Any) -> str:
         return str(raw_value).strip()
 
 
+def _normalize_turbulence_id(raw_value: Any, default: str = "01") -> str:
+    text = str(raw_value if raw_value is not None else "").strip()
+    if not text:
+        return default
+    if text.isdigit():
+        return f"{int(text):02d}"
+    try:
+        numeric = float(text)
+    except Exception:
+        return text
+    if numeric.is_integer():
+        return f"{int(numeric):02d}"
+    return text
+
+
+def _coerce_microturbulence_value(raw_value: Any, fallback: str) -> float:
+    candidate = raw_value
+    if candidate in (None, ""):
+        candidate = fallback
+    try:
+        turb_val = float(str(candidate).strip())
+        if turb_val > 10:
+            turb_val = turb_val / 10.0
+        return turb_val
+    except Exception:
+        return 1.0
+
+
 def _collect_synthesis_abundances(params: Mapping[str, Any]) -> Dict[str, str]:
     abundances: Dict[str, str] = {}
     unsupported: List[str] = []
@@ -835,6 +863,96 @@ def get_synthesis_stem(teff, logg, feh, turb_str, abundances: Optional[Mapping[s
     parts.extend(f"{key}{legacy[key]}" for key in ("a", "c", "n", "o", "r", "s"))
     parts.extend(f"{key}{normalized[key]}" for key in sorted(key for key in normalized if key not in legacy))
     return "_".join(parts)
+
+
+def _filename_token(raw_value: Any) -> str:
+    text = str(raw_value if raw_value is not None else "").strip()
+    if not text:
+        return ""
+    cleaned = "".join(ch if ch.isalnum() or ch in {".", "+", "-"} else "-" for ch in text)
+    return re.sub(r"-{2,}", "-", cleaned).strip("-")
+
+
+def _resolve_synthesis_request(params: Mapping[str, Any]) -> Dict[str, Any]:
+    teff = int(params["teff"])
+    logg = float(params["logg"])
+    feh = float(params["feh"])
+    model_turb_str = _normalize_turbulence_id(
+        params.get("microturb_str")
+        or params.get("t_value")
+        or params.get("turb")
+        or params.get("turbvel")
+        or "01"
+    )
+    synthesis_turb_raw = params.get("turbvel")
+    if synthesis_turb_raw in (None, ""):
+        synthesis_turb_raw = params.get("microturb")
+    if synthesis_turb_raw in (None, ""):
+        synthesis_turb_raw = params.get("turbulence")
+    if synthesis_turb_raw in (None, ""):
+        synthesis_turb_raw = model_turb_str
+    abundances = _collect_synthesis_abundances(params)
+    return {
+        "teff": teff,
+        "logg": logg,
+        "feh": feh,
+        "model_turb_str": model_turb_str,
+        "synthesis_turb_raw": synthesis_turb_raw,
+        "abundances": abundances,
+    }
+
+
+def get_synthesis_output_stem_from_params(
+    params: Mapping[str, Any],
+    *,
+    default_output_mode: str = "Flux",
+    default_calculation_mode: str = "LTE",
+    default_mode: str = "",
+) -> str:
+    request = _resolve_synthesis_request(params)
+    base_stem = get_synthesis_stem(
+        request["teff"],
+        request["logg"],
+        request["feh"],
+        request["model_turb_str"],
+        request["abundances"],
+    )
+
+    output_mode = params.get("output_mode")
+    output_mode_text = str(output_mode if output_mode not in (None, "") else default_output_mode).strip()
+    calculation_mode = params.get("calculation_mode")
+    calculation_mode_text = str(
+        calculation_mode if calculation_mode not in (None, "") else default_calculation_mode
+    ).strip()
+    mode = params.get("mode")
+    mode_text = str(mode if mode not in (None, "") else default_mode).strip()
+
+    extras: List[str] = []
+    synthesis_turb_id = _normalize_turbulence_id(request["synthesis_turb_raw"], default=request["model_turb_str"])
+    if synthesis_turb_id != request["model_turb_str"]:
+        extras.append(f"xi{synthesis_turb_id}")
+
+    lam_min = params.get("lam_min")
+    lam_max = params.get("lam_max")
+    lam_step = params.get("lam_step")
+    if lam_min not in (None, "") and lam_max not in (None, "") and lam_step not in (None, ""):
+        extras.append(
+            "wl"
+            + _filename_token(
+                f"{float(lam_min):g}-{float(lam_max):g}-{float(lam_step):g}"
+            )
+        )
+
+    if output_mode_text:
+        extras.append(f"out{_filename_token(output_mode_text.lower())}")
+    if calculation_mode_text:
+        extras.append(f"calc{_filename_token(calculation_mode_text.lower())}")
+    if mode_text:
+        extras.append(f"mode{_filename_token(mode_text.lower())}")
+
+    if not extras:
+        return base_stem
+    return "_".join([base_stem, *extras])
 
 class ModelInterpolator:
     def __init__(self, config: TurbospectrumConfig):
@@ -1007,61 +1125,73 @@ class ModelInterpolator:
 def run_single_synthesis(args):
     params, config = args
     if isinstance(params, Mapping):
-        teff = int(params["teff"])
-        logg = float(params["logg"])
-        feh = float(params["feh"])
-        turb_str = str(
-            params.get("microturb_str")
-            or params.get("t_value")
-            or params.get("turbvel")
-            or params.get("turb")
-            or "01"
-        ).strip()
-        synthesis_abundances = _collect_synthesis_abundances(params)
+        request = _resolve_synthesis_request(params)
+        teff = request["teff"]
+        logg = request["logg"]
+        feh = request["feh"]
+        model_turb_str = request["model_turb_str"]
+        synthesis_turb_raw = request["synthesis_turb_raw"]
+        synthesis_abundances = request["abundances"]
+        mode_value = params.get("mode")
     else:
-        teff, logg, feh, turb_str = params
+        teff, logg, feh, model_turb_str = params
         teff = int(teff)
         logg = float(logg)
         feh = float(feh)
-        turb_str = str(turb_str).strip()
+        model_turb_str = _normalize_turbulence_id(model_turb_str)
+        synthesis_turb_raw = model_turb_str
         synthesis_abundances = {}
+        mode_value = None
 
-    def build_result(status: str, message: str):
+    # Map turb_str to float for babsma input if needed
+    turb_val = _coerce_microturbulence_value(synthesis_turb_raw, fallback=model_turb_str)
+
+    model_file = get_model_filename(teff, logg, feh, model_turb_str)
+    model_path = os.path.join(config.model_atmosphere_path, model_file)
+
+    output_mode = _normalize_output_mode(getattr(config, "output_mode", "Flux"))
+    calculation_mode = "NLTE" if config.nlte else "LTE"
+    base_name = get_synthesis_output_stem_from_params(
+        {
+            "teff": teff,
+            "logg": logg,
+            "feh": feh,
+            "t_value": model_turb_str,
+            "turbvel": synthesis_turb_raw,
+            "lam_min": config.lambda_min,
+            "lam_max": config.lambda_max,
+            "lam_step": config.lambda_step,
+            "output_mode": output_mode,
+            "calculation_mode": calculation_mode,
+            "mode": mode_value,
+            **synthesis_abundances,
+        },
+        default_output_mode=output_mode,
+        default_calculation_mode=calculation_mode,
+    )
+    log_file = os.path.join(config.log_dir, f"{base_name}.log")
+    opac_path = os.path.join(config.project_root, config.model_opac_dir, f"{base_name}.opac")
+    is_intensity = output_mode == "Intensity"
+    alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(synthesis_abundances)
+    individual_abundance_count = len(
+        [line for line in individual_abundance_block.splitlines() if line.strip()]
+    )
+
+    def build_result(status: str, message: str, *, output_path: str = ""):
         return {
             "base_name": base_name,
             "params": {
                 "teff": teff,
                 "logg": logg,
                 "feh": feh,
-                "turb": turb_str,
+                "turb": model_turb_str,
+                "turbvel": synthesis_turb_raw,
                 "abundances": dict(synthesis_abundances),
             },
             "status": status,
             "message": message,
+            "output_path": output_path,
         }
-
-    # Map turb_str to float for babsma input if needed
-    # Assuming "01" -> 1.0, "02" -> 2.0 etc.
-    try:
-        turb_val = float(turb_str) # This might be wrong if it's just an ID, but usually t01 = 1km/s
-        if turb_val > 10: # e.g. if it was 10 meaning 1.0? Unlikely.
-             turb_val = turb_val / 10.0
-    except:
-        turb_val = 1.0 # Default fallback
-
-    model_file = get_model_filename(teff, logg, feh, turb_str)
-    model_path = os.path.join(config.model_atmosphere_path, model_file)
-    
-    base_name = get_synthesis_stem(teff, logg, feh, turb_str, synthesis_abundances)
-    log_file = os.path.join(config.log_dir, f"{base_name}.log")
-    opac_path = os.path.join(config.project_root, config.model_opac_dir, f"{base_name}opac")
-    result_file = os.path.join(config.output_dir, f"{base_name}.spec")
-    output_mode = _normalize_output_mode(getattr(config, "output_mode", "Flux"))
-    is_intensity = output_mode == "Intensity"
-    alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(synthesis_abundances)
-    individual_abundance_count = len(
-        [line for line in individual_abundance_block.splitlines() if line.strip()]
-    )
     
     # Check if output exists and skip if force is False
     expected_outputs = []
@@ -1077,13 +1207,13 @@ def run_single_synthesis(args):
                 all_exist = False
                 break
         if all_exist:
-            return build_result("skipped", "Output already exists")
+            return build_result("skipped", "Output already exists", output_path=expected_outputs[0])
     
     # If exact model doesn't exist, pick a nearest-neighbor MARCS atmosphere (no interpolation).
     model_input_path = model_path
     if not os.path.exists(model_path):
         model_lib = ModelInterpolator(config)
-        nearest, message = model_lib.find_nearest_model(teff, logg, feh, turb_str)
+        nearest, message = model_lib.find_nearest_model(teff, logg, feh, model_turb_str)
         if not nearest:
             return build_result("error", f"Model missing and nearest-neighbor selection failed: {message}")
         model_input_path = nearest["path"]
@@ -1136,7 +1266,7 @@ def run_single_synthesis(args):
                 cwd=config.project_root # Run from root so relative paths in Fortran work if needed
             )
             if process.returncode != 0:
-                return build_result("error", "babsma failed")
+                return build_result("error", "babsma failed", output_path=expected_outputs[0])
         except Exception as e:
             return build_result("exception", f"babsma execution failed: {e}")
 
@@ -1204,11 +1334,11 @@ def run_single_synthesis(args):
                     cwd=config.project_root
                 )
                 if process.returncode != 0:
-                    return build_result("error", f"bsyn failed ({mode_str})")
+                    return build_result("error", f"bsyn failed ({mode_str})", output_path=current_result_file)
             except Exception as e:
                 return build_result("exception", f"bsyn execution failed: {e}")
 
-    return build_result("success", "Synthesis complete")
+    return build_result("success", "Synthesis complete", output_path=expected_outputs[0])
 
 def run_grid(config: TurbospectrumConfig, grid_points: List[Tuple]):
     """

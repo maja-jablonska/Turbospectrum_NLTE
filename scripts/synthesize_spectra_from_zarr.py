@@ -41,6 +41,7 @@ from run_turbospectrum import (  # noqa: E402
     create_linelist_file,
     determine_worker_count,
     ensure_directories,
+    get_synthesis_output_stem_from_params,
     get_synthesis_stem,
     resolve_linelist_paths,
     run_single_synthesis,
@@ -554,10 +555,11 @@ def _validate_grid(grid_root) -> Tuple[int, Dict[str, np.ndarray]]:
         raise KeyError(f"Grid Zarr is missing required columns: {missing}")
 
     column_data: Dict[str, np.ndarray] = {name: np.array(grid_root[name][:]) for name in required_columns + wavelength_columns}
-    turb_column = next((col for col in optional_turb if col in available), None)
-    if turb_column is None:
+    present_turb_columns = [col for col in optional_turb if col in available]
+    if not present_turb_columns:
         raise KeyError("Grid Zarr must include either 'turbvel' or 't_value' for microturbulence selection")
-    column_data["turb"] = np.array(grid_root[turb_column][:])
+    for name in present_turb_columns:
+        column_data[name] = np.array(grid_root[name][:])
 
     passthrough_columns = sorted(
         name
@@ -603,10 +605,6 @@ def _synthesis_task(args) -> Dict:
     if _WORKER_CONFIG is None:
         raise RuntimeError("Worker config not initialized")
     cfg = copy.deepcopy(_WORKER_CONFIG)
-    teff = int(row_values["teff"])
-    logg = float(row_values["logg"])
-    feh = float(row_values["feh"])
-    turb_str = str(row_values["turb"]).strip()
     lam_min = float(row_values["lam_min"])
     lam_max = float(row_values["lam_max"])
     lam_step = float(row_values["lam_step"])
@@ -642,7 +640,8 @@ def _synthesis_task(args) -> Dict:
             "teff",
             "logg",
             "feh",
-            "turb",
+            "turbvel",
+            "t_value",
             "lam_min",
             "lam_max",
             "lam_step",
@@ -652,13 +651,22 @@ def _synthesis_task(args) -> Dict:
             "grid_version",
         }
     }
-    base_name = get_synthesis_stem(teff, logg, feh, turb_str, abundance_values)
     start = time.perf_counter()
     result = run_single_synthesis((row_values, cfg))
     duration = time.perf_counter() - start
 
-    suffix = ".intensity.spec" if is_intensity else ".spec"
-    spec_path = os.path.join(cfg.output_dir, f"{os.path.splitext(base_name)[0]}{suffix}")
+    spec_path = str(result.get("output_path", "") or "")
+    if not spec_path:
+        base_name = str(result.get("base_name", "") or get_synthesis_stem(
+            int(row_values["teff"]),
+            float(row_values["logg"]),
+            float(row_values["feh"]),
+            str(row_values.get("t_value") or row_values.get("turbvel") or "01").strip(),
+            abundance_values,
+        ))
+        suffix = ".intensity.spec" if is_intensity else ".spec"
+        spec_path = os.path.join(cfg.output_dir, f"{os.path.splitext(base_name)[0]}{suffix}")
+    base_name = str(result.get("base_name", "") or os.path.splitext(os.path.basename(spec_path))[0])
     spectrum = None
     mu_selected = float("nan")
     mu_selected_index = -1
@@ -876,12 +884,11 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
             "teff": column_data["teff"][idx],
             "logg": column_data["logg"][idx],
             "feh": column_data["feh"][idx],
-            "turb": column_data["turb"][idx],
             "lam_min": column_data["lam_min"][idx],
             "lam_max": column_data["lam_max"][idx],
             "lam_step": column_data["lam_step"][idx],
         }
-        for optional_key in ("output_mode", "calculation_mode"):
+        for optional_key in ("turbvel", "t_value", "output_mode", "calculation_mode", "mode"):
             if optional_key in column_data:
                 row_values[optional_key] = column_data[optional_key][idx]
         for passthrough_key, values in column_data.items():
@@ -889,7 +896,8 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
                 "teff",
                 "logg",
                 "feh",
-                "turb",
+                "turbvel",
+                "t_value",
                 "lam_min",
                 "lam_max",
                 "lam_step",
@@ -908,7 +916,8 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
                 "teff",
                 "logg",
                 "feh",
-                "turb",
+                "turbvel",
+                "t_value",
                 "lam_min",
                 "lam_max",
                 "lam_step",
@@ -918,12 +927,10 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
                 "grid_version",
             }
         }
-        base_name = get_synthesis_stem(
-            int(row_values["teff"]),
-            float(row_values["logg"]),
-            float(row_values["feh"]),
-            str(row_values["turb"]).strip(),
-            abundance_values,
+        base_name = get_synthesis_output_stem_from_params(
+            {**row_values, **abundance_values},
+            default_output_mode=getattr(base_config, "output_mode", "Flux"),
+            default_calculation_mode="NLTE" if base_config.nlte else "LTE",
         )
         base_name_counts[base_name] = base_name_counts.get(base_name, 0) + 1
         tasks.append((idx, row_values))
