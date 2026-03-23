@@ -84,11 +84,22 @@ def _read_mu_points(spec_path: str) -> np.ndarray:
         return np.asarray([], dtype=np.float32)
 
 
+def _mu_candidates(mu_points: np.ndarray, cfg: TurbospectrumConfig) -> np.ndarray:
+    ms = getattr(cfg, "mu_sampling", {}) or {}
+    mu_min = float(ms.get("min", 0.0))
+    mu_max = float(ms.get("max", 1.0))
+    candidates = np.where((mu_points >= mu_min) & (mu_points <= mu_max))[0]
+    if candidates.size == 0:
+        candidates = np.arange(mu_points.size, dtype=np.int64)
+    return np.asarray(candidates, dtype=np.int64)
+
+
 def _choose_mu_indices(
     mu_points: np.ndarray,
     *,
     global_index: int,
     cfg: TurbospectrumConfig,
+    target_mu: float | None = None,
 ) -> tuple[np.ndarray, float]:
     """Choose mu indices for one spectrum row, deterministically if seeded.
 
@@ -97,23 +108,26 @@ def _choose_mu_indices(
     """
     ms = getattr(cfg, "mu_sampling", {}) or {}
     mode = str(ms.get("mode", "none")).lower()
-    if mode != "random" or mu_points.size == 0:
+    if mu_points.size == 0:
         return np.asarray([], dtype=np.int64), float("nan")
 
     count = int(ms.get("count", 1) or 1)
-    mu_min = float(ms.get("min", 0.0))
-    mu_max = float(ms.get("max", 1.0))
-    seed = ms.get("seed")
-    base_seed = 0 if seed in (None, "") else int(seed)
+    candidates = _mu_candidates(mu_points, cfg)
+    if mode in {"nearest", "target"} and target_mu is not None:
+        distances = np.abs(mu_points[candidates] - float(target_mu))
+        order = np.lexsort((candidates, distances))
+        ranked = candidates[order]
+        chosen = ranked[:count] if count <= ranked.size else np.resize(ranked, count)
+    elif mode == "random":
+        seed = ms.get("seed")
+        base_seed = 0 if seed in (None, "") else int(seed)
+        # Deterministic per-row RNG: independent of multiprocessing ordering.
+        rng = np.random.default_rng((base_seed + int(global_index)) % (2**32))
+        replace = bool(count > candidates.size)
+        chosen = rng.choice(candidates, size=count, replace=replace)
+    else:
+        return np.asarray([], dtype=np.int64), float("nan")
 
-    candidates = np.where((mu_points >= mu_min) & (mu_points <= mu_max))[0]
-    if candidates.size == 0:
-        candidates = np.arange(mu_points.size, dtype=np.int64)
-
-    # Deterministic per-row RNG: independent of multiprocessing ordering.
-    rng = np.random.default_rng((base_seed + int(global_index)) % (2**32))
-    replace = bool(count > candidates.size)
-    chosen = rng.choice(candidates, size=count, replace=replace)
     chosen = np.asarray(chosen, dtype=np.int64)
     mu_sel = mu_points[chosen]
     mu_summary = float(mu_sel[0]) if mu_sel.size == 1 else float(np.mean(mu_sel))
@@ -467,6 +481,8 @@ def _synthesis_task(batch):
         if is_intensity and str(mu_sampling.get("mode", "none")).strip().lower() in {"", "none"}:
             mu_sampling["mode"] = "random"
         cfg.mu_sampling = mu_sampling
+        target_mu_raw = row_values.get("mu")
+        target_mu = None if target_mu_raw in (None, "") else float(target_mu_raw)
 
         start = time.perf_counter()
         result = run_single_synthesis((row_values, cfg))
@@ -505,12 +521,18 @@ def _synthesis_task(batch):
                     raise ValueError(f"Unexpected wavelength count {data.shape[0]} (expected {expected_n})")
 
                 if is_intensity:
-                    # Optional: pick random mu points from the Intensity file and use
-                    # their I_abs/I_norm as the stored spectrum.
+                    # Pick the requested mu from the Intensity file, or fall back
+                    # to the historical per-row random selection mode.
                     mu_points = _read_mu_points(spec_path)
-                    chosen_idx, mu_selected = _choose_mu_indices(mu_points, global_index=int(global_index), cfg=cfg)
+                    mu_mode = str(getattr(cfg, "mu_sampling", {}).get("mode", "none")).lower()
+                    chosen_idx, mu_selected = _choose_mu_indices(
+                        mu_points,
+                        global_index=int(global_index),
+                        cfg=cfg,
+                        target_mu=target_mu,
+                    )
                     reduce_mode = str(getattr(cfg, "mu_sampling", {}).get("reduce", "first")).lower()
-                    if chosen_idx.size == 0 and str(getattr(cfg, "mu_sampling", {}).get("mode", "none")).lower() == "random":
+                    if chosen_idx.size == 0 and mu_mode == "random":
                         # Fallback: if header parsing failed, infer mu column count from file columns.
                         # Column layout: wl, flux_norm, flux_abs, (Iabs, Inorm)*n_mu
                         n_mu = max(0, int((data.shape[1] - 3) // 2))
@@ -522,6 +544,18 @@ def _synthesis_task(batch):
                             replace = bool(count > n_mu)
                             chosen_idx = np.asarray(rng.choice(np.arange(n_mu), size=count, replace=replace), dtype=np.int64)
                             # mu values unknown without header.
+                            mu_selected = float("nan")
+                    elif chosen_idx.size == 0 and target_mu is not None and mu_mode in {"nearest", "target"}:
+                        n_mu = max(0, int((data.shape[1] - 3) // 2))
+                        if n_mu > 0:
+                            mu_min = float(getattr(cfg, "mu_sampling", {}).get("min", 0.0))
+                            mu_max = float(getattr(cfg, "mu_sampling", {}).get("max", 1.0))
+                            denom = mu_max - mu_min
+                            frac = 0.0 if denom <= 0 else float(np.clip((target_mu - mu_min) / denom, 0.0, 1.0))
+                            ranked = np.argsort(np.abs(np.arange(n_mu, dtype=np.float64) - frac * max(0, n_mu - 1)))
+                            count = int(getattr(cfg, "mu_sampling", {}).get("count", 1) or 1)
+                            chosen_idx = ranked[:count] if count <= ranked.size else np.resize(ranked, count)
+                            chosen_idx = np.asarray(chosen_idx, dtype=np.int64)
                             mu_selected = float("nan")
 
                     if chosen_idx.size > 0:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import csv
 import argparse
 import gzip
@@ -204,6 +206,7 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
     """
     sample_count = int(config.get("num_samples", 50))
     bounds_cfg = config.get("bounds") or {}
+    synthesis_cfg = config.get("synthesis") or {}
 
     bounds: List[Tuple[float, float]] = []
     for name in ["teff", "logg", "feh"]:
@@ -235,6 +238,18 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
             raise ValueError("sample_turbvel=true requires at least one turbvel option")
         bounds.append((0.0, float(len(turbvel_options))))
 
+    mu_sampling_cfg = synthesis_cfg.get("mu_sampling") or {}
+    sample_mu = False
+    if isinstance(mu_sampling_cfg, Mapping) and str(synthesis_cfg.get("output_mode", "Flux")).strip().lower() == "intensity":
+        mu_mode = str(mu_sampling_cfg.get("mode", "none")).strip().lower()
+        if mu_mode in {"nearest", "target"}:
+            mu_min = float(mu_sampling_cfg.get("min", 0.0))
+            mu_max = float(mu_sampling_cfg.get("max", 1.0))
+            if mu_max <= mu_min:
+                raise ValueError(f"mu_sampling max must be greater than min, got {mu_min}..{mu_max}")
+            sample_mu = True
+            bounds.append((mu_min, mu_max))
+
     lhs = _latin_hypercube(bounds, sample_count, rng)
 
     col_idx = 0
@@ -260,9 +275,12 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
     else:
         turbvel = _choose_series(turbvel_cfg, rng, sample_count, "turbvel")
 
+    mu = np.round(lhs[:, col_idx], 6) if sample_mu else None
+    if sample_mu:
+        col_idx += 1
+
     t_value = _choose_series(config.get("t_value_options", ["01"]), rng, sample_count, "t_value_options")
 
-    synthesis_cfg = config.get("synthesis") or {}
     lam_min = float(synthesis_cfg.get("lam_min", 6000))
     lam_max = float(synthesis_cfg.get("lam_max", 6100))
     lam_step = float(synthesis_cfg.get("lam_step", 0.01))
@@ -286,6 +304,8 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
         "mode": np.full(sample_count, mode, dtype=object),
         "calculation_mode": np.full(sample_count, calculation_mode, dtype=object),
     }
+    if sample_mu and mu is not None:
+        out["mu"] = mu.astype(np.float64, copy=False)
     for element in _ordered_abundance_keys(abund_cfg):
         out[element] = abundance_samples.get(
             element,

@@ -6,7 +6,11 @@ import json
 import numpy as np
 import zarr
 
-from scripts.synthesize_regular_grid import _materialize_synthesis_config, _verify_continuum_saved
+from scripts.synthesize_regular_grid import (
+    _build_regular_columns,
+    _materialize_synthesis_config,
+    _verify_continuum_saved,
+)
 from scripts.synthesize_spectra_from_zarr import _validate_synthesis_results
 
 
@@ -143,10 +147,31 @@ class RegularGridValidationTests(unittest.TestCase):
                 cfg = json.load(handle)
 
             mu_sampling = cfg["synthesis_parameters"]["mu_sampling"]
-            self.assertEqual(mu_sampling["mode"], "random")
+            self.assertEqual(mu_sampling["mode"], "nearest")
             self.assertEqual(mu_sampling["count"], 1)
             self.assertEqual(mu_sampling["min"], 0.2)
             self.assertEqual(mu_sampling["max"], 0.8)
+
+    def test_build_regular_columns_expands_uniform_mu_axis(self) -> None:
+        columns = _build_regular_columns(
+            teff_axis=np.asarray([4000, 4250], dtype=np.int64),
+            logg_axis=np.asarray([1.0], dtype=np.float64),
+            feh_axis=np.asarray([-0.5], dtype=np.float64),
+            turbvel_axis=np.asarray(["01"], dtype=object),
+            mu_axis=np.asarray([0.2, 0.8], dtype=np.float64),
+            grid_version="regular-linear-v1",
+            lam_min=8400.0,
+            lam_max=8800.0,
+            lam_step=0.01,
+            output_mode="Intensity",
+            mode="1D",
+            calculation_mode="LTE",
+            abundances={"a": "+0.00", "c": "+0.00", "n": "+0.00", "o": "+0.00", "r": "+0.00", "s": "+0.00"},
+            max_rows=100,
+        )
+
+        np.testing.assert_array_equal(columns["teff"], np.asarray([4000, 4000, 4250, 4250], dtype=np.int64))
+        np.testing.assert_allclose(columns["mu"], np.asarray([0.2, 0.8, 0.2, 0.8], dtype=np.float64))
 
 
 if __name__ == "__main__":
