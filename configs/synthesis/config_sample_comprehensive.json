@@ -60,6 +60,7 @@
             "_note": [
                 "Optional: for intensity runs, sample mu points from the Turbospectrum output file and store them in Zarr outputs.",
                 "mode='random' samples from the mu-points header in the .spec file (after filtering by [min,max]).",
+                "mode='nearest' uses a per-row grid mu value and stores the nearest Turbospectrum mu column.",
                 "reduce='first' keeps one mu; reduce='mean' averages across the sampled mus.",
                 "seed makes selection deterministic per row index."
             ],

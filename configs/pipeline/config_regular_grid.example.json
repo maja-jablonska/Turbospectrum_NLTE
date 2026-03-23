@@ -24,11 +24,11 @@
       "lam_min": 8400.0,
       "lam_max": 8800.0,
       "lam_step": 0.01,
-      "output_mode": "Flux",
+      "output_mode": "Intensity",
       "mode": "1D",
       "calculation_mode": "LTE",
-      "_mu_range_note": "Optional mu sampling range for intensity post-processing (start:end:step or comma list).",
-      "mu_range": null
+      "_mu_range_note": "Uniform mu axis for regular-grid intensity runs (start:end:step or comma list).",
+      "mu_range": "0.0:1.0:0.1"
     },
     "limits": {
       "max_rows": 2000000

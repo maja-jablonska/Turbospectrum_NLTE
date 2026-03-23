@@ -276,7 +276,7 @@ class TurbospectrumConfig:
     mu_angles: List[float] = field(default_factory=list)
     # Optional post-processing configuration for intensity outputs.
     # Expected shape (all keys optional):
-    #   {"mode": "random", "count": 1, "seed": 123, "min": 0.0, "max": 1.0, "reduce": "first"}
+    #   {"mode": "nearest", "count": 1, "seed": 123, "min": 0.0, "max": 1.0, "reduce": "first"}
     mu_sampling: Dict[str, Any] = field(default_factory=dict)
 
     # Synthesis Parameters
@@ -734,6 +734,7 @@ RESERVED_SYNTHESIS_KEYS = {
     "teff",
     "logg",
     "feh",
+    "mu",
     "turb",
     "turbvel",
     "t_value",

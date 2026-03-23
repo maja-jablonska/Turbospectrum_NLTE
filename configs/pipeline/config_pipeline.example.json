@@ -72,8 +72,8 @@
       "output_mode": "Intensity",
       "mu_angles": [],
       "mu_sampling": {
-        "_note": "Only used when output_mode='Intensity'. mode='random' selects random mu columns from the Turbospectrum intensity output.",
-        "mode": "random",
+        "_note": "Only used when output_mode='Intensity'. mode='nearest' samples a per-row mu target with the latin-hypercube grid and stores the nearest Turbospectrum mu column.",
+        "mode": "nearest",
         "count": 1,
         "seed": 0,
         "min": 0.0,

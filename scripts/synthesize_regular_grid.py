@@ -133,6 +133,7 @@ def _build_regular_columns(
     logg_axis: np.ndarray,
     feh_axis: np.ndarray,
     turbvel_axis: np.ndarray,
+    mu_axis: np.ndarray | None,
     grid_version: str,
     lam_min: float,
     lam_max: float,
@@ -147,7 +148,9 @@ def _build_regular_columns(
     ng = int(logg_axis.size)
     nf = int(feh_axis.size)
     nu = int(turbvel_axis.size)
-    row_count = nt * ng * nf * nu
+    nm = int(mu_axis.size) if mu_axis is not None else 1
+    base_count = nt * ng * nf * nu
+    row_count = base_count * nm
     if row_count <= 0:
         raise ValueError("Computed row_count is zero")
     if row_count > max_rows:
@@ -156,10 +159,23 @@ def _build_regular_columns(
             "Lower axis resolutions or increase --max-rows."
         )
 
-    teff = np.repeat(teff_axis.astype(np.int64), ng * nf * nu)
-    logg = np.tile(np.repeat(logg_axis.astype(np.float64), nf * nu), nt)
-    feh = np.tile(np.repeat(feh_axis.astype(np.float64), nu), nt * ng)
-    turbvel = np.tile(turbvel_axis.astype(object), nt * ng * nf)
+    teff_base = np.repeat(teff_axis.astype(np.int64), ng * nf * nu)
+    logg_base = np.tile(np.repeat(logg_axis.astype(np.float64), nf * nu), nt)
+    feh_base = np.tile(np.repeat(feh_axis.astype(np.float64), nu), nt * ng)
+    turbvel_base = np.tile(turbvel_axis.astype(object), nt * ng * nf)
+
+    if mu_axis is not None:
+        teff = np.repeat(teff_base, nm)
+        logg = np.repeat(logg_base, nm)
+        feh = np.repeat(feh_base, nm)
+        turbvel = np.repeat(turbvel_base, nm)
+        mu = np.tile(mu_axis.astype(np.float64), base_count)
+    else:
+        teff = teff_base
+        logg = logg_base
+        feh = feh_base
+        turbvel = turbvel_base
+        mu = None
 
     columns: Dict[str, np.ndarray] = {
         "grid_version": np.full(row_count, str(grid_version), dtype=object),
@@ -182,6 +198,8 @@ def _build_regular_columns(
         "mode": np.full(row_count, mode, dtype=object),
         "calculation_mode": np.full(row_count, calculation_mode, dtype=object),
     }
+    if mu is not None:
+        columns["mu"] = mu
     return columns
 
 
@@ -287,9 +305,7 @@ def _materialize_synthesis_config(
         mu_sampling = synthesis.setdefault("mu_sampling", {})
         if not isinstance(mu_sampling, dict):
             raise ValueError("synthesis_parameters.mu_sampling must be a JSON object in synthesis config")
-        mode = str(mu_sampling.get("mode", "none")).strip().lower()
-        if mode in {"", "none"}:
-            mu_sampling["mode"] = "random"
+        mu_sampling["mode"] = "nearest"
         mu_sampling.setdefault("count", 1)
         mu_sampling["min"] = mu_min
         mu_sampling["max"] = mu_max
@@ -479,6 +495,8 @@ def main() -> None:
     feh_axis = _parse_numeric_axis(feh_axis_spec, "feh", integer=False)
     turbvel_axis = _parse_turbvel_values(turbvel_axis_spec)
     mu_axis = _parse_numeric_axis(mu_range_spec, "mu", integer=False) if mu_range_spec is not None else None
+    if mu_axis is not None and output_mode != "Intensity":
+        raise ValueError("mu_range requires output_mode='Intensity'")
 
     if lam_step <= 0:
         raise ValueError("lam-step must be positive")
@@ -532,6 +550,7 @@ def main() -> None:
         logg_axis=logg_axis,
         feh_axis=feh_axis,
         turbvel_axis=turbvel_axis,
+        mu_axis=mu_axis,
         grid_version=grid_version,
         lam_min=lam_min,
         lam_max=lam_max,
@@ -550,9 +569,9 @@ def main() -> None:
     )
     if mu_axis is not None:
         print(
-            "[regular-grid] mu range: "
+            "[regular-grid] mu axis: "
             f"{float(np.min(mu_axis)):.6f}..{float(np.max(mu_axis)):.6f} "
-            f"({mu_axis.size} points -> mu_sampling min/max)"
+            f"({mu_axis.size} uniformly spaced samples)"
         )
     if scratch:
         print(f"[regular-grid] synthesis scratch: {scratch}")
