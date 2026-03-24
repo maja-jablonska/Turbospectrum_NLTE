@@ -117,6 +117,8 @@
   "runtime": {
     "_note": "Optional runtime knobs for HPC; may be overridden by CLI flags.",
     "workers": null,
+    "shard_count": null,
+    "rows_per_shard": null,
     "scratch": null,
     "chunk_rows": 32
   }

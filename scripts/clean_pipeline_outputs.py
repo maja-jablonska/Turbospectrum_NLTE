@@ -87,6 +87,8 @@ def _collect_targets(cfg: dict, cfg_dir: Path, run_root: Path | None, include_pi
         targets.extend(
             [
                 Target("path", str(rr / "next_shard.txt"), "run_root shard counter"),
+                Target("path", str(rr / "next_work_item.txt"), "run_root pending-work counter"),
+                Target("path", str(rr / "pending_shards.txt"), "run_root pending-shards list"),
                 Target("path", str(rr / "counter.lock"), "run_root lock file"),
                 Target("path", str(rr / "missing_shards.txt"), "run_root missing-shards list"),
                 Target("glob", str(rr / "tmp" / "pbs_*"), "run_root PBS temp dirs"),
@@ -134,7 +136,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--run-root",
         default=None,
-        help="Optional run root to also clean scheduler state files (next_shard/counter.lock/missing_shards + tmp/pbs_*).",
+        help="Optional run root to also clean scheduler state files (next_shard/next_work_item/pending_shards/counter.lock/missing_shards + tmp/pbs_*).",
     )
     parser.add_argument(
         "--no-pipeline-tmp",
@@ -207,4 +209,3 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
