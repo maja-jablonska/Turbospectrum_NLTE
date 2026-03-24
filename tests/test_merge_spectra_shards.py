@@ -144,6 +144,71 @@ class MergeSpectraShardsTests(unittest.TestCase):
             self.assertEqual(int(merged.attrs["skipped_invalid_shards"]), 1)
             self.assertTrue(bool(merged.attrs["skip_invalid_shards_effective"]))
 
+    def test_partial_merge_skips_nan_flux_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path = os.path.join(tmpdir, "grid.zarr")
+            output_path = os.path.join(tmpdir, "merged.zarr")
+            valid_shard = os.path.join(tmpdir, "spectra_shard_0.zarr")
+            nan_shard = os.path.join(tmpdir, "spectra_shard_1.zarr")
+            missing_shard = os.path.join(tmpdir, "spectra_shard_2.zarr")
+
+            self._write_grid(grid_path, row_count=3)
+            self._write_shard(
+                valid_shard,
+                wavelengths=np.asarray([5000.0, 5000.2], dtype=np.float32),
+                global_index=np.asarray([0], dtype=np.int64),
+                flux=np.asarray([[1.0, 0.95]], dtype=np.float32),
+                statuses=["success"],
+                messages=["ok"],
+            )
+            self._write_shard(
+                nan_shard,
+                wavelengths=np.asarray([5000.0, 5000.2], dtype=np.float32),
+                global_index=np.asarray([1], dtype=np.int64),
+                flux=np.asarray([[np.nan, np.nan]], dtype=np.float32),
+                statuses=["success"],
+                messages=["nan flux"],
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    MERGE_SCRIPT,
+                    "--output-zarr",
+                    output_path,
+                    "--grid-zarr",
+                    grid_path,
+                    "--shard",
+                    valid_shard,
+                    "--shard",
+                    nan_shard,
+                    "--shard",
+                    missing_shard,
+                    "--allow-missing",
+                    "--skip-nonexistent-shards",
+                    "--allow-incomplete-provenance",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+
+            merged = zarr.open_group(output_path, mode="r")
+            np.testing.assert_array_equal(
+                np.asarray(merged["global_index"][:], dtype=np.int64),
+                np.asarray([0], dtype=np.int64),
+            )
+            np.testing.assert_allclose(
+                np.asarray(merged["flux"][:], dtype=np.float32),
+                np.asarray([[1.0, 0.95]], dtype=np.float32),
+            )
+            self.assertEqual(int(merged.attrs["skipped_nonexistent_shards"]), 1)
+            self.assertEqual(int(merged.attrs["skipped_invalid_shards"]), 1)
+            self.assertTrue(bool(merged.attrs["skip_invalid_shards_effective"]))
+
 
 if __name__ == "__main__":
     unittest.main()

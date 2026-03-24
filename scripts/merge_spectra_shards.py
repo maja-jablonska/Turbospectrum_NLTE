@@ -45,6 +45,7 @@ from provenance_contract import (
     is_meaningful_provenance_value,
 )
 from spectrum_output import infer_flux_metadata
+from synthesis_validation import SUCCESS_STATUSES
 
 PROVENANCE_FILENAMES: Tuple[str, ...] = (
     "canonical_config.yaml",
@@ -137,6 +138,41 @@ def _validate_shard_structure(path: str) -> np.ndarray:
     wavelengths = np.asarray(root["wavelength"][:], dtype=np.float32)
     if wavelengths.size <= 0:
         raise ValueError(f"Shard {path} wavelength array is empty")
+    global_index = np.asarray(root["global_index"][:], dtype=np.int64)
+    flux = np.asarray(root["flux"][:], dtype=np.float32)
+    status = np.asarray(root["status"][:])
+    message = np.asarray(root["message"][:])
+
+    if global_index.ndim != 1:
+        raise ValueError(f"Shard {path} global_index must be 1D, got {global_index.shape}")
+    if np.unique(global_index).size != global_index.size:
+        raise ValueError(f"Shard {path} global_index contains duplicates")
+    if flux.ndim != 2 or flux.shape[0] != global_index.size or flux.shape[1] != wavelengths.size:
+        raise ValueError(
+            f"Shard {path} flux shape {flux.shape} does not match rows={global_index.size} wavelengths={wavelengths.size}"
+        )
+    if status.ndim != 1 or status.shape[0] != global_index.size:
+        raise ValueError(f"Shard {path} status shape {status.shape} does not match rows={global_index.size}")
+    if message.ndim != 1 or message.shape[0] != global_index.size:
+        raise ValueError(f"Shard {path} message shape {message.shape} does not match rows={global_index.size}")
+    if global_index.size and not np.all(np.isfinite(flux)):
+        raise ValueError(f"Shard {path} contains non-finite flux values")
+
+    statuses = []
+    for item in status.tolist():
+        if isinstance(item, (bytes, bytearray)):
+            item = item.decode("utf-8", errors="ignore")
+        statuses.append(str(item).strip().lower())
+    invalid_statuses = sorted({item for item in statuses if item not in SUCCESS_STATUSES})
+    if invalid_statuses:
+        raise ValueError(f"Shard {path} contains non-success statuses: {invalid_statuses}")
+
+    if "continuum" in root:
+        continuum = np.asarray(root["continuum"][:], dtype=np.float32)
+        if continuum.shape != flux.shape:
+            raise ValueError(f"Shard {path} continuum shape {continuum.shape} does not match flux {flux.shape}")
+        if global_index.size and not np.all(np.any(np.isfinite(continuum), axis=1)):
+            raise ValueError(f"Shard {path} contains rows without finite continuum")
     return wavelengths
 
 
