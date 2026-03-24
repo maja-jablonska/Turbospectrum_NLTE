@@ -46,6 +46,7 @@ from provenance_contract import (  # noqa: E402
     is_meaningful_provenance_value,
 )
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
+from synthesis_validation import SUCCESS_STATUSES, validate_synthesis_results
 
 
 def _read_mu_points(spec_path: str) -> np.ndarray:
@@ -295,7 +296,7 @@ def _existing_shard_is_usable(path: str, expected_global_indices: np.ndarray) ->
 
     if len(statuses) != gidx.size:
         return False
-    if any(status not in {"success", "skipped"} for status in statuses):
+    if any(status not in SUCCESS_STATUSES for status in statuses):
         return False
 
     if not np.all(np.isfinite(flux)):
@@ -1144,6 +1145,13 @@ def main():
     # Write shard
     ############################################
 
+    status_counts = validate_synthesis_results(
+        statuses=statuses,
+        messages=messages,
+        fluxes=fluxes,
+        continua=continua,
+    )
+
     logger.info(
         "Writing shard output: %s (rows=%d wl=%d)",
         write_path if write_path != final_path else final_path,
@@ -1217,6 +1225,7 @@ def main():
         "spice_version": pipeline_version,
         "compiler": str(getattr(config, "compiler", "")),
         "nlte": bool(getattr(config, "nlte", False)),
+        "status_counts": dict(status_counts),
     }
     attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
     root.attrs.update(attrs_payload)

@@ -602,7 +602,12 @@ set +e
 VALIDATE_RC=$?
 set -e
 if (( VALIDATE_RC != 0 )); then
-    echo "[turbospec] WARN: validation exited with code ${VALIDATE_RC}; continuing with merge."
+    if (( FINAL_MISSING > 0 )) && [[ "$(to_bool01 "${ALLOW_PARTIAL_MERGE}")" == "1" ]]; then
+        echo "[turbospec] WARN: validation exited with code ${VALIDATE_RC}; continuing because partial merge is enabled and ${FINAL_MISSING} shard IDs are still missing."
+    else
+        echo "[turbospec] ERROR: validation exited with code ${VALIDATE_RC}; merge aborted." >&2
+        exit "${VALIDATE_RC}"
+    fi
 fi
 
 SHARD_STORE_COUNT=$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' | wc -l | tr -d '[:space:]')
