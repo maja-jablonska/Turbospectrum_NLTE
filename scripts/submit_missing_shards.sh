@@ -10,7 +10,7 @@ Required:
   --run-root <path>         Run root (contains outputs/shards and outputs/grids).
 
 Optional:
-  --expected-shards <N>     Total shard count. If omitted, inferred from grid Zarr row count.
+  --expected-shards <N>     Total shard count. If omitted, inferred from grid Zarr row count; pass explicitly when using SHARD_COUNT/ROWS_PER_SHARD.
   --max-array-size <N>      Max array tasks per qsub submission (default: 20).
   --python-bin <path>       Python executable to use on compute nodes.
   --mamba-env <name>        Conda/mamba env name to activate (default: astro).

@@ -82,6 +82,10 @@ RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE}"
 REPO="${REPO:-${PBS_O_WORKDIR}}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
 WORKERS_OVERRIDE="${WORKERS:-}"
+SHARD_COUNT_OVERRIDE="${SHARD_COUNT:-}"
+ROWS_PER_SHARD_OVERRIDE="${ROWS_PER_SHARD:-}"
+FORCE_RESTART="${FORCE_RESTART:-0}"
+ALLOW_PARTIAL_MERGE="${ALLOW_PARTIAL_MERGE:-1}"
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
@@ -95,6 +99,15 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
     echo "[turbospec] ERROR: config not found: ${CONFIG_PATH}" >&2
     exit 1
 fi
+
+to_bool01() {
+    local val
+    val="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "${val}" in
+        1|true|yes|on) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
 
 CONFIG_OUTPUTS=$(
     "${PYTHON}" - <<PY
@@ -125,10 +138,28 @@ if workers not in (None, ""):
     except Exception:
         workers_out = ""
 
+shard_count = runtime.get("shard_count")
+shard_count_out = ""
+if shard_count not in (None, ""):
+    try:
+        shard_count_out = str(int(shard_count))
+    except Exception:
+        shard_count_out = ""
+
+rows_per_shard = runtime.get("rows_per_shard")
+rows_per_shard_out = ""
+if rows_per_shard not in (None, ""):
+    try:
+        rows_per_shard_out = str(int(rows_per_shard))
+    except Exception:
+        rows_per_shard_out = ""
+
 print(grid)
 print(shards_dir)
 print(merged)
 print(workers_out)
+print(shard_count_out)
+print(rows_per_shard_out)
 PY
 )
 mapfile -t _cfg_lines <<< "${CONFIG_OUTPUTS}"
@@ -136,6 +167,8 @@ CFG_GRID_ZARR="${_cfg_lines[0]:-}"
 CFG_SHARDS_DIR="${_cfg_lines[1]:-}"
 CFG_MERGED_ZARR="${_cfg_lines[2]:-}"
 CFG_WORKERS="${_cfg_lines[3]:-}"
+CFG_SHARD_COUNT="${_cfg_lines[4]:-}"
+CFG_ROWS_PER_SHARD="${_cfg_lines[5]:-}"
 
 WORKERS="${WORKERS_OVERRIDE:-${CFG_WORKERS:-16}}"
 if ! [[ "${WORKERS}" =~ ^[0-9]+$ ]] || (( WORKERS < 1 )); then
@@ -173,7 +206,7 @@ if [[ "${MERGED_ZARR}" != /* ]]; then
     MERGED_ZARR="${REPO}/${MERGED_ZARR}"
 fi
 
-NEXT_SHARD="${NEXT_SHARD:-${RUN_ROOT}/next_shard.txt}"
+NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
 LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
@@ -181,7 +214,8 @@ TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
 TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
-mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_SHARD}")" "$(dirname "${LOCK_FILE}")" \
+PENDING_SHARDS_FILE="${PENDING_SHARDS_FILE:-${RUN_ROOT}/pending_shards.txt}"
+mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_WORK_ITEM}")" "$(dirname "${LOCK_FILE}")" \
          "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
 
 # Force mkstemp()/tempfile users to write under designated scratch temp.
@@ -199,7 +233,9 @@ echo "[turbospec] Workers: ${WORKERS}"
 echo "[turbospec] Validate workers: ${VALIDATE_WORKERS}"
 echo "[turbospec] Merge chunk rows: ${MERGE_CHUNK_ROWS}"
 echo "[turbospec] Missing shard report: ${MISSING_FILE}"
-echo "[turbospec] Run policy: no auto-resubmit, no post-pass recovery."
+echo "[turbospec] Force restart: $(to_bool01 "${FORCE_RESTART}")"
+echo "[turbospec] Allow partial merge: $(to_bool01 "${ALLOW_PARTIAL_MERGE}")"
+echo "[turbospec] Run policy: preserve valid shards and resume missing shard IDs."
 
 CONFIG_NUM_SAMPLES=$(
     "${PYTHON}" - <<PY
@@ -243,18 +279,46 @@ PY
 echo "Grid rows: ${ROW_COUNT}"
 
 ############################################
-# Fresh run setup
+# Shard layout
 ############################################
 
-if [[ -z "${SHARDS_DIR}" || "${SHARDS_DIR}" == "/" ]]; then
-    echo "[turbospec] ERROR: unsafe SHARDS_DIR='${SHARDS_DIR}' for fresh-run cleanup." >&2
+if ! [[ "${ROW_COUNT}" =~ ^[0-9]+$ ]] || (( ROW_COUNT < 1 )); then
+    echo "[turbospec] ERROR: invalid row count inferred from grid: '${ROW_COUNT}'." >&2
     exit 1
 fi
-echo "[turbospec] Clearing previous shard outputs (fresh run)."
-find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name '*.zarr' -exec rm -rf {} +
-echo 0 > "${NEXT_SHARD}"
-rm -f "${MISSING_FILE}"
-echo "[turbospec] Shard counter reset: ${NEXT_SHARD}=0"
+
+ROWS_PER_SHARD="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
+if [[ -n "${ROWS_PER_SHARD}" ]]; then
+    if ! [[ "${ROWS_PER_SHARD}" =~ ^[0-9]+$ ]] || (( ROWS_PER_SHARD < 1 )); then
+        echo "[turbospec] ERROR: ROWS_PER_SHARD must be a positive integer, got '${ROWS_PER_SHARD}'." >&2
+        exit 1
+    fi
+fi
+
+SHARD_COUNT="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
+if [[ -n "${ROWS_PER_SHARD}" && -z "${SHARD_COUNT_OVERRIDE}" && -z "${CFG_SHARD_COUNT}" ]]; then
+    SHARD_COUNT=$(( (ROW_COUNT + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
+fi
+if [[ -z "${SHARD_COUNT}" ]]; then
+    SHARD_COUNT="${ROW_COUNT}"
+fi
+if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
+    echo "[turbospec] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
+    exit 1
+fi
+if (( SHARD_COUNT > ROW_COUNT )); then
+    echo "[turbospec] WARN: SHARD_COUNT=${SHARD_COUNT} exceeds grid rows=${ROW_COUNT}; capping to ${ROW_COUNT}." >&2
+    SHARD_COUNT="${ROW_COUNT}"
+fi
+if [[ -z "${ROWS_PER_SHARD}" ]]; then
+    ROWS_PER_SHARD=$(( (ROW_COUNT + SHARD_COUNT - 1) / SHARD_COUNT ))
+fi
+
+echo "[turbospec] Shard count: ${SHARD_COUNT}"
+echo "[turbospec] Approx rows per shard: ${ROWS_PER_SHARD}"
+if (( SHARD_COUNT == ROW_COUNT )); then
+    echo "[turbospec] INFO: one-row-per-shard mode is active. Set SHARD_COUNT or ROWS_PER_SHARD to coarsen sharding for large grids."
+fi
 
 ############################################
 # Walltime guard
@@ -317,7 +381,7 @@ run_shard_attempts () {
           --skip-grid \
           --synthesis-mode sharded \
           --shard-index "${shard}" \
-          --shard-count "${ROW_COUNT}" \
+          --shard-count "${SHARD_COUNT}" \
           --workers 1 \
           --scratch "${attempt_scratch}" \
           --output "${tmp_out}" \
@@ -336,7 +400,7 @@ run_shard_attempts () {
 
 write_missing_shards_file () {
     ${PYTHON} - <<PY
-import os
+import re
 import sys
 from pathlib import Path
 
@@ -344,46 +408,101 @@ import numpy as np
 import zarr
 
 shard_dir = Path(r"${SHARDS_DIR}")
-expected = int(r"${ROW_COUNT}")
+expected_shards = int(r"${SHARD_COUNT}")
+row_count = int(r"${ROW_COUNT}")
 out_path = Path(r"${MISSING_FILE}")
 out_path.parent.mkdir(parents=True, exist_ok=True)
 
+pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
 seen: set[int] = set()
-for shard_path in sorted(shard_dir.glob("*.zarr")):
+for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
+    match = pattern.match(shard_path.name)
+    if match is None:
+        continue
+    shard_idx = int(match.group(1))
+    if shard_idx < 0 or shard_idx >= expected_shards:
+        continue
     try:
         root = zarr.open_group(str(shard_path), mode="r")
     except Exception:
         continue
-    if "global_index" not in root:
+    for key in ("global_index", "flux", "status", "message"):
+        if key not in root:
+            root = None
+            break
+    if root is None:
         continue
     try:
         gidx = np.asarray(root["global_index"][:], dtype=np.int64)
+        flux = np.asarray(root["flux"][:], dtype=np.float32)
+        status = np.asarray(root["status"][:])
     except Exception:
         continue
     if gidx.ndim != 1 or gidx.size == 0:
         continue
-    valid = gidx[(gidx >= 0) & (gidx < expected)]
-    if valid.size:
-        seen.update(int(x) for x in valid.tolist())
+    if flux.ndim != 2 or flux.shape[0] != gidx.size:
+        continue
+    if status.ndim != 1 or status.shape[0] != gidx.size:
+        continue
+    if np.any(gidx < 0) or np.any(gidx >= row_count):
+        continue
+    if np.unique(gidx).size != gidx.size:
+        continue
+    if not np.all(np.isfinite(flux)):
+        continue
+    statuses = []
+    for item in status.tolist():
+        if isinstance(item, (bytes, bytearray)):
+            item = item.decode("utf-8", errors="ignore")
+        statuses.append(str(item).strip().lower())
+    if any(s not in {"success", "skipped"} for s in statuses):
+        continue
+    seen.add(shard_idx)
 
-missing = sorted(set(range(expected)) - seen)
+missing = sorted(set(range(expected_shards)) - seen)
 text = "\n".join(str(x) for x in missing)
 out_path.write_text(f"{text}\n" if text else "", encoding="utf-8")
 print(
-    f"[missing-shards] expected={expected} seen={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('*.zarr')))}",
+    f"[missing-shards] expected={expected_shards} valid={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('spectra_shard_*.zarr')))}",
     file=sys.stderr,
 )
 PY
 }
 
 ############################################
+# Resume setup
+############################################
+
+if [[ -z "${SHARDS_DIR}" || "${SHARDS_DIR}" == "/" ]]; then
+    echo "[turbospec] ERROR: unsafe SHARDS_DIR='${SHARDS_DIR}' for shard cleanup." >&2
+    exit 1
+fi
+
+if [[ "$(to_bool01 "${FORCE_RESTART}")" == "1" ]]; then
+    echo "[turbospec] Force restart requested; clearing previous shard outputs."
+    find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
+    rm -f "${MISSING_FILE}" "${PENDING_SHARDS_FILE}" "${NEXT_WORK_ITEM}"
+    if [[ -d "${MERGED_ZARR}" ]]; then
+        rm -rf "${MERGED_ZARR}"
+    fi
+fi
+
+write_missing_shards_file 2>> "${LOG_DIR}/missing.log"
+cp "${MISSING_FILE}" "${PENDING_SHARDS_FILE}"
+PENDING_COUNT=$(wc -l < "${PENDING_SHARDS_FILE}" | tr -d '[:space:]')
+echo 0 > "${NEXT_WORK_ITEM}"
+
+COMPLETED_COUNT=$((SHARD_COUNT - PENDING_COUNT))
+echo "[turbospec] Existing valid shards: ${COMPLETED_COUNT}/${SHARD_COUNT}"
+
+############################################
 # Worker
 ############################################
 
 worker() {
-
-    JOBFS_DIR=${TMP_WORK_DIR}/worker_${RANDOM}
-    mkdir -p $JOBFS_DIR
+    local jobfs_dir task_index shard available
+    jobfs_dir="${TMP_WORK_DIR}/worker_${RANDOM}"
+    mkdir -p "${jobfs_dir}"
 
     while true; do
 
@@ -400,10 +519,10 @@ worker() {
         # Scratch precheck
         #################################
 
-        AVAILABLE=$(df -Pk "$JOBFS_DIR" | awk 'NR==2 {print $4}')
+        available=$(df -Pk "${jobfs_dir}" | awk 'NR==2 {print $4}')
 
         # Require ~5GB free
-        if (( AVAILABLE < 5*1024*1024 )); then
+        if (( available < 5*1024*1024 )); then
             echo "Low scratch — sleeping."
             sleep 60
             continue
@@ -413,16 +532,21 @@ worker() {
         # Atomic shard grab
         #################################
 
-        exec 9<>${LOCK_FILE}
+        exec 9<>"${LOCK_FILE}"
         flock -x 9
 
-        shard=$(cat ${NEXT_SHARD})
-        echo $((shard + 1)) > ${NEXT_SHARD}
+        task_index=$(cat "${NEXT_WORK_ITEM}")
+        echo $((task_index + 1)) > "${NEXT_WORK_ITEM}"
 
         flock -u 9
         exec 9>&-
 
-        if (( shard >= ROW_COUNT )); then
+        if (( task_index >= PENDING_COUNT )); then
+            break
+        fi
+
+        shard="$(sed -n "$((task_index + 1))p" "${PENDING_SHARDS_FILE}")"
+        if [[ -z "${shard}" ]]; then
             break
         fi
 
@@ -430,31 +554,33 @@ worker() {
         # Retry with jitter
         #################################
 
-        if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${JOBFS_DIR}" "${LOG_DIR}/shard_${shard}.log" 15; then
+        if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15; then
             echo "Shard ${shard} failed after ${SHARD_RETRY_ATTEMPTS} attempts in main loop." >> "${LOG_DIR}/shard_${shard}.log"
         fi
     done
 }
 
 export -f worker
-export NEXT_SHARD LOCK_FILE ROW_COUNT LOG_DIR REPO PYTHON PBS_JOBID CONFIG_PATH TMP_OUTPUT_DIR
+export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE SHARD_COUNT LOG_DIR REPO PYTHON PBS_JOBID CONFIG_PATH TMP_OUTPUT_DIR
 
 ############################################
 # Launch workers (start conservative!)
 ############################################
 
-echo "Launching ${WORKERS} workers..."
+if (( PENDING_COUNT > 0 )); then
+    echo "Launching ${WORKERS} workers for ${PENDING_COUNT} pending shard IDs..."
+    for ((i=0; i<WORKERS; i++)); do
+        worker &
+    done
+    wait
+else
+    echo "[turbospec] No pending shard IDs detected; moving directly to validation/merge."
+fi
 
-for ((i=0;i<WORKERS;i++)); do
-    worker &
-done
+CURRENT=$(cat "${NEXT_WORK_ITEM}")
 
-wait
-
-CURRENT=$(cat ${NEXT_SHARD})
-
-if (( CURRENT < ROW_COUNT )); then
-    echo "[turbospec] NOTICE: walltime ended before all shard IDs were assigned (${CURRENT}/${ROW_COUNT})."
+if (( CURRENT < PENDING_COUNT )); then
+    echo "[turbospec] NOTICE: walltime ended before all pending shard IDs were assigned (${CURRENT}/${PENDING_COUNT})."
 fi
 
 mkdir -p "$(dirname "${MISSING_FILE}")"
@@ -463,7 +589,7 @@ FINAL_MISSING=$(wc -l < "${MISSING_FILE}" | tr -d '[:space:]')
 
 echo "[turbospec] Failed shard report written: ${MISSING_FILE} (count=${FINAL_MISSING})"
 if (( FINAL_MISSING > 0 )); then
-    echo "First 20 failed shard IDs:"
+    echo "First 20 missing shard IDs:"
     head -n 20 "${MISSING_FILE}"
 fi
 
@@ -471,7 +597,7 @@ echo "[turbospec] Validating shard outputs..."
 set +e
 "${PYTHON}" "${REPO}/scripts/validate_dataset.py" \
     --shard-dir "${SHARDS_DIR}" \
-    --expected-shards "${ROW_COUNT}" \
+    --expected-shards "${SHARD_COUNT}" \
     --workers "${VALIDATE_WORKERS}"
 VALIDATE_RC=$?
 set -e
@@ -479,7 +605,7 @@ if (( VALIDATE_RC != 0 )); then
     echo "[turbospec] WARN: validation exited with code ${VALIDATE_RC}; continuing with merge."
 fi
 
-SHARD_STORE_COUNT=$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name '*.zarr' | wc -l | tr -d '[:space:]')
+SHARD_STORE_COUNT=$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' | wc -l | tr -d '[:space:]')
 if (( SHARD_STORE_COUNT == 0 )); then
     echo "[turbospec] ERROR: no shard stores were produced in ${SHARDS_DIR}; skipping merge." >&2
     echo "[turbospec] ERROR: inspect ${LOG_DIR}/shard_*.log for worker failures." >&2
@@ -504,8 +630,13 @@ MERGE_CMD=(
 )
 
 if (( FINAL_MISSING > 0 )); then
-    echo "[turbospec] WARN: missing shards detected; enabling partial merge (--allow-missing --skip-nonexistent-shards)."
-    MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
+    if [[ "$(to_bool01 "${ALLOW_PARTIAL_MERGE}")" == "1" ]]; then
+        echo "[turbospec] WARN: missing shards detected; enabling partial merge (--allow-missing --skip-nonexistent-shards)."
+        MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
+    else
+        echo "[turbospec] ERROR: ${FINAL_MISSING} shard IDs are still missing; merge aborted." >&2
+        exit 1
+    fi
 fi
 
 echo "[turbospec] Merging shard outputs..."

@@ -295,19 +295,19 @@ The Gadi job wraps the local smoke script and keeps outputs under:
 For long sharded production runs on Gadi, use:
 
 ```bash
-qsub turbospectrum.pbs
+qsub turbospectrum_example.pbs
 ```
 
 Common overrides:
 
 ```bash
-qsub -v MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json,RUN_ROOT=/scratch/mk27/$USER/turbospec,WORKERS=16 turbospectrum.pbs
+qsub -v MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json,RUN_ROOT=/scratch/mk27/$USER/turbospec,WORKERS=16,ROWS_PER_SHARD=32 turbospectrum_example.pbs
 ```
 
 Post-processing tuning overrides (optional):
 
 ```bash
-qsub -v WORKERS=96,VALIDATE_WORKERS=32,MERGE_CHUNK_ROWS=128 turbospectrum.pbs
+qsub -v WORKERS=32,VALIDATE_WORKERS=32,MERGE_CHUNK_ROWS=128 turbospectrum_example.pbs
 ```
 
 Behavior summary:
@@ -315,7 +315,10 @@ Behavior summary:
 - reads default grid/shard/merged output paths from `outputs` in the pipeline config
 - uses `RUN_ROOT` for queue state/log/tmp directories (and as a fallback when output paths are missing)
 - validates shard completeness with `scripts/validate_dataset.py` before merge
-- keeps existing shard outputs across manual and automatic resubmissions, then merges all valid shards at the end (partial merge allowed if some shards remain missing)
+- preserves valid shard outputs across reruns and resumes only the missing shard IDs on later submissions
+- defaults to legacy one-row-per-shard scheduling unless `SHARD_COUNT` or `ROWS_PER_SHARD` is set in the environment or `runtime`
+- for large grids, set `ROWS_PER_SHARD` or `runtime.rows_per_shard` to reduce per-shard startup overhead
+- use `FORCE_RESTART=1` only when you want to discard prior shard outputs and start again from scratch
 
 ## W&B on Gadi/HPC (MLP)
 
