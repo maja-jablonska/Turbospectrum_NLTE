@@ -51,6 +51,48 @@ class LinelistValidationError(ValueError):
     """Raised when configured linelist files fail upfront validation."""
 
 
+_TURBOSPECTRUM_ERROR_RE = re.compile(
+    r"\b(error|failed|exception|segmentation|traceback|forrtl|abort|fatal|severe|cannot|can't)\b|^\s*stop\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _extract_turbospectrum_log_excerpt(
+    log_file: str,
+    *,
+    max_lines: int = 12,
+    max_chars: int = 1200,
+) -> str:
+    if not log_file or not os.path.isfile(log_file):
+        return ""
+
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as handle:
+            lines = [re.sub(r"\s+", " ", line).strip() for line in handle if line.strip()]
+    except OSError as exc:
+        return f"log unreadable: {exc}"
+
+    if not lines:
+        return ""
+
+    interesting = [line for line in lines if _TURBOSPECTRUM_ERROR_RE.search(line)]
+    excerpt_lines = interesting[-max_lines:] if interesting else lines[-max_lines:]
+    excerpt = " | ".join(excerpt_lines)
+    if len(excerpt) > max_chars:
+        excerpt = f"{excerpt[: max_chars - 3]}..."
+    return excerpt
+
+
+def _with_turbospectrum_log_context(message: str, log_file: str) -> str:
+    parts = [str(message).strip()]
+    if log_file:
+        parts.append(f"log={log_file}")
+    excerpt = _extract_turbospectrum_log_excerpt(log_file)
+    if excerpt:
+        parts.append(f"excerpt={excerpt}")
+    return "; ".join(part for part in parts if part)
+
+
 def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     """
     Normalize config JSON to the flat schema expected by TurbospectrumConfig.
@@ -1178,7 +1220,7 @@ def run_single_synthesis(args):
         [line for line in individual_abundance_block.splitlines() if line.strip()]
     )
 
-    def build_result(status: str, message: str, *, output_path: str = ""):
+    def build_result(status: str, message: str, *, output_path: str = "", log_path: str = ""):
         return {
             "base_name": base_name,
             "params": {
@@ -1192,6 +1234,7 @@ def run_single_synthesis(args):
             "status": status,
             "message": message,
             "output_path": output_path,
+            "log_path": log_path,
         }
     
     # Check if output exists and skip if force is False
@@ -1208,7 +1251,12 @@ def run_single_synthesis(args):
                 all_exist = False
                 break
         if all_exist:
-            return build_result("skipped", "Output already exists", output_path=expected_outputs[0])
+            return build_result(
+                "skipped",
+                "Output already exists",
+                output_path=expected_outputs[0],
+                log_path=log_file,
+            )
     
     # If exact model doesn't exist, pick a nearest-neighbor MARCS atmosphere (no interpolation).
     model_input_path = model_path
@@ -1231,7 +1279,7 @@ def run_single_synthesis(args):
 
     marcs_flag = '.true.' if is_marcs else '.false.'
 
-    with open(log_file, "w") as log:
+    with open(log_file, "w", encoding="utf-8") as log:
         log.write(f"Starting synthesis for {base_name}\n")
         
         # ---------------------------------------------------------------------
@@ -1267,9 +1315,23 @@ def run_single_synthesis(args):
                 cwd=config.project_root # Run from root so relative paths in Fortran work if needed
             )
             if process.returncode != 0:
-                return build_result("error", "babsma failed", output_path=expected_outputs[0])
+                log.flush()
+                return build_result(
+                    "error",
+                    _with_turbospectrum_log_context(
+                        f"babsma failed (rc={process.returncode})",
+                        log_file,
+                    ),
+                    output_path=expected_outputs[0],
+                    log_path=log_file,
+                )
         except Exception as e:
-            return build_result("exception", f"babsma execution failed: {e}")
+            log.flush()
+            return build_result(
+                "exception",
+                _with_turbospectrum_log_context(f"babsma execution failed: {e}", log_file),
+                log_path=log_file,
+            )
 
         # ---------------------------------------------------------------------
         # Step 2: BSYN (Spectral Synthesis)
@@ -1335,11 +1397,30 @@ def run_single_synthesis(args):
                     cwd=config.project_root
                 )
                 if process.returncode != 0:
-                    return build_result("error", f"bsyn failed ({mode_str})", output_path=current_result_file)
+                    log.flush()
+                    return build_result(
+                        "error",
+                        _with_turbospectrum_log_context(
+                            f"bsyn failed ({mode_str}, rc={process.returncode})",
+                            log_file,
+                        ),
+                        output_path=current_result_file,
+                        log_path=log_file,
+                    )
             except Exception as e:
-                return build_result("exception", f"bsyn execution failed: {e}")
+                log.flush()
+                return build_result(
+                    "exception",
+                    _with_turbospectrum_log_context(f"bsyn execution failed: {e}", log_file),
+                    log_path=log_file,
+                )
 
-    return build_result("success", "Synthesis complete", output_path=expected_outputs[0])
+    return build_result(
+        "success",
+        "Synthesis complete",
+        output_path=expected_outputs[0],
+        log_path=log_file,
+    )
 
 def run_grid(config: TurbospectrumConfig, grid_points: List[Tuple]):
     """
