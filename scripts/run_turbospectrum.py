@@ -13,6 +13,23 @@ import json
 import csv
 from datetime import datetime
 
+try:
+    from .nlte_ascii_departures import (
+        NLTE_ASCII_CONTROL_KEYS,
+        materialize_nlte_info_with_departure_override,
+        resolve_absolute_abundance,
+        select_departure_file,
+        selector_from_row,
+    )
+except ImportError:
+    from nlte_ascii_departures import (
+        NLTE_ASCII_CONTROL_KEYS,
+        materialize_nlte_info_with_departure_override,
+        resolve_absolute_abundance,
+        select_departure_file,
+        selector_from_row,
+    )
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -791,6 +808,7 @@ RESERVED_SYNTHESIS_KEYS = {
     "grid_version",
     "row_index",
     "global_index",
+    *NLTE_ASCII_CONTROL_KEYS,
 }
 
 
@@ -996,6 +1014,56 @@ def get_synthesis_output_stem_from_params(
     if not extras:
         return base_stem
     return "_".join([base_stem, *extras])
+
+
+def _resolve_nlte_ascii_runtime_info(
+    *,
+    params: Mapping[str, Any],
+    config: TurbospectrumConfig,
+    model_input_path: str,
+) -> Dict[str, Any] | None:
+    if not config.nlte:
+        return None
+
+    selector = selector_from_row(params)
+    if selector is None:
+        return None
+
+    model_stem = os.path.splitext(os.path.basename(str(model_input_path)))[0]
+    target_abundance, abundance_column = resolve_absolute_abundance(params, selector)
+    selected_candidate = select_departure_file(
+        directory=selector.directory,
+        model_stem=model_stem,
+        abundance=target_abundance,
+        match=selector.match,
+    )
+
+    base_nlte_info_file = os.path.abspath(
+        str(
+            config.nlte_info_file
+            if config.nlte_info_file
+            else os.path.join(config.project_root, "DATA", "SPECIES_LTE_NLTE.dat")
+        )
+    )
+    tmp_root = os.path.abspath(
+        str(config.tmp_dir if config.tmp_dir else os.path.join(config.project_root, "tmp"))
+    )
+    runtime_nlte_info_file = materialize_nlte_info_with_departure_override(
+        base_info_path=base_nlte_info_file,
+        selector=selector,
+        departure_file_path=selected_candidate.path,
+        output_root=tmp_root,
+    )
+
+    return {
+        "nlte_info_file": runtime_nlte_info_file,
+        "departure_file": selected_candidate.path,
+        "target_abundance": float(target_abundance),
+        "matched_abundance": float(selected_candidate.abundance),
+        "abundance_column": abundance_column,
+        "species": selector.species,
+        "model_stem": model_stem,
+    }
 
 class ModelInterpolator:
     def __init__(self, config: TurbospectrumConfig):
@@ -1219,8 +1287,20 @@ def run_single_synthesis(args):
     individual_abundance_count = len(
         [line for line in individual_abundance_block.splitlines() if line.strip()]
     )
+    nlte_ascii_info: Dict[str, Any] | None = None
 
     def build_result(status: str, message: str, *, output_path: str = "", log_path: str = ""):
+        extra_params: Dict[str, Any] = {}
+        if nlte_ascii_info is not None:
+            extra_params.update(
+                {
+                    "nlte_ascii_departure_file": nlte_ascii_info["departure_file"],
+                    "nlte_ascii_target_abundance": f"{nlte_ascii_info['target_abundance']:+0.3f}",
+                    "nlte_ascii_matched_abundance": f"{nlte_ascii_info['matched_abundance']:+0.3f}",
+                    "nlte_ascii_species": nlte_ascii_info["species"],
+                    "nlte_ascii_abundance_column": nlte_ascii_info["abundance_column"],
+                }
+            )
         return {
             "base_name": base_name,
             "params": {
@@ -1230,6 +1310,7 @@ def run_single_synthesis(args):
                 "turb": model_turb_str,
                 "turbvel": synthesis_turb_raw,
                 "abundances": dict(synthesis_abundances),
+                **extra_params,
             },
             "status": status,
             "message": message,
@@ -1267,6 +1348,27 @@ def run_single_synthesis(args):
             return build_result("error", f"Model missing and nearest-neighbor selection failed: {message}")
         model_input_path = nearest["path"]
 
+    nlte_info_file_for_run = (
+        os.path.abspath(str(config.nlte_info_file))
+        if config.nlte_info_file
+        else os.path.join(config.project_root, "DATA", "SPECIES_LTE_NLTE.dat")
+    )
+    if config.nlte and isinstance(params, Mapping):
+        try:
+            nlte_ascii_info = _resolve_nlte_ascii_runtime_info(
+                params=params,
+                config=config,
+                model_input_path=model_input_path,
+            )
+        except Exception as exc:
+            return build_result(
+                "error",
+                f"NLTE ASCII departure selection failed: {exc}",
+                log_path=log_file,
+            )
+        if nlte_ascii_info is not None:
+            nlte_info_file_for_run = str(nlte_ascii_info["nlte_info_file"])
+
     # Check if model is a standard MARCS model or interpolated
     is_marcs = True
     try:
@@ -1281,6 +1383,16 @@ def run_single_synthesis(args):
 
     with open(log_file, "w", encoding="utf-8") as log:
         log.write(f"Starting synthesis for {base_name}\n")
+        if nlte_ascii_info is not None:
+            log.write(
+                "NLTE ASCII departure override: "
+                f"species={nlte_ascii_info['species']} "
+                f"column={nlte_ascii_info['abundance_column']} "
+                f"target_abundance={nlte_ascii_info['target_abundance']:+0.3f} "
+                f"matched_abundance={nlte_ascii_info['matched_abundance']:+0.3f} "
+                f"model_stem={nlte_ascii_info['model_stem']} "
+                f"file={nlte_ascii_info['departure_file']}\n"
+            )
         
         # ---------------------------------------------------------------------
         # Step 1: BABSMA (Continuous Opacity)
@@ -1361,7 +1473,7 @@ def run_single_synthesis(args):
             current_result_file = os.path.join(config.output_dir, f"{base_name}{suffix}.spec")
             
             bsyn_input = f"""'NLTE :'          '{'.true.' if config.nlte else '.false.'}'
-'NLTEINFOFILE:'  '{config.nlte_info_file if config.nlte_info_file else 'DATA/SPECIES_LTE_NLTE.dat'}'
+'NLTEINFOFILE:'  '{nlte_info_file_for_run if config.nlte else (config.nlte_info_file if config.nlte_info_file else 'DATA/SPECIES_LTE_NLTE.dat')}'
 'LAMBDA_MIN:'     '{config.lambda_min}'
 'LAMBDA_MAX:'     '{config.lambda_max}'
 'LAMBDA_STEP:'    '{config.lambda_step}'

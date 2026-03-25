@@ -207,6 +207,12 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
     sample_count = int(config.get("num_samples", 50))
     bounds_cfg = config.get("bounds") or {}
     synthesis_cfg = config.get("synthesis") or {}
+    nlte_ascii_cfg = config.get("nlte_ascii_departures") or {}
+
+    try:
+        from .nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+    except ImportError:
+        from nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
 
     bounds: List[Tuple[float, float]] = []
     for name in ["teff", "logg", "feh"]:
@@ -311,6 +317,15 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
             element,
             np.full(sample_count, fixed_abundances.get(element, "+0.00"), dtype=object),
         )
+    nlte_ascii_selector = normalize_nlte_ascii_selector(
+        directory=nlte_ascii_cfg.get("directory"),
+        species=nlte_ascii_cfg.get("species"),
+        abundance_column=nlte_ascii_cfg.get("abundance_column"),
+        abundance_scale=nlte_ascii_cfg.get("abundance_scale"),
+        solar_abundance=nlte_ascii_cfg.get("solar_abundance"),
+        match=nlte_ascii_cfg.get("match"),
+    )
+    out.update(build_nlte_ascii_selector_columns(sample_count, nlte_ascii_selector))
     return out
 
 

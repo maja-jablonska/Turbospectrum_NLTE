@@ -48,6 +48,10 @@ from run_turbospectrum import (  # noqa: E402
     run_single_synthesis,
     validate_runtime_environment,
 )
+try:
+    from .nlte_ascii_departures import NLTE_ASCII_CONTROL_KEYS
+except ImportError:
+    from nlte_ascii_departures import NLTE_ASCII_CONTROL_KEYS
 from provenance_contract import (  # noqa: E402
     assert_required_provenance_fields,
     canonical_json_sha256,
@@ -261,6 +265,7 @@ def _ordered_param_names(column_data: Mapping[str, np.ndarray]) -> List[str]:
         "turb",
         "turbvel",
         "t_value",
+        *NLTE_ASCII_CONTROL_KEYS,
     }
     candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
     extras = sorted(
@@ -673,6 +678,7 @@ def _synthesis_task(args) -> Dict:
             "calculation_mode",
             "mode",
             "grid_version",
+            *NLTE_ASCII_CONTROL_KEYS,
         }
     }
     start = time.perf_counter()
@@ -954,6 +960,7 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
                 "calculation_mode",
                 "mode",
                 "grid_version",
+                *NLTE_ASCII_CONTROL_KEYS,
             }:
                 continue
             row_values[passthrough_key] = values[idx]
@@ -974,6 +981,7 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
                 "calculation_mode",
                 "mode",
                 "grid_version",
+                *NLTE_ASCII_CONTROL_KEYS,
             }
         }
         base_name = get_synthesis_output_stem_from_params(
