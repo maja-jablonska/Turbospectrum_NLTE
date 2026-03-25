@@ -1021,7 +1021,7 @@ def _resolve_nlte_ascii_runtime_info(
     params: Mapping[str, Any],
     config: TurbospectrumConfig,
     model_input_path: str,
-) -> Dict[str, Any] | None:
+) -> Optional[Dict[str, Any]]:
     if not config.nlte:
         return None
 
@@ -1287,7 +1287,7 @@ def run_single_synthesis(args):
     individual_abundance_count = len(
         [line for line in individual_abundance_block.splitlines() if line.strip()]
     )
-    nlte_ascii_info: Dict[str, Any] | None = None
+    nlte_ascii_info: Optional[Dict[str, Any]] = None
 
     def build_result(status: str, message: str, *, output_path: str = "", log_path: str = ""):
         extra_params: Dict[str, Any] = {}
