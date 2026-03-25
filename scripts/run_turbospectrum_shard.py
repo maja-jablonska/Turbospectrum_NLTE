@@ -28,6 +28,7 @@ from run_turbospectrum import (  # noqa: E402
     LinelistValidationError,
     TurbospectrumConfig,
     _normalize_config_dict,
+    _with_turbospectrum_log_context,
     create_linelist_file,
     determine_worker_count,
     ensure_directories,
@@ -488,6 +489,7 @@ def _synthesis_task(batch):
         start = time.perf_counter()
         result = run_single_synthesis((row_values, cfg))
         duration = time.perf_counter() - start
+        log_path = str(result.get("log_path", "") or "")
 
         spec_path = str(result.get("output_path", "") or "")
         base_name = str(result.get("base_name", "") or os.path.splitext(os.path.basename(spec_path))[0])
@@ -575,7 +577,10 @@ def _synthesis_task(batch):
                     "global_index": global_index,
                     "base_name": base_name,
                     "status": "error",
-                    "message": str(exc),
+                    "message": _with_turbospectrum_log_context(
+                        f"Failed to read spectrum {spec_path}: {exc}",
+                        log_path,
+                    ),
                     "duration": duration,
                     "spectrum": None,
                     "mu_selected": float("nan"),
@@ -590,7 +595,10 @@ def _synthesis_task(batch):
                     "global_index": global_index,
                     "base_name": base_name,
                     "status": "error",
-                    "message": f"Missing spectrum output: {spec_path}",
+                    "message": _with_turbospectrum_log_context(
+                        f"Missing spectrum output: {spec_path}",
+                        log_path,
+                    ),
                     "duration": duration,
                     "spectrum": None,
                 })
@@ -1132,14 +1140,26 @@ def main():
 
                 done += 1
 
-                logger.info(
-                    "[%d/%d] global=%d %s (%.2fs)",
-                    done,
-                    len(indices),
-                    result["global_index"],
-                    result["status"],
-                    result["duration"],
-                )
+                status_text = str(result["status"]).upper()
+                if str(result["status"]).lower() in SUCCESS_STATUSES:
+                    logger.info(
+                        "[%d/%d] global=%d %s (%.2fs)",
+                        done,
+                        len(indices),
+                        result["global_index"],
+                        status_text,
+                        result["duration"],
+                    )
+                else:
+                    logger.error(
+                        "[%d/%d] global=%d %s (%.2fs) - %s",
+                        done,
+                        len(indices),
+                        result["global_index"],
+                        status_text,
+                        result["duration"],
+                        result["message"],
+                    )
 
     ############################################
     # Write shard
