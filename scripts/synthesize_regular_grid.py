@@ -22,6 +22,11 @@ from typing import Any, Dict, List, Mapping, Sequence
 
 import numpy as np
 
+try:
+    from .nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+except ImportError:
+    from nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
@@ -143,6 +148,7 @@ def _build_regular_columns(
     calculation_mode: str,
     abundances: Dict[str, str],
     max_rows: int,
+    nlte_ascii_selector: Any = None,
 ) -> Dict[str, np.ndarray]:
     nt = int(teff_axis.size)
     ng = int(logg_axis.size)
@@ -200,6 +206,7 @@ def _build_regular_columns(
     }
     if mu is not None:
         columns["mu"] = mu
+    columns.update(build_nlte_ascii_selector_columns(row_count, nlte_ascii_selector))
     return columns
 
 
@@ -344,6 +351,39 @@ def main() -> None:
     parser.add_argument("--o", default=None)
     parser.add_argument("--r", default=None)
     parser.add_argument("--s", default=None)
+    parser.add_argument(
+        "--nlte-ascii-dir",
+        default=None,
+        help="Directory containing per-abundance NLTE ASCII departure files",
+    )
+    parser.add_argument(
+        "--nlte-ascii-species",
+        default=None,
+        help="Element symbol or atomic number for the NLTE ASCII departure files (default: Fe)",
+    )
+    parser.add_argument(
+        "--nlte-ascii-abundance-column",
+        default=None,
+        help="Grid column that controls the departure-file abundance token (default: auto)",
+    )
+    parser.add_argument(
+        "--nlte-ascii-abundance-scale",
+        default=None,
+        choices=("relative", "absolute"),
+        help="Interpret the abundance column as [X/Fe] or absolute log abundance",
+    )
+    parser.add_argument(
+        "--nlte-ascii-solar-abundance",
+        type=float,
+        default=None,
+        help="Solar abundance used when converting relative [X/Fe] values into absolute abundance tokens",
+    )
+    parser.add_argument(
+        "--nlte-ascii-match",
+        default=None,
+        choices=("nearest", "exact"),
+        help="How to match available NLTE ASCII files in the departure directory",
+    )
 
     parser.add_argument("--run-root", default=None, help="Runtime root (defaults to RUN_ROOT/scratch)")
     parser.add_argument("--grid-zarr", default=None, help="Output grid Zarr path")
@@ -489,6 +529,27 @@ def main() -> None:
 
     skip_synthesis_cfg = _cfg_get(cfg, ("runtime", "skip_synthesis"), False)
     skip_synthesis = bool(args.skip_synthesis) if args.skip_synthesis is not None else bool(skip_synthesis_cfg)
+    nlte_ascii_cfg = cfg.get("nlte_ascii_departures") if isinstance(cfg.get("nlte_ascii_departures"), dict) else {}
+    nlte_ascii_selector = normalize_nlte_ascii_selector(
+        directory=args.nlte_ascii_dir if args.nlte_ascii_dir is not None else nlte_ascii_cfg.get("directory"),
+        species=args.nlte_ascii_species if args.nlte_ascii_species is not None else nlte_ascii_cfg.get("species"),
+        abundance_column=(
+            args.nlte_ascii_abundance_column
+            if args.nlte_ascii_abundance_column is not None
+            else nlte_ascii_cfg.get("abundance_column")
+        ),
+        abundance_scale=(
+            args.nlte_ascii_abundance_scale
+            if args.nlte_ascii_abundance_scale is not None
+            else nlte_ascii_cfg.get("abundance_scale")
+        ),
+        solar_abundance=(
+            args.nlte_ascii_solar_abundance
+            if args.nlte_ascii_solar_abundance is not None
+            else nlte_ascii_cfg.get("solar_abundance")
+        ),
+        match=args.nlte_ascii_match if args.nlte_ascii_match is not None else nlte_ascii_cfg.get("match"),
+    )
 
     teff_axis = _parse_numeric_axis(teff_axis_spec, "teff", integer=True)
     logg_axis = _parse_numeric_axis(logg_axis_spec, "logg", integer=False)
@@ -559,6 +620,7 @@ def main() -> None:
         mode=mode,
         calculation_mode=calculation_mode,
         abundances=abundances,
+        nlte_ascii_selector=nlte_ascii_selector,
         max_rows=max_rows,
     )
 
@@ -572,6 +634,13 @@ def main() -> None:
             "[regular-grid] mu axis: "
             f"{float(np.min(mu_axis)):.6f}..{float(np.max(mu_axis)):.6f} "
             f"({mu_axis.size} uniformly spaced samples)"
+        )
+    if nlte_ascii_selector is not None:
+        print(
+            "[regular-grid] NLTE ASCII departures: "
+            f"dir={nlte_ascii_selector.directory} species={nlte_ascii_selector.species} "
+            f"abundance_column={nlte_ascii_selector.abundance_column} "
+            f"scale={nlte_ascii_selector.abundance_scale} match={nlte_ascii_selector.match}"
         )
     if scratch:
         print(f"[regular-grid] synthesis scratch: {scratch}")

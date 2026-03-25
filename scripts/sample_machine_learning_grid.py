@@ -22,6 +22,11 @@ import polars as pl
 import zarr
 from numcodecs import Blosc, VLenUTF8
 
+try:
+    from .nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+except ImportError:
+    from nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -329,6 +334,39 @@ def main() -> None:
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR)")
     parser.add_argument("--log-file", default=None, help="Optional log file path")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress bars")
+    parser.add_argument(
+        "--nlte-ascii-dir",
+        default=None,
+        help="Directory containing per-abundance NLTE ASCII departure files",
+    )
+    parser.add_argument(
+        "--nlte-ascii-species",
+        default=None,
+        help="Element symbol or atomic number for the NLTE ASCII departure files (default: Fe)",
+    )
+    parser.add_argument(
+        "--nlte-ascii-abundance-column",
+        default=None,
+        help="Grid column that controls the departure-file abundance token (default: auto)",
+    )
+    parser.add_argument(
+        "--nlte-ascii-abundance-scale",
+        default=None,
+        choices=("relative", "absolute"),
+        help="Interpret the abundance column as [X/Fe] or absolute log abundance",
+    )
+    parser.add_argument(
+        "--nlte-ascii-solar-abundance",
+        type=float,
+        default=None,
+        help="Solar abundance used when converting relative [X/Fe] values into absolute abundance tokens",
+    )
+    parser.add_argument(
+        "--nlte-ascii-match",
+        default=None,
+        choices=("nearest", "exact"),
+        help="How to match available NLTE ASCII files in the departure directory",
+    )
     args = parser.parse_args()
 
     logger = _configure_logging(args.log_level, args.log_file)
@@ -339,10 +377,40 @@ def main() -> None:
     sample_count = args.samples or int(config.get("num_samples", 50))
     seed = config.get("seed")
     rng = np.random.default_rng(seed)
+    nlte_ascii_cfg = config.get("nlte_ascii_departures") or {}
+    nlte_ascii_selector = normalize_nlte_ascii_selector(
+        directory=args.nlte_ascii_dir if args.nlte_ascii_dir is not None else nlte_ascii_cfg.get("directory"),
+        species=args.nlte_ascii_species if args.nlte_ascii_species is not None else nlte_ascii_cfg.get("species"),
+        abundance_column=(
+            args.nlte_ascii_abundance_column
+            if args.nlte_ascii_abundance_column is not None
+            else nlte_ascii_cfg.get("abundance_column")
+        ),
+        abundance_scale=(
+            args.nlte_ascii_abundance_scale
+            if args.nlte_ascii_abundance_scale is not None
+            else nlte_ascii_cfg.get("abundance_scale")
+        ),
+        solar_abundance=(
+            args.nlte_ascii_solar_abundance
+            if args.nlte_ascii_solar_abundance is not None
+            else nlte_ascii_cfg.get("solar_abundance")
+        ),
+        match=args.nlte_ascii_match if args.nlte_ascii_match is not None else nlte_ascii_cfg.get("match"),
+    )
 
     logger.info("Loaded config: %s", os.path.abspath(args.config))
     logger.info("Sampling: target_rows=%d seed=%s resume=%s", sample_count, seed, args.resume)
     logger.info("Versions: polars=%s zarr=%s numpy=%s", getattr(pl, "__version__", "?"), getattr(zarr, "__version__", "?"), getattr(np, "__version__", "?"))
+    if nlte_ascii_selector is not None:
+        logger.info(
+            "NLTE ASCII departures: dir=%s species=%s abundance_column=%s scale=%s match=%s",
+            nlte_ascii_selector.directory,
+            nlte_ascii_selector.species,
+            nlte_ascii_selector.abundance_column,
+            nlte_ascii_selector.abundance_scale,
+            nlte_ascii_selector.match,
+        )
 
     t_step = time.perf_counter()
     bounds, sampled_abundances, fixed_abundances, sampled_turbvel_options = _resolve_sampling_dimensions(config)
@@ -447,23 +515,23 @@ def main() -> None:
         )
         for element in _ordered_abundance_keys(abundances)
     }
-    df = pl.DataFrame(
-        {
-            "grid_version": np.full(sample_count_new, grid_version, dtype=object),
-            "teff": int_teff,
-            "logg": logg_vals,
-            "feh": feh_vals,
-            "lam_min": np.full(sample_count_new, lam_min, dtype=float),
-            "lam_max": np.full(sample_count_new, lam_max, dtype=float),
-            "lam_step": np.full(sample_count_new, lam_step, dtype=float),
-            "turbvel": turbvel_series,
-            "t_value": t_value_series,
-            **abundance_columns,
-            "output_mode": np.full(sample_count_new, output_mode, dtype=object),
-            "mode": np.full(sample_count_new, mode, dtype=object),
-            "calculation_mode": np.full(sample_count_new, calculation_mode, dtype=object),
-        }
-    )
+    columns = {
+        "grid_version": np.full(sample_count_new, grid_version, dtype=object),
+        "teff": int_teff,
+        "logg": logg_vals,
+        "feh": feh_vals,
+        "lam_min": np.full(sample_count_new, lam_min, dtype=float),
+        "lam_max": np.full(sample_count_new, lam_max, dtype=float),
+        "lam_step": np.full(sample_count_new, lam_step, dtype=float),
+        "turbvel": turbvel_series,
+        "t_value": t_value_series,
+        **abundance_columns,
+        "output_mode": np.full(sample_count_new, output_mode, dtype=object),
+        "mode": np.full(sample_count_new, mode, dtype=object),
+        "calculation_mode": np.full(sample_count_new, calculation_mode, dtype=object),
+    }
+    columns.update(build_nlte_ascii_selector_columns(sample_count_new, nlte_ascii_selector))
+    df = pl.DataFrame(columns)
     logger.info("Built Polars DataFrame (%d rows, %d cols) in %.2fs", df.height, len(df.columns), time.perf_counter() - t_step)
 
     compression_kwargs = _zarr_compression_kwargs(zarr_compressor_cfg)
