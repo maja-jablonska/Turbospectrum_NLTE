@@ -477,6 +477,12 @@ def _stage_departure_file(src: str, dst: str, *, prefer_copy: bool = False) -> N
         shutil.copy2(src, dst)
 
 
+def _target_departure_cache_name(source_path: str, *, atomic_number: int) -> str:
+    _, ext = os.path.splitext(os.path.basename(source_path))
+    digest = hashlib.sha256(_as_abspath(source_path).encode("utf-8")).hexdigest()[:16]
+    return f"z{atomic_number:02d}_{digest}{ext or '.dat'}"
+
+
 def _materialized_nlte_info_is_complete(
     info_path: str,
     *,
@@ -521,7 +527,10 @@ def materialize_nlte_info_with_departure_override(
     resolved_base = _as_abspath(base_info_path)
     resolved_departure = _as_abspath(departure_file_path)
     target_atomic_number = PERIODIC_TABLE[_normalize_key(selector.species)]
-    target_departure_name = os.path.basename(resolved_departure)
+    target_departure_name = _target_departure_cache_name(
+        resolved_departure,
+        atomic_number=target_atomic_number,
+    )
     digest = hashlib.sha256(
         f"{resolved_base}|{selector.species}|{resolved_departure}".encode("utf-8")
     ).hexdigest()[:16]
