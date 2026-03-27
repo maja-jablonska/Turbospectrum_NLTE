@@ -357,14 +357,16 @@ def _resolve_linelist_paths(config: TurbospectrumConfig) -> List[str]:
 
 
 def _resolve_synthesis_binary_paths(config: TurbospectrumConfig, project_root: str) -> List[str]:
-    exec_root = os.path.join(project_root, f"exec-{config.compiler}")
     out: List[str] = []
     seen: set[str] = set()
-    for item in (config.babsma_exec, config.bsyn_exec, config.interpol_exec):
-        raw = str(item or "").strip()
-        if not raw:
+    for item in (
+        getattr(config, "babsma_path", ""),
+        getattr(config, "bsyn_path", ""),
+        getattr(config, "interpol_path", ""),
+    ):
+        path = os.path.abspath(os.path.expanduser(os.path.expandvars(str(item or "").strip())))
+        if not path:
             continue
-        path = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(exec_root, raw))
         if path in seen or not os.path.isfile(path):
             continue
         seen.add(path)

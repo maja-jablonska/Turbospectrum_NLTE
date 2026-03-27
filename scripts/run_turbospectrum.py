@@ -64,6 +64,19 @@ def _normalize_output_mode(raw: Any) -> str:
     raise ValueError(f"output_mode must be 'Flux' or 'Intensity', got {raw!r}")
 
 
+def _expand_path_text(value: Any) -> str:
+    return os.path.expanduser(os.path.expandvars(str(value or "").strip()))
+
+
+def _resolve_path_from_base(value: Any, *, base_dir: str) -> str:
+    expanded = _expand_path_text(value)
+    if not expanded:
+        return ""
+    if os.path.isabs(expanded):
+        return os.path.abspath(expanded)
+    return os.path.abspath(os.path.join(base_dir, expanded))
+
+
 class LinelistValidationError(ValueError):
     """Raised when configured linelist files fail upfront validation."""
 
@@ -164,6 +177,9 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["babsma_exec"] = executables.get("babsma_exec", "babsma_lu")
     flat["bsyn_exec"] = executables.get("bsyn_exec", "bsyn_lu")
     flat["interpol_exec"] = executables.get("interpol_exec", "interpol_modeles")
+    flat["babsma_path"] = executables.get("babsma_path", cfg_data.get("babsma_path", ""))
+    flat["bsyn_path"] = executables.get("bsyn_path", cfg_data.get("bsyn_path", ""))
+    flat["interpol_path"] = executables.get("interpol_path", cfg_data.get("interpol_path", ""))
 
     paths = cfg_data.get("paths", {}) or {}
     flat["model_atmosphere_path"] = paths.get("model_atmosphere_path", "")
@@ -329,6 +345,11 @@ class TurbospectrumConfig:
     babsma_exec: str = "babsma_lu"
     bsyn_exec: str = "bsyn_lu"
     interpol_exec: str = "interpol_modeles"
+    # Optional explicit executable paths. When provided, these override the
+    # corresponding executable-name fields and preserve absolute paths.
+    babsma_path: str = ""
+    bsyn_path: str = ""
+    interpol_path: str = ""
 
     # Output mode
     output_mode: str = "Flux"
@@ -371,6 +392,7 @@ class TurbospectrumConfig:
     grid_points_file: str = ""
 
     def __post_init__(self):
+        self.project_root = os.path.abspath(_expand_path_text(self.project_root))
         self.output_mode = _normalize_output_mode(self.output_mode)
         try:
             self.resolution = float(self.resolution)
@@ -386,7 +408,12 @@ class TurbospectrumConfig:
                 self.mu_sampling["mode"] = "random"
 
         # Set derived paths if not provided
-        if not self.model_atmosphere_path:
+        if self.model_atmosphere_path:
+            self.model_atmosphere_path = _resolve_path_from_base(
+                self.model_atmosphere_path,
+                base_dir=self.project_root,
+            )
+        else:
             # Prefer the common layout:
             #   input_files/model_atmospheres/1D/marcs_standard_comp/*.mod
             # but support older layouts with an extra nested marcs_standard_comp/
@@ -395,28 +422,48 @@ class TurbospectrumConfig:
             )
             nested = os.path.join(candidate, "marcs_standard_comp")
             self.model_atmosphere_path = nested if os.path.isdir(nested) else candidate
-        if not self.linelist_path:
+        if self.linelist_path:
+            self.linelist_path = _resolve_path_from_base(self.linelist_path, base_dir=self.project_root)
+        else:
             self.linelist_path = os.path.join(self.project_root, "input_files", "linelists")
         if self.linelist_files is None:
             # Default to the one we found or empty
             self.linelist_files = ["nlte_ges_linelist_jmg6may2025_I_II"]
         # Ensure NLTE info file has a default if NLTE is enabled
-        if self.nlte and not self.nlte_info_file:
-            self.nlte_info_file = os.path.join(self.project_root, "DATA", "SPECIES_LTE_NLTE.dat")
+        if self.nlte:
+            if self.nlte_info_file:
+                self.nlte_info_file = _resolve_path_from_base(self.nlte_info_file, base_dir=self.project_root)
+            else:
+                self.nlte_info_file = os.path.join(self.project_root, "DATA", "SPECIES_LTE_NLTE.dat")
         default_run_root = os.path.join(self.project_root, "runs", "local-dev")
-        if not self.output_dir:
+        if self.output_dir:
+            self.output_dir = _resolve_path_from_base(self.output_dir, base_dir=self.project_root)
+        else:
             self.output_dir = os.path.join(default_run_root, "outputs", "spectra")
-        if not self.log_dir:
+        if self.log_dir:
+            self.log_dir = _resolve_path_from_base(self.log_dir, base_dir=self.project_root)
+        else:
             self.log_dir = os.path.join(default_run_root, "logs", "shards")
-        if not self.tmp_dir:
+        if self.tmp_dir:
+            self.tmp_dir = _resolve_path_from_base(self.tmp_dir, base_dir=self.project_root)
+        else:
             self.tmp_dir = os.path.join(default_run_root, "tmp")
-            
+
         # Set executable paths
         exec_dir = os.path.join(self.project_root, f"exec-{self.compiler}")
-        self.babsma_path = os.path.join(exec_dir, self.babsma_exec)
-        self.bsyn_path = os.path.join(exec_dir, self.bsyn_exec)
+        self.babsma_path = _resolve_path_from_base(
+            self.babsma_path or self.babsma_exec,
+            base_dir=exec_dir,
+        )
+        self.bsyn_path = _resolve_path_from_base(
+            self.bsyn_path or self.bsyn_exec,
+            base_dir=exec_dir,
+        )
         # Interpolator is usually in a separate directory
-        self.interpol_path = os.path.join(self.project_root, "interpolator", self.interpol_exec)
+        self.interpol_path = _resolve_path_from_base(
+            self.interpol_path or self.interpol_exec,
+            base_dir=os.path.join(self.project_root, "interpolator"),
+        )
 
         print("\n--- Turbospectrum Configuration ---")
         for key, value in dataclasses.asdict(self).items():
