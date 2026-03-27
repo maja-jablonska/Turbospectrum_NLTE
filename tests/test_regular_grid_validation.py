@@ -130,6 +130,48 @@ class RegularGridValidationTests(unittest.TestCase):
             self.assertEqual(cfg["paths"]["linelist_path"], linelist_dir)
             self.assertEqual(cfg["paths"]["linelist_files"], ["custom_list"])
 
+    def test_materialize_synthesis_config_preserves_absolute_linelist_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_cfg_path = os.path.join(tmpdir, "base.json")
+            run_root = os.path.join(tmpdir, "run")
+            cfg_dir = os.path.join(tmpdir, "configs", "pipeline")
+            linelist_dir = os.path.join(tmpdir, "external", "linelists")
+            os.makedirs(cfg_dir, exist_ok=True)
+            os.makedirs(linelist_dir, exist_ok=True)
+
+            with open(base_cfg_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "project_root": "",
+                        "paths": {
+                            "linelist_path": "",
+                            "linelist_files": ["base_list"],
+                        },
+                        "synthesis_parameters": {
+                            "output_mode": "Flux",
+                        },
+                    },
+                    handle,
+                )
+
+            materialized = _materialize_synthesis_config(
+                base_config_path=base_cfg_path,
+                run_root=run_root,
+                overrides={
+                    "paths": {
+                        "linelist_path": linelist_dir,
+                        "linelist_files": ["custom_list"],
+                    }
+                },
+                overrides_base_dir=cfg_dir,
+            )
+
+            with open(materialized, "r", encoding="utf-8") as handle:
+                cfg = json.load(handle)
+
+            self.assertEqual(cfg["paths"]["linelist_path"], linelist_dir)
+            self.assertEqual(cfg["paths"]["linelist_files"], ["custom_list"])
+
     def test_materialize_synthesis_config_applies_mu_range_to_written_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_cfg_path = os.path.join(tmpdir, "base.json")
