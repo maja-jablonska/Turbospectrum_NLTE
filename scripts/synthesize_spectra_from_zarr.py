@@ -951,6 +951,9 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
         for optional_key in ("turbvel", "t_value", "output_mode", "calculation_mode", "mode"):
             if optional_key in column_data:
                 row_values[optional_key] = column_data[optional_key][idx]
+        for control_key in NLTE_ASCII_CONTROL_KEYS:
+            if control_key in column_data:
+                row_values[control_key] = column_data[control_key][idx]
         for passthrough_key, values in column_data.items():
             if passthrough_key in {
                 "teff",
