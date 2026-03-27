@@ -478,9 +478,14 @@ def _stage_departure_file(src: str, dst: str, *, prefer_copy: bool = False) -> N
 
 
 def _target_departure_cache_name(source_path: str, *, atomic_number: int) -> str:
-    _, ext = os.path.splitext(os.path.basename(source_path))
+    source_name = os.path.basename(source_path)
+    _, ext = os.path.splitext(source_name)
     digest = hashlib.sha256(_as_abspath(source_path).encode("utf-8")).hexdigest()[:16]
-    return f"z{atomic_number:02d}_{digest}{ext or '.dat'}"
+    abundance_suffix = ""
+    match = _FILENAME_RE.match(source_name)
+    if match:
+        abundance_suffix = f"_abu{match.group('abundance')}"
+    return f"z{atomic_number:02d}_{digest}{abundance_suffix}{ext or '.dat'}"
 
 
 def _materialized_nlte_info_is_complete(

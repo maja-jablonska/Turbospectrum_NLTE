@@ -877,6 +877,16 @@ def _format_abundance_value(raw_value: Any) -> str:
         return str(raw_value).strip()
 
 
+_SIGNED_FLOAT_RE = re.compile(r"^[+\-]?(?:\d+(?:\.\d*)?|\.\d+)$")
+
+
+def _format_control_abundance_value(raw_value: Any) -> str:
+    text = str(raw_value if raw_value is not None else "").strip()
+    if text and _SIGNED_FLOAT_RE.fullmatch(text):
+        return text if text.startswith(("+", "-")) else f"+{text}"
+    return _format_abundance_value(raw_value)
+
+
 def _normalize_turbulence_id(raw_value: Any, default: str = "01") -> str:
     text = str(raw_value if raw_value is not None else "").strip()
     if not text:
@@ -928,7 +938,7 @@ def _collect_synthesis_abundances(params: Mapping[str, Any]) -> Dict[str, str]:
 
 def _build_abundance_controls(abundances: Mapping[str, Any]) -> Tuple[str, str, str, str]:
     normalized = {
-        _normalize_abundance_key(name): _format_abundance_value(value)
+        _normalize_abundance_key(name): _format_control_abundance_value(value)
         for name, value in abundances.items()
         if _normalize_abundance_key(name)
     }
@@ -1330,11 +1340,8 @@ def run_single_synthesis(args):
     log_file = os.path.join(config.log_dir, f"{base_name}.log")
     opac_path = os.path.join(config.project_root, config.model_opac_dir, f"{base_name}.opac")
     is_intensity = output_mode == "Intensity"
-    alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(synthesis_abundances)
-    individual_abundance_count = len(
-        [line for line in individual_abundance_block.splitlines() if line.strip()]
-    )
     nlte_ascii_info: Optional[Dict[str, Any]] = None
+    runtime_abundances: Dict[str, Any] = dict(synthesis_abundances)
 
     def build_result(status: str, message: str, *, output_path: str = "", log_path: str = ""):
         extra_params: Dict[str, Any] = {}
@@ -1356,7 +1363,7 @@ def run_single_synthesis(args):
                 "feh": feh,
                 "turb": model_turb_str,
                 "turbvel": synthesis_turb_raw,
-                "abundances": dict(synthesis_abundances),
+                "abundances": dict(runtime_abundances),
                 **extra_params,
             },
             "status": status,
@@ -1415,6 +1422,14 @@ def run_single_synthesis(args):
             )
         if nlte_ascii_info is not None:
             nlte_info_file_for_run = str(nlte_ascii_info["nlte_info_file"])
+            runtime_abundances[_normalize_abundance_key(nlte_ascii_info["species"])] = (
+                f"{nlte_ascii_info['matched_abundance']:+0.3f}"
+            )
+
+    alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(runtime_abundances)
+    individual_abundance_count = len(
+        [line for line in individual_abundance_block.splitlines() if line.strip()]
+    )
 
     # Check if model is a standard MARCS model or interpolated
     is_marcs = True
@@ -1437,6 +1452,7 @@ def run_single_synthesis(args):
                 f"column={nlte_ascii_info['abundance_column']} "
                 f"target_abundance={nlte_ascii_info['target_abundance']:+0.3f} "
                 f"matched_abundance={nlte_ascii_info['matched_abundance']:+0.3f} "
+                f"applied_abundance={runtime_abundances.get(_normalize_abundance_key(nlte_ascii_info['species']), '')} "
                 f"model_stem={nlte_ascii_info['model_stem']} "
                 f"file={nlte_ascii_info['departure_file']}\n"
             )
