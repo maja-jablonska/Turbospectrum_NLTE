@@ -11,6 +11,8 @@ Current canonical files:
 - `configs/pipeline/config_pipeline.example.json`: template.
 - `configs/pipeline/config_pipeline.json`: active pipeline config.
 - `configs/pipeline/config_regular_grid.example.json`: regular Cartesian grid template (linear interpolation workflows).
+- `configs/pipeline/config_regular_grid_nlte_fe.example.json`: Fe NLTE regular-grid template for flux synthesis with per-abundance ASCII departures.
+- `configs/pipeline/config_regular_grid_nlte_fe_intensity.example.json`: Fe NLTE regular-grid template for intensity synthesis with per-abundance ASCII departures and `mu_range` sampling.
 - `configs/sampling/config_ml_sampling.json`: sampling-only config.
 - `configs/synthesis/config_sample_comprehensive.json`: full nested synthesis schema.
 - `configs/synthesis/config_sample.json`: compact flat synthesis schema (legacy-compatible).

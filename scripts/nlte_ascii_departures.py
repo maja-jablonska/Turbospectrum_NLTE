@@ -120,43 +120,47 @@ PERIODIC_TABLE = {symbol.lower(): atomic_number for atomic_number, symbol in enu
 ATOMIC_SYMBOL_BY_NUMBER = {atomic_number: symbol for atomic_number, symbol in enumerate(_ELEMENT_SYMBOLS) if symbol}
 
 # Default solar abundances on the usual log epsilon(H)=12 scale.
-# These defaults are only used to convert relative [X/Fe] values into the
+# These defaults are used when converting relative [X/Fe] values into the
 # absolute abundance token encoded in NLTE ASCII departure filenames.
+#
+# Keep this table aligned with Turbospectrum's current hard-coded
+# `ABUND_SOURCE='magg'` runtime default in `run_turbospectrum.py`, so that
+# relative-abundance selectors choose files on the same solar scale BSYN uses.
 DEFAULT_SOLAR_ABUNDANCE = {
     "h": 12.00,
     "he": 10.93,
     "li": 1.05,
     "be": 1.38,
     "b": 2.70,
-    "c": 8.46,
-    "n": 7.83,
-    "o": 8.69,
-    "f": 4.40,
-    "ne": 7.93,
-    "na": 6.22,
-    "mg": 7.55,
-    "al": 6.43,
-    "si": 7.51,
-    "p": 5.41,
-    "s": 7.12,
-    "cl": 5.31,
-    "ar": 6.38,
-    "k": 5.07,
-    "ca": 6.30,
-    "sc": 3.14,
-    "ti": 4.97,
-    "v": 3.90,
-    "cr": 5.62,
-    "mn": 5.42,
-    "fe": 7.50,
-    "co": 4.94,
-    "ni": 6.20,
-    "cu": 4.18,
-    "zn": 4.56,
+    "c": 8.56,
+    "n": 7.98,
+    "o": 8.77,
+    "f": 4.67,
+    "ne": 8.15,
+    "na": 6.33,
+    "mg": 7.58,
+    "al": 6.48,
+    "si": 7.57,
+    "p": 5.48,
+    "s": 7.21,
+    "cl": 5.29,
+    "ar": 6.50,
+    "k": 5.12,
+    "ca": 6.32,
+    "sc": 3.09,
+    "ti": 4.96,
+    "v": 4.01,
+    "cr": 5.69,
+    "mn": 5.53,
+    "fe": 7.51,
+    "co": 4.92,
+    "ni": 6.25,
+    "cu": 4.21,
+    "zn": 4.60,
     "sr": 2.83,
     "y": 2.21,
-    "zr": 2.59,
-    "ba": 2.25,
+    "zr": 2.58,
+    "ba": 2.17,
     "eu": 0.52,
 }
 
@@ -183,6 +187,27 @@ def _coerce_float(raw_value: Any, *, label: str) -> float:
         return float(text)
     except Exception as exc:
         raise ValueError(f"{label} must be numeric, got {raw_value!r}") from exc
+
+
+def read_departure_file_abundance(path: str) -> float:
+    """Read the abundance stored inside a TS ASCII departure file.
+
+    Exported per-abundance ASCII files encode the authoritative NLTE abundance
+    in the first numeric line after comment headers. We use that value, rather
+    than trusting the filename token alone, when wiring an override back into
+    BSYN.
+    """
+    resolved = _as_abspath(path)
+    with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith(("#", "!")):
+                continue
+            try:
+                return float(line.split()[0])
+            except (TypeError, ValueError):
+                continue
+    raise ValueError(f"Could not read abundance header from departure file: {resolved}")
 
 
 def _find_row_value(row_values: Mapping[str, Any], requested_key: str) -> Any:

@@ -17,6 +17,7 @@ try:
     from .nlte_ascii_departures import (
         NLTE_ASCII_CONTROL_KEYS,
         materialize_nlte_info_with_departure_override,
+        read_departure_file_abundance,
         resolve_absolute_abundance,
         select_departure_file,
         selector_from_row,
@@ -25,6 +26,7 @@ except ImportError:
     from nlte_ascii_departures import (
         NLTE_ASCII_CONTROL_KEYS,
         materialize_nlte_info_with_departure_override,
+        read_departure_file_abundance,
         resolve_absolute_abundance,
         select_departure_file,
         selector_from_row,
@@ -1111,12 +1113,14 @@ def _resolve_nlte_ascii_runtime_info(
         departure_file_path=selected_candidate.path,
         output_root=tmp_root,
     )
+    departure_file_abundance = read_departure_file_abundance(selected_candidate.path)
 
     return {
         "nlte_info_file": runtime_nlte_info_file,
         "departure_file": selected_candidate.path,
         "target_abundance": float(target_abundance),
         "matched_abundance": float(selected_candidate.abundance),
+        "departure_file_abundance": float(departure_file_abundance),
         "abundance_column": abundance_column,
         "species": selector.species,
         "model_stem": model_stem,
@@ -1351,6 +1355,7 @@ def run_single_synthesis(args):
                     "nlte_ascii_departure_file": nlte_ascii_info["departure_file"],
                     "nlte_ascii_target_abundance": f"{nlte_ascii_info['target_abundance']:+0.3f}",
                     "nlte_ascii_matched_abundance": f"{nlte_ascii_info['matched_abundance']:+0.3f}",
+                    "nlte_ascii_departure_file_abundance": f"{nlte_ascii_info['departure_file_abundance']:+0.3f}",
                     "nlte_ascii_species": nlte_ascii_info["species"],
                     "nlte_ascii_abundance_column": nlte_ascii_info["abundance_column"],
                 }
@@ -1423,7 +1428,7 @@ def run_single_synthesis(args):
         if nlte_ascii_info is not None:
             nlte_info_file_for_run = str(nlte_ascii_info["nlte_info_file"])
             runtime_abundances[_normalize_abundance_key(nlte_ascii_info["species"])] = (
-                f"{nlte_ascii_info['matched_abundance']:+0.3f}"
+                f"{nlte_ascii_info['departure_file_abundance']:+0.3f}"
             )
 
     alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(runtime_abundances)
@@ -1452,6 +1457,7 @@ def run_single_synthesis(args):
                 f"column={nlte_ascii_info['abundance_column']} "
                 f"target_abundance={nlte_ascii_info['target_abundance']:+0.3f} "
                 f"matched_abundance={nlte_ascii_info['matched_abundance']:+0.3f} "
+                f"departure_file_abundance={nlte_ascii_info['departure_file_abundance']:+0.3f} "
                 f"applied_abundance={runtime_abundances.get(_normalize_abundance_key(nlte_ascii_info['species']), '')} "
                 f"model_stem={nlte_ascii_info['model_stem']} "
                 f"file={nlte_ascii_info['departure_file']}\n"
