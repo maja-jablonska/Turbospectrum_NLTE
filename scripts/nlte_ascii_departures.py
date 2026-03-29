@@ -434,6 +434,36 @@ def _ensure_trailing_sep(path: str) -> str:
     return path if path.endswith(os.sep) else f"{path}{os.sep}"
 
 
+def _normalize_runtime_resource_dir(
+    raw_path: str,
+    *,
+    base_info_path: str,
+    fallback_dir_names: Sequence[str],
+) -> str:
+    """Map stale absolute NLTE-info roots onto the current checkout when possible."""
+    preferred = _ensure_trailing_sep(_as_abspath(raw_path)) if raw_path else ""
+    if preferred and os.path.isdir(preferred):
+        return preferred
+
+    data_root = os.path.dirname(_as_abspath(base_info_path))
+    candidates: list[str] = []
+    preferred_leaf = os.path.basename(os.path.normpath(str(raw_path or "")))
+    if preferred_leaf:
+        candidates.append(os.path.join(data_root, preferred_leaf))
+    candidates.extend(os.path.join(data_root, name) for name in fallback_dir_names)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = _ensure_trailing_sep(os.path.abspath(candidate))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if os.path.isdir(resolved):
+            return resolved
+
+    return preferred
+
+
 def parse_nlte_info_file(path: str) -> tuple[str, str, list[NlteInfoEntry]]:
     resolved_path = _as_abspath(path)
     resolved_dir = os.path.dirname(resolved_path)
@@ -520,16 +550,22 @@ def _materialized_nlte_info_is_complete(
     expected_target_departure_name: str,
 ) -> bool:
     try:
-        _, departure_path, entries = parse_nlte_info_file(info_path)
+        model_path, departure_path, entries = parse_nlte_info_file(info_path)
     except Exception:
+        return False
+
+    if not model_path or not os.path.isdir(model_path):
         return False
 
     found_target_species = False
     for entry in entries:
+        model_atom_name = str(entry.model_atom_file).strip()
         departure_name = str(entry.departure_file).strip()
         if entry.atomic_number == target_atomic_number:
             found_target_species = True
             if departure_name != expected_target_departure_name:
+                return False
+            if model_atom_name and not os.path.isfile(os.path.join(model_path, model_atom_name)):
                 return False
 
         requires_materialized_departure = (
@@ -574,6 +610,16 @@ def materialize_nlte_info_with_departure_override(
         return info_path
 
     model_path, departure_path, entries = parse_nlte_info_file(resolved_base)
+    model_path = _normalize_runtime_resource_dir(
+        model_path,
+        base_info_path=resolved_base,
+        fallback_dir_names=("ATOM", "ATOMS"),
+    )
+    departure_path = _normalize_runtime_resource_dir(
+        departure_path,
+        base_info_path=resolved_base,
+        fallback_dir_names=("DEP", "departures", "DEPARTURES"),
+    )
     staged_departure_dir = os.path.join(target_root, "departures")
     os.makedirs(staged_departure_dir, exist_ok=True)
 

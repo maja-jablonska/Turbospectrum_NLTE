@@ -9,7 +9,7 @@ import hashlib
 import dataclasses
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple, Optional, Dict, Iterator, Mapping
+from typing import Any, List, Tuple, Optional, Dict, Iterator, Mapping, Sequence
 import json
 import csv
 from datetime import datetime
