@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -9,10 +10,18 @@ from scripts.nlte_ascii_departures import (
     build_nlte_ascii_selector_columns,
     materialize_nlte_info_with_departure_override,
     normalize_nlte_ascii_selector,
+    parse_nlte_info_file,
+    read_departure_file_abundance,
     resolve_absolute_abundance,
     select_departure_file,
 )
-from scripts.run_turbospectrum import get_synthesis_output_stem_from_params
+from scripts.run_turbospectrum import (
+    TurbospectrumConfig,
+    _build_abundance_controls,
+    _resolve_nlte_ascii_runtime_info,
+    get_synthesis_output_stem_from_params,
+)
+from scripts.synthesize_spectra_from_zarr import _build_tasks
 from scripts.synthesize_regular_grid import _build_regular_columns
 
 
@@ -36,7 +45,23 @@ class NlteAsciiDepartureTests(unittest.TestCase):
             abundance, column = resolve_absolute_abundance({"feh": "-0.50"}, selector)
 
             self.assertEqual(column, "feh")
-            self.assertAlmostEqual(abundance, 7.00, places=6)
+            self.assertAlmostEqual(abundance, 7.01, places=6)
+
+    def test_read_departure_file_abundance_uses_file_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, f"000001_{self._MODEL_STEM}_abu+7.500.dat")
+            with open(path, "w", encoding="utf-8") as handle:
+                for _ in range(8):
+                    handle.write("# parameter 1.0 1.0\n")
+                handle.write("7.510\n")
+                handle.write("2\n")
+                handle.write("1\n")
+                handle.write("-5.0\n")
+                handle.write("-4.0\n")
+                handle.write("1.0\n")
+                handle.write("1.0\n")
+
+            self.assertAlmostEqual(read_departure_file_abundance(path), 7.51, places=6)
 
     def test_select_departure_file_picks_nearest_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -94,12 +119,139 @@ class NlteAsciiDepartureTests(unittest.TestCase):
 
             with open(runtime_info, "r", encoding="utf-8") as handle:
                 contents = handle.read()
+            _, runtime_departure_dir, entries = parse_nlte_info_file(runtime_info)
+            fe_entry = next(entry for entry in entries if entry.atomic_number == 26)
+            staged_override = os.path.join(runtime_departure_dir, fe_entry.departure_file)
 
-            self.assertIn(os.path.basename(override_fe), contents)
+            self.assertNotEqual(fe_entry.departure_file, os.path.basename(override_fe))
+            self.assertLess(len(fe_entry.departure_file), len(os.path.basename(override_fe)))
+            self.assertIn("_abu+7.500", fe_entry.departure_file)
+            self.assertIn(fe_entry.departure_file, contents)
             self.assertIn("'ascii'", contents)
             self.assertIn("'base_ca.dat'", contents)
+            self.assertTrue(os.path.isfile(staged_override))
 
         self.assertTrue(True)
+
+    def test_materialize_nlte_info_with_departure_override_repairs_missing_staged_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = os.path.join(tmpdir, "atoms")
+            dep_dir = os.path.join(tmpdir, "dep")
+            ascii_dir = os.path.join(tmpdir, "ascii")
+            os.makedirs(model_dir, exist_ok=True)
+            os.makedirs(dep_dir, exist_ok=True)
+            os.makedirs(ascii_dir, exist_ok=True)
+
+            base_ca = os.path.join(dep_dir, "base_ca.dat")
+            base_fe = os.path.join(dep_dir, "base_fe.bin")
+            override_fe = os.path.join(ascii_dir, f"000001_{self._MODEL_STEM}_abu+7.500.dat")
+            for path in (base_ca, base_fe, override_fe):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("dummy\n")
+
+            nlte_info = os.path.join(tmpdir, "SPECIES_LTE_NLTE.dat")
+            with open(nlte_info, "w", encoding="utf-8") as handle:
+                handle.write("# path for model atom files     ! don't change this line !\n")
+                handle.write("atoms/\n")
+                handle.write("#\n")
+                handle.write("# path for departure files      ! don't change this line !\n")
+                handle.write("dep/\n")
+                handle.write("#\n")
+                handle.write("# atomic (N)LTE setup\n")
+                handle.write("20 'Ca' 'lte' 'atom.ca105b' 'base_ca.dat' 'ascii'\n")
+                handle.write("26 'Fe' 'nlte' 'atom.fe607a' 'base_fe.bin' 'binary'\n")
+
+            selector = normalize_nlte_ascii_selector(directory=ascii_dir, species="Fe")
+            runtime_root = os.path.join(tmpdir, "runtime")
+            runtime_info = materialize_nlte_info_with_departure_override(
+                base_info_path=nlte_info,
+                selector=selector,
+                departure_file_path=override_fe,
+                output_root=runtime_root,
+            )
+
+            _, runtime_departure_dir, entries = parse_nlte_info_file(runtime_info)
+            fe_entry = next(entry for entry in entries if entry.atomic_number == 26)
+            staged_override = os.path.join(runtime_departure_dir, fe_entry.departure_file)
+            os.unlink(staged_override)
+            self.assertFalse(os.path.exists(staged_override))
+
+            repaired_info = materialize_nlte_info_with_departure_override(
+                base_info_path=nlte_info,
+                selector=selector,
+                departure_file_path=override_fe,
+                output_root=runtime_root,
+            )
+
+            self.assertEqual(repaired_info, runtime_info)
+            self.assertTrue(os.path.isfile(staged_override))
+
+    def test_runtime_info_uses_departure_header_abundance_for_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_dir = os.path.join(tmpdir, "DATA")
+            model_dir = os.path.join(data_dir, "ATOM")
+            dep_dir = os.path.join(data_dir, "DEP")
+            ascii_dir = os.path.join(tmpdir, "ascii")
+            os.makedirs(model_dir, exist_ok=True)
+            os.makedirs(dep_dir, exist_ok=True)
+            os.makedirs(ascii_dir, exist_ok=True)
+
+            base_fe = os.path.join(dep_dir, "base_fe.bin")
+            with open(base_fe, "w", encoding="utf-8") as handle:
+                handle.write("dummy\n")
+
+            override_fe = os.path.join(ascii_dir, f"000001_{self._MODEL_STEM}_abu+7.500.dat")
+            with open(override_fe, "w", encoding="utf-8") as handle:
+                for _ in range(8):
+                    handle.write("# parameter 1.0 1.0\n")
+                handle.write("7.510\n")
+                handle.write("2\n")
+                handle.write("1\n")
+                handle.write("-5.0\n")
+                handle.write("-4.0\n")
+                handle.write("1.0\n")
+                handle.write("1.0\n")
+
+            nlte_info = os.path.join(data_dir, "SPECIES_LTE_NLTE.dat")
+            with open(nlte_info, "w", encoding="utf-8") as handle:
+                handle.write("# path for model atom files     ! don't change this line !\n")
+                handle.write("/Users/mjablons/Documents/Turbospectrum_NLTE/DATA/ATOMS\n")
+                handle.write("#\n")
+                handle.write("# path for departure files      ! don't change this line !\n")
+                handle.write("/Users/mjablons/Documents/Turbospectrum_NLTE/DATA/DEP\n")
+                handle.write("#\n")
+                handle.write("# atomic (N)LTE setup\n")
+                handle.write("26 'Fe' 'nlte' 'atom.fe607a' 'base_fe.bin' 'binary'\n")
+
+            config = TurbospectrumConfig(
+                project_root=tmpdir,
+                nlte=True,
+                nlte_info_file=nlte_info,
+                tmp_dir=os.path.join(tmpdir, "runtime"),
+            )
+            model_path = os.path.join(tmpdir, f"{self._MODEL_STEM}.mod")
+            with open(model_path, "w", encoding="utf-8") as handle:
+                handle.write("MARCS\n")
+
+            info = _resolve_nlte_ascii_runtime_info(
+                params={
+                    "feh": 0.0,
+                    "nlte_ascii_departure_dir": ascii_dir,
+                    "nlte_ascii_departure_species": "Fe",
+                    "nlte_ascii_abundance_column": "feh",
+                    "nlte_ascii_abundance_scale": "relative",
+                    "nlte_ascii_solar_abundance": 7.50,
+                },
+                config=config,
+                model_input_path=model_path,
+            )
+
+            self.assertIsNotNone(info)
+            assert info is not None
+            self.assertAlmostEqual(info["matched_abundance"], 7.50, places=6)
+            self.assertAlmostEqual(info["departure_file_abundance"], 7.51, places=6)
+            runtime_model_path, _, _ = parse_nlte_info_file(info["nlte_info_file"])
+            self.assertEqual(runtime_model_path, model_dir + os.sep)
 
     def test_output_stem_ignores_nlte_ascii_control_keys(self) -> None:
         base = {
@@ -197,6 +349,51 @@ class NlteAsciiDepartureTests(unittest.TestCase):
 
             self.assertIn("nlte_ascii_departure_dir", columns)
             self.assertEqual(columns["nlte_ascii_departure_species"].tolist(), ["Fe", "Fe"])
+
+    def test_build_tasks_preserves_nlte_ascii_control_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selector = normalize_nlte_ascii_selector(
+                directory=tmpdir,
+                species="Fe",
+                solar_abundance=7.50,
+            )
+            column_data = {
+                "teff": np.asarray([5000], dtype=np.int64),
+                "logg": np.asarray([4.0], dtype=np.float64),
+                "feh": np.asarray([-0.5], dtype=np.float64),
+                "lam_min": np.asarray([5000.0], dtype=np.float64),
+                "lam_max": np.asarray([5020.0], dtype=np.float64),
+                "lam_step": np.asarray([0.01], dtype=np.float64),
+                "turbvel": np.asarray(["01"], dtype=object),
+                **build_nlte_ascii_selector_columns(1, selector),
+            }
+
+            tasks = _build_tasks(
+                1,
+                column_data,
+                SimpleNamespace(output_mode="Flux", nlte=True),
+            )
+            row_values = tasks[0][1]
+
+            self.assertEqual(row_values["nlte_ascii_departure_dir"], tmpdir)
+            self.assertEqual(row_values["nlte_ascii_departure_species"], "Fe")
+            self.assertEqual(row_values["nlte_ascii_abundance_column"], "auto")
+            self.assertEqual(row_values["nlte_ascii_abundance_scale"], "relative")
+            self.assertEqual(row_values["nlte_ascii_match"], "nearest")
+            self.assertAlmostEqual(float(row_values["nlte_ascii_solar_abundance"]), 7.5, places=6)
+
+    def test_build_abundance_controls_preserves_exact_numeric_strings(self) -> None:
+        alpha, r_proc, s_proc, block = _build_abundance_controls(
+            {
+                "a": "+0.00",
+                "fe": "+7.000",
+            }
+        )
+
+        self.assertEqual(alpha, "+0.00")
+        self.assertEqual(r_proc, "+0.00")
+        self.assertEqual(s_proc, "+0.00")
+        self.assertIn(" 26  +7.000", block)
 
 
 if __name__ == "__main__":
