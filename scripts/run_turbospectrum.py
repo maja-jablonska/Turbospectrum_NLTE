@@ -5,6 +5,7 @@ import multiprocessing
 import time
 import glob
 import re
+import hashlib
 import dataclasses
 from collections import Counter
 from dataclasses import dataclass, field
@@ -993,6 +994,55 @@ def _filename_token(raw_value: Any) -> str:
     return re.sub(r"-{2,}", "-", cleaned).strip("-")
 
 
+_FORTRAN_PATH_MAX = 240
+
+
+def _fit_stem_to_path_limits(
+    stem: str,
+    *,
+    path_targets: Sequence[Tuple[str, str]],
+    max_total_len: int = _FORTRAN_PATH_MAX,
+) -> str:
+    """Shorten a synthesis stem when Fortran-facing paths would overflow.
+
+    Turbospectrum stores many path-like inputs in fixed-size `character*256`
+    buffers. On long HPC scratch paths, an otherwise valid descriptive stem can
+    overflow those buffers, causing silent truncation and missing output files.
+    """
+    normalized_targets = [
+        (os.path.abspath(str(root)), str(suffix))
+        for root, suffix in path_targets
+    ]
+    if all(len(os.path.join(root, f"{stem}{suffix}")) <= max_total_len for root, suffix in normalized_targets):
+        return stem
+
+    max_stem_len = min(
+        max(24, max_total_len - len(root) - 1 - len(suffix))
+        for root, suffix in normalized_targets
+    )
+    if len(stem) <= max_stem_len:
+        return stem
+
+    digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:12]
+    room = max_stem_len - len(digest) - 2
+    if room <= 0:
+        shortened = digest[:max_stem_len]
+    else:
+        head = max(8, room // 2)
+        tail = max(8, room - head)
+        if head + tail > room:
+            tail = max(0, room - head)
+        shortened = f"{stem[:head]}_{digest}"
+        if tail > 0:
+            shortened += f"_{stem[-tail:]}"
+        shortened = shortened[:max_stem_len]
+
+    # Final guard in case a target root is even longer than anticipated.
+    if all(len(os.path.join(root, f"{shortened}{suffix}")) <= max_total_len for root, suffix in normalized_targets):
+        return shortened
+    return digest[:max_stem_len]
+
+
 def _resolve_synthesis_request(params: Mapping[str, Any]) -> Dict[str, Any]:
     teff = int(params["teff"])
     logg = float(params["logg"])
@@ -1323,7 +1373,7 @@ def run_single_synthesis(args):
 
     output_mode = _normalize_output_mode(getattr(config, "output_mode", "Flux"))
     calculation_mode = "NLTE" if config.nlte else "LTE"
-    base_name = get_synthesis_output_stem_from_params(
+    base_name_raw = get_synthesis_output_stem_from_params(
         {
             "teff": teff,
             "logg": logg,
@@ -1340,6 +1390,15 @@ def run_single_synthesis(args):
         },
         default_output_mode=output_mode,
         default_calculation_mode=calculation_mode,
+    )
+    result_suffix = ".intensity.spec" if output_mode == "Intensity" else ".spec"
+    opac_root = os.path.join(config.project_root, config.model_opac_dir)
+    base_name = _fit_stem_to_path_limits(
+        base_name_raw,
+        path_targets=[
+            (config.output_dir, result_suffix),
+            (opac_root, ".opac"),
+        ],
     )
     log_file = os.path.join(config.log_dir, f"{base_name}.log")
     opac_path = os.path.join(config.project_root, config.model_opac_dir, f"{base_name}.opac")
@@ -1450,6 +1509,11 @@ def run_single_synthesis(args):
 
     with open(log_file, "w", encoding="utf-8") as log:
         log.write(f"Starting synthesis for {base_name}\n")
+        if base_name != base_name_raw:
+            log.write(
+                "Shortened synthesis stem to satisfy Fortran path limits: "
+                f"original={base_name_raw} shortened={base_name}\n"
+            )
         if nlte_ascii_info is not None:
             log.write(
                 "NLTE ASCII departure override: "
@@ -1504,6 +1568,17 @@ def run_single_synthesis(args):
                         log_file,
                     ),
                     output_path=expected_outputs[0],
+                    log_path=log_file,
+                )
+            if not os.path.exists(opac_path):
+                log.flush()
+                return build_result(
+                    "error",
+                    _with_turbospectrum_log_context(
+                        f"babsma completed but produced no MODELOPAC: {opac_path} (len={len(opac_path)})",
+                        log_file,
+                    ),
+                    output_path=opac_path,
                     log_path=log_file,
                 )
         except Exception as e:
@@ -1583,6 +1658,17 @@ def run_single_synthesis(args):
                         "error",
                         _with_turbospectrum_log_context(
                             f"bsyn failed ({mode_str}, rc={process.returncode})",
+                            log_file,
+                        ),
+                        output_path=current_result_file,
+                        log_path=log_file,
+                    )
+                if not os.path.exists(current_result_file):
+                    log.flush()
+                    return build_result(
+                        "error",
+                        _with_turbospectrum_log_context(
+                            f"bsyn completed but produced no RESULTFILE: {current_result_file} (len={len(current_result_file)})",
                             log_file,
                         ),
                         output_path=current_result_file,
