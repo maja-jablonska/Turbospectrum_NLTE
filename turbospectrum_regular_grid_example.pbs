@@ -351,6 +351,7 @@ echo "[regular-grid] Run root: ${RUN_ROOT}"
 echo "[regular-grid] Grid Zarr: ${GRID_ZARR}"
 echo "[regular-grid] Shards: ${SHARDS_DIR}"
 echo "[regular-grid] Merged: ${MERGED_ZARR}"
+echo "[regular-grid] Log dir: ${LOG_DIR}"
 echo "[regular-grid] Synthesis config: ${SYNTH_CONFIG_PATH}"
 echo "[regular-grid] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[regular-grid] Synthesis scratch root: ${SYNTH_SCRATCH}"
@@ -558,13 +559,25 @@ export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO P
 ############################################
 
 if (( PENDING_COUNT > 0 )); then
-    echo "[regular-grid] Launching ${WORKERS} workers for ${PENDING_COUNT} pending shard rows..."
-    for ((i=0; i<WORKERS; i++)); do
-        worker &
-    done
-    wait
+    MIN_REQUIRED_SECONDS=$((EST_RUNTIME + SAFETY_BUFFER))
+    REMAINING_AT_LAUNCH="$(time_left)"
+    if (( REMAINING_AT_LAUNCH < MIN_REQUIRED_SECONDS )); then
+        echo "[regular-grid] WARN: only ${REMAINING_AT_LAUNCH}s remain before walltime, but the worker guard requires at least ${MIN_REQUIRED_SECONDS}s (EST_RUNTIME=${EST_RUNTIME}s + SAFETY_BUFFER=${SAFETY_BUFFER}s). No shard attempts will be started in this job."
+        echo "[regular-grid] WARN: rerun with more walltime or lower SAFETY_BUFFER/EST_RUNTIME if that is safe for your workload."
+    else
+        echo "[regular-grid] Launching ${WORKERS} workers for ${PENDING_COUNT} pending shard rows..."
+        for ((i=0; i<WORKERS; i++)); do
+            worker &
+        done
+        wait
+    fi
 else
     echo "[regular-grid] No pending shard rows detected; moving directly to validation/merge."
+fi
+
+CURRENT="$(cat "${NEXT_WORK_ITEM}")"
+if (( PENDING_COUNT > 0 && CURRENT == 0 )); then
+    echo "[regular-grid] NOTICE: no shard rows were assigned in this job. If no per-shard logs were written, the walltime guard likely prevented the first shard attempt."
 fi
 
 write_missing_shards_file
@@ -601,6 +614,9 @@ if (( SHARD_STORE_COUNT == 0 )); then
     FIRST_SHARD_LOG=""
     if compgen -G "${LOG_DIR}/shard_*.log" > /dev/null; then
         FIRST_SHARD_LOG="$(printf '%s\n' "${LOG_DIR}"/shard_*.log | sort | head -n 1)"
+    fi
+    if [[ -z "${FIRST_SHARD_LOG}" ]]; then
+        echo "[regular-grid] ERROR: no per-shard logs were written under ${LOG_DIR}. This usually means the job never reached a shard attempt, often because the walltime guard stopped workers before launch." >&2
     fi
     if [[ -n "${FIRST_SHARD_LOG}" && -f "${FIRST_SHARD_LOG}" ]]; then
         echo "[regular-grid] ERROR: first shard log excerpt (${FIRST_SHARD_LOG}):" >&2
