@@ -620,7 +620,9 @@ if (( SHARD_STORE_COUNT == 0 )); then
     fi
     if [[ -n "${FIRST_SHARD_LOG}" && -f "${FIRST_SHARD_LOG}" ]]; then
         echo "[regular-grid] ERROR: first shard log excerpt (${FIRST_SHARD_LOG}):" >&2
-        if grep -Einq 'error|failed|exception|missing spectrum|traceback|forrtl|stop|log=' "${FIRST_SHARD_LOG}"; then
+        if grep -Fq 'Fix the missing binaries/data paths before rerunning:' "${FIRST_SHARD_LOG}"; then
+            grep -Fin -A8 'Fix the missing binaries/data paths before rerunning:' "${FIRST_SHARD_LOG}" | tail -n 40 >&2 || true
+        elif grep -Einq 'error|failed|exception|missing spectrum|traceback|forrtl|stop|log=' "${FIRST_SHARD_LOG}"; then
             grep -Ein 'error|failed|exception|missing spectrum|traceback|forrtl|stop|log=' "${FIRST_SHARD_LOG}" | tail -n 80 >&2 || true
         else
             tail -n 120 "${FIRST_SHARD_LOG}" >&2 || true

@@ -3,7 +3,11 @@ import unittest
 
 import numpy as np
 
-from scripts.run_turbospectrum import TurbospectrumConfig, get_synthesis_output_stem_from_params
+from scripts.run_turbospectrum import (
+    TurbospectrumConfig,
+    _fit_stem_to_path_limits,
+    get_synthesis_output_stem_from_params,
+)
 from scripts.run_turbospectrum_shard import _build_task_batches
 from scripts.synthesize_spectra_from_zarr import _build_tasks
 
@@ -110,6 +114,26 @@ class SynthesisTaskIdentityTests(unittest.TestCase):
             self.assertEqual(str(tasks[0][1][1]["t_value"]), "02")
             self.assertEqual(str(tasks[0][0][1]["a"]), "+0.00")
             self.assertEqual(str(tasks[0][1][1]["a"]), "+0.10")
+
+    def test_fit_stem_to_path_limits_shortens_long_fortran_paths(self) -> None:
+        stem = (
+            "p5000_g+4.0_m0.0_t01_st_z-0.50_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00_"
+            "wl5000-5020-0.01_outintensity_calcnlte_mode1d"
+        )
+        roots = [
+            ("/very/long/scratch/path/" + "x" * 120, ".intensity.spec"),
+            ("/very/long/scratch/path/" + "y" * 120, ".opac"),
+        ]
+
+        shortened = _fit_stem_to_path_limits(stem, path_targets=roots, max_total_len=240)
+
+        self.assertNotEqual(shortened, stem)
+        self.assertEqual(
+            shortened,
+            _fit_stem_to_path_limits(stem, path_targets=roots, max_total_len=240),
+        )
+        for root, suffix in roots:
+            self.assertLessEqual(len(f"{root}/{shortened}{suffix}"), 240)
 
 
 if __name__ == "__main__":
