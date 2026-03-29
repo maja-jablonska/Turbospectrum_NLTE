@@ -1,0 +1,252 @@
+#!/bin/bash
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -N turbospec-array
+#PBS -l ncpus=32
+#PBS -l mem=64GB
+#PBS -l jobfs=100GB
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -M maja.jablonska@anu.edu.au
+#PBS -m bae
+#PBS -l storage=scratch/mk27+scratch/y89
+#PBS -J 0-99
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+############################################
+# Thread caps
+############################################
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+
+############################################
+# Environment activation
+############################################
+
+PYTHON_BIN="${PYTHON_BIN:-}"
+MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
+
+activate_mamba() {
+    if [[ -n "${MAMBA_EXE:-}" && -x "${MAMBA_EXE}" ]]; then
+        eval "$("${MAMBA_EXE}" shell hook --shell bash)"
+    elif command -v mamba >/dev/null 2>&1; then
+        eval "$(mamba shell hook --shell bash)"
+    elif [[ -f "${HOME}/miniforge/etc/profile.d/conda.sh" ]]; then
+        source "${HOME}/miniforge/etc/profile.d/conda.sh"
+    else
+        return 1
+    fi
+
+    if command -v mamba >/dev/null 2>&1; then
+        mamba activate "${MAMBA_ENV_NAME}"
+    elif command -v conda >/dev/null 2>&1; then
+        conda activate "${MAMBA_ENV_NAME}"
+    else
+        return 1
+    fi
+}
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if activate_mamba; then
+        :
+    else
+        echo "[turbospec-array] WARN: could not activate mamba env '${MAMBA_ENV_NAME}', falling back to PATH python." >&2
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    else
+        echo "[turbospec-array] ERROR: no python executable found after env setup." >&2
+        exit 1
+    fi
+fi
+
+PYTHON="${PYTHON_BIN}"
+echo "[turbospec-array] Python: ${PYTHON}"
+echo "[turbospec-array] Mamba env: ${MAMBA_ENV_NAME}"
+echo "[turbospec-array] Conda prefix: ${CONDA_PREFIX:-<unset>}"
+
+############################################
+# Paths and shard layout
+############################################
+
+PROJECT="${PROJECT:-mk27}"
+USER_ID="${USER_ID:-$(whoami)}"
+DEFAULT_RUN_ROOT="/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE"
+USER_RUN_ROOT="${RUN_ROOT:-}"
+RUN_ROOT="${USER_RUN_ROOT:-${DEFAULT_RUN_ROOT}}"
+REPO="${REPO:-${PBS_O_WORKDIR}}"
+CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
+WORKERS="${WORKERS:-${PBS_NCPUS:-32}}"
+SHARD_COUNT_OVERRIDE="${SHARD_COUNT:-}"
+
+if [[ "${REPO}" != /* ]]; then
+    REPO="${PBS_O_WORKDIR}/${REPO}"
+fi
+REPO="$(cd "${REPO}" >/dev/null 2>&1 && pwd)"
+
+if [[ "${CONFIG_PATH}" != /* ]]; then
+    CONFIG_PATH="${REPO}/${CONFIG_PATH}"
+fi
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+    echo "[turbospec-array] ERROR: config not found: ${CONFIG_PATH}" >&2
+    exit 1
+fi
+
+CONFIG_OUTPUTS="$(
+    "${PYTHON}" - <<PY
+import json
+import os
+
+cfg_path = os.path.abspath(r"${CONFIG_PATH}")
+cfg_dir = os.path.dirname(cfg_path)
+with open(cfg_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+outs = cfg.get("outputs", {}) or {}
+runtime = cfg.get("runtime", {}) or {}
+
+def _abs(p):
+    if not p:
+        return ""
+    return p if os.path.isabs(p) else os.path.abspath(os.path.join(cfg_dir, p))
+
+def _infer_run_root(*paths):
+    for path in paths:
+        if not path:
+            continue
+        parent = os.path.dirname(os.path.normpath(path))
+        if os.path.basename(parent) in {"shards", "zarr", "grids"} and os.path.basename(os.path.dirname(parent)) == "outputs":
+            return os.path.dirname(os.path.dirname(parent))
+    return ""
+
+run_root = _abs(outs.get("run_root")) or _infer_run_root(
+    outs.get("spectra_shard_template") and _abs(outs.get("spectra_shard_template")),
+    outs.get("spectra_zarr") and _abs(outs.get("spectra_zarr")),
+    outs.get("grid_zarr") and _abs(outs.get("grid_zarr")),
+)
+grid = _abs(outs.get("grid_zarr"))
+shard_tmpl = _abs(outs.get("spectra_shard_template"))
+shards_dir = os.path.dirname(shard_tmpl) if shard_tmpl else ""
+shard_count = runtime.get("shard_count")
+rows_per_shard = runtime.get("rows_per_shard")
+
+print(run_root)
+print(grid)
+print(shard_tmpl)
+print(shards_dir)
+print("" if shard_count in (None, "") else int(shard_count))
+print("" if rows_per_shard in (None, "") else int(rows_per_shard))
+PY
+)"
+
+mapfile -t _cfg_lines <<< "${CONFIG_OUTPUTS}"
+CFG_RUN_ROOT="${_cfg_lines[0]:-}"
+CFG_GRID_ZARR="${_cfg_lines[1]:-}"
+CFG_SHARD_TEMPLATE="${_cfg_lines[2]:-}"
+CFG_SHARDS_DIR="${_cfg_lines[3]:-}"
+CFG_SHARD_COUNT="${_cfg_lines[4]:-}"
+CFG_ROWS_PER_SHARD="${_cfg_lines[5]:-}"
+
+if [[ -z "${USER_RUN_ROOT}" && -n "${CFG_RUN_ROOT}" ]]; then
+    RUN_ROOT="${CFG_RUN_ROOT}"
+fi
+
+GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR:-${RUN_ROOT}/outputs/grids/parameter_grid.zarr}}"
+SHARD_TEMPLATE="${SHARD_TEMPLATE:-${CFG_SHARD_TEMPLATE}}"
+SHARDS_DIR="${SHARDS_DIR:-${CFG_SHARDS_DIR:-${RUN_ROOT}/outputs/shards}}"
+
+if [[ -z "${GRID_ZARR}" || -z "${SHARD_TEMPLATE}" || -z "${SHARDS_DIR}" ]]; then
+    echo "[turbospec-array] ERROR: failed to resolve grid/shard paths from config." >&2
+    exit 1
+fi
+
+if [[ ! -d "${GRID_ZARR}" ]]; then
+    echo "[turbospec-array] ERROR: grid zarr not found: ${GRID_ZARR}" >&2
+    echo "[turbospec-array] ERROR: generate the grid first, e.g. python scripts/pipeline_from_config.py --config ${CONFIG_PATH} --skip-synthesis" >&2
+    exit 1
+fi
+
+ROW_COUNT="$("${PYTHON}" - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
+for key in ("teff", "params", "global_index"):
+    if key in root and len(root[key].shape) >= 1:
+        print(int(root[key].shape[0]))
+        break
+else:
+    raise RuntimeError(f"Could not infer row count from {r'${GRID_ZARR}'}")
+PY
+)"
+
+ROWS_PER_SHARD="${ROWS_PER_SHARD:-${CFG_ROWS_PER_SHARD:-}}"
+SHARD_COUNT="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
+if [[ -n "${ROWS_PER_SHARD}" && -z "${SHARD_COUNT_OVERRIDE}" && -z "${CFG_SHARD_COUNT}" ]]; then
+    SHARD_COUNT=$(( (ROW_COUNT + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
+fi
+if [[ -z "${SHARD_COUNT}" ]]; then
+    echo "[turbospec-array] ERROR: SHARD_COUNT is not set and runtime.shard_count is missing in the config." >&2
+    echo "[turbospec-array] ERROR: submit with qsub -J 0-\$((N-1)) -v SHARD_COUNT=N,CONFIG_PATH=... turbospectrum_example_array.pbs" >&2
+    exit 1
+fi
+if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
+    echo "[turbospec-array] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
+    exit 1
+fi
+
+SHARD_INDEX="${PBS_ARRAY_INDEX:-0}"
+if ! [[ "${SHARD_INDEX}" =~ ^[0-9]+$ ]] || (( SHARD_INDEX < 0 )); then
+    echo "[turbospec-array] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${SHARD_INDEX}'." >&2
+    exit 1
+fi
+if (( SHARD_INDEX >= SHARD_COUNT )); then
+    echo "[turbospec-array] INFO: array task ${SHARD_INDEX} is outside SHARD_COUNT=${SHARD_COUNT}; exiting cleanly."
+    exit 0
+fi
+
+LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs/pbs}"
+SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
+TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
+TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
+TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
+SCRATCH="${TMP_WORK_DIR}/shard_${SHARD_INDEX}"
+TMP_OUT="${TMP_OUTPUT_DIR}/spectra_shard_${SHARD_INDEX}.tmp.zarr"
+SHARD_OUT="${SHARD_TEMPLATE//\{shard_index\}/${SHARD_INDEX}}"
+
+mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" "${SCRATCH}"
+
+export TMPDIR="${TMP_SYSTEM_DIR}"
+export TMP="${TMP_SYSTEM_DIR}"
+export TEMP="${TMP_SYSTEM_DIR}"
+
+echo "[turbospec-array] Repo: ${REPO}"
+echo "[turbospec-array] Config: ${CONFIG_PATH}"
+echo "[turbospec-array] Run root: ${RUN_ROOT}"
+echo "[turbospec-array] Log dir: ${LOG_DIR}"
+echo "[turbospec-array] Grid: ${GRID_ZARR}"
+echo "[turbospec-array] Shards: ${SHARDS_DIR}"
+echo "[turbospec-array] Shard count: ${SHARD_COUNT}"
+echo "[turbospec-array] Shard index: ${SHARD_INDEX}"
+echo "[turbospec-array] Output: ${SHARD_OUT}"
+echo "[turbospec-array] Scratch: ${SCRATCH}"
+echo "[turbospec-array] Workers: ${WORKERS}"
+
+"${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
+    --config "${CONFIG_PATH}" \
+    --skip-grid \
+    --synthesis-mode sharded \
+    --shard-index "${SHARD_INDEX}" \
+    --shard-count "${SHARD_COUNT}" \
+    --workers "${WORKERS}" \
+    --scratch "${SCRATCH}" \
+    --output "${TMP_OUT}"
