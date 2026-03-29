@@ -78,7 +78,9 @@ echo "[turbospec] Conda prefix: ${CONDA_PREFIX:-<unset>}"
 
 PROJECT="${PROJECT:-mk27}"
 USER_ID="${USER_ID:-$(whoami)}"
-RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE}"
+DEFAULT_RUN_ROOT="/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE"
+USER_RUN_ROOT="${RUN_ROOT:-}"
+RUN_ROOT="${USER_RUN_ROOT:-${DEFAULT_RUN_ROOT}}"
 REPO="${REPO:-${PBS_O_WORKDIR}}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
 WORKERS_OVERRIDE="${WORKERS:-}"
@@ -126,6 +128,20 @@ def _abs(p):
         return ""
     return p if os.path.isabs(p) else os.path.abspath(os.path.join(cfg_dir, p))
 
+def _infer_run_root(*paths):
+    for path in paths:
+        if not path:
+            continue
+        parent = os.path.dirname(os.path.normpath(path))
+        if os.path.basename(parent) in {"shards", "zarr", "grids"} and os.path.basename(os.path.dirname(parent)) == "outputs":
+            return os.path.dirname(os.path.dirname(parent))
+    return ""
+
+run_root = _abs(outs.get("run_root")) or _infer_run_root(
+    outs.get("spectra_shard_template") and _abs(outs.get("spectra_shard_template")),
+    outs.get("spectra_zarr") and _abs(outs.get("spectra_zarr")),
+    outs.get("grid_zarr") and _abs(outs.get("grid_zarr")),
+)
 grid = _abs(outs.get("grid_zarr"))
 shard_tmpl = _abs(outs.get("spectra_shard_template"))
 merged = _abs(outs.get("spectra_zarr"))
@@ -154,6 +170,7 @@ if rows_per_shard not in (None, ""):
     except Exception:
         rows_per_shard_out = ""
 
+print(run_root)
 print(grid)
 print(shards_dir)
 print(merged)
@@ -163,12 +180,13 @@ print(rows_per_shard_out)
 PY
 )
 mapfile -t _cfg_lines <<< "${CONFIG_OUTPUTS}"
-CFG_GRID_ZARR="${_cfg_lines[0]:-}"
-CFG_SHARDS_DIR="${_cfg_lines[1]:-}"
-CFG_MERGED_ZARR="${_cfg_lines[2]:-}"
-CFG_WORKERS="${_cfg_lines[3]:-}"
-CFG_SHARD_COUNT="${_cfg_lines[4]:-}"
-CFG_ROWS_PER_SHARD="${_cfg_lines[5]:-}"
+CFG_RUN_ROOT="${_cfg_lines[0]:-}"
+CFG_GRID_ZARR="${_cfg_lines[1]:-}"
+CFG_SHARDS_DIR="${_cfg_lines[2]:-}"
+CFG_MERGED_ZARR="${_cfg_lines[3]:-}"
+CFG_WORKERS="${_cfg_lines[4]:-}"
+CFG_SHARD_COUNT="${_cfg_lines[5]:-}"
+CFG_ROWS_PER_SHARD="${_cfg_lines[6]:-}"
 
 WORKERS="${WORKERS_OVERRIDE:-${CFG_WORKERS:-16}}"
 if ! [[ "${WORKERS}" =~ ^[0-9]+$ ]] || (( WORKERS < 1 )); then
@@ -190,6 +208,10 @@ MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-128}"
 if ! [[ "${MERGE_CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( MERGE_CHUNK_ROWS < 1 )); then
     echo "[turbospec] WARN: invalid MERGE_CHUNK_ROWS='${MERGE_CHUNK_ROWS}', defaulting to 128." >&2
     MERGE_CHUNK_ROWS=128
+fi
+
+if [[ -z "${USER_RUN_ROOT}" && -n "${CFG_RUN_ROOT}" ]]; then
+    RUN_ROOT="${CFG_RUN_ROOT}"
 fi
 
 GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR:-${RUN_ROOT}/grid/parameter_grid.zarr}}"
@@ -225,9 +247,11 @@ export TEMP="${TMP_SYSTEM_DIR}"
 
 echo "[turbospec] Repo: ${REPO}"
 echo "[turbospec] Config: ${CONFIG_PATH}"
+echo "[turbospec] Run root: ${RUN_ROOT}"
 echo "[turbospec] Grid: ${GRID_ZARR}"
 echo "[turbospec] Shards: ${SHARDS_DIR}"
 echo "[turbospec] Merged: ${MERGED_ZARR}"
+echo "[turbospec] Log dir: ${LOG_DIR}"
 echo "[turbospec] Scratch tmp root: ${SCRATCH_TMP_ROOT}"
 echo "[turbospec] Workers: ${WORKERS}"
 echo "[turbospec] Validate workers: ${VALIDATE_WORKERS}"
@@ -568,16 +592,27 @@ export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE SHARD_COUNT LO
 ############################################
 
 if (( PENDING_COUNT > 0 )); then
-    echo "Launching ${WORKERS} workers for ${PENDING_COUNT} pending shard IDs..."
-    for ((i=0; i<WORKERS; i++)); do
-        worker &
-    done
-    wait
+    MIN_REQUIRED_SECONDS=$((EST_RUNTIME + SAFETY_BUFFER))
+    REMAINING_AT_LAUNCH="$(time_left)"
+    if (( REMAINING_AT_LAUNCH < MIN_REQUIRED_SECONDS )); then
+        echo "[turbospec] WARN: only ${REMAINING_AT_LAUNCH}s remain before walltime, but the worker guard requires at least ${MIN_REQUIRED_SECONDS}s (EST_RUNTIME=${EST_RUNTIME}s + SAFETY_BUFFER=${SAFETY_BUFFER}s). No shard attempts will be started in this job."
+        echo "[turbospec] WARN: rerun with more walltime or lower SAFETY_BUFFER/EST_RUNTIME if that is safe for your workload."
+    else
+        echo "Launching ${WORKERS} workers for ${PENDING_COUNT} pending shard IDs..."
+        for ((i=0; i<WORKERS; i++)); do
+            worker &
+        done
+        wait
+    fi
 else
     echo "[turbospec] No pending shard IDs detected; moving directly to validation/merge."
 fi
 
 CURRENT=$(cat "${NEXT_WORK_ITEM}")
+
+if (( PENDING_COUNT > 0 && CURRENT == 0 )); then
+    echo "[turbospec] NOTICE: no shard IDs were assigned in this job. If no per-shard logs were written, the walltime guard likely prevented the first shard attempt."
+fi
 
 if (( CURRENT < PENDING_COUNT )); then
     echo "[turbospec] NOTICE: walltime ended before all pending shard IDs were assigned (${CURRENT}/${PENDING_COUNT})."
@@ -617,6 +652,9 @@ if (( SHARD_STORE_COUNT == 0 )); then
     FIRST_SHARD_LOG=""
     if compgen -G "${LOG_DIR}/shard_*.log" > /dev/null; then
         FIRST_SHARD_LOG="$(printf '%s\n' "${LOG_DIR}"/shard_*.log | sort | head -n 1)"
+    fi
+    if [[ -z "${FIRST_SHARD_LOG}" ]]; then
+        echo "[turbospec] ERROR: no per-shard logs were written under ${LOG_DIR}. This usually means the job never reached a shard attempt, often because the walltime guard stopped workers before launch." >&2
     fi
     if [[ -n "${FIRST_SHARD_LOG}" && -f "${FIRST_SHARD_LOG}" ]]; then
         echo "[turbospec] ERROR: first shard log excerpt (${FIRST_SHARD_LOG}):" >&2
