@@ -2,6 +2,7 @@
 #PBS -P mk27
 #PBS -q rsaa
 #PBS -N turbospec-array
+#PBS -r y
 #PBS -l ncpus=32
 #PBS -l mem=64GB
 #PBS -l jobfs=100GB
