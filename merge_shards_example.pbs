@@ -9,7 +9,7 @@
 #PBS -j oe
 #PBS -M maja.jablonska@anu.edu.au
 #PBS -m bae
-#PBS -l storage=scratch/mk27+scratch/y89
+#PBS -l storage=scratch/mk27+gdata/y89
 
 set -euo pipefail
 cd "${PBS_O_WORKDIR}"
