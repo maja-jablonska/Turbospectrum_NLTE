@@ -1120,6 +1120,10 @@ def get_synthesis_output_stem_from_params(
     if mode_text:
         extras.append(f"mode{_filename_token(mode_text.lower())}")
 
+    target_mu = params.get("mu")
+    if target_mu not in (None, ""):
+        extras.append(f"mu{_filename_token(f'{float(target_mu):.6g}')}")
+
     if not extras:
         return base_stem
     return "_".join([base_stem, *extras])
