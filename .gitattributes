@@ -24,3 +24,5 @@
 /COM/linelists/nlte_linelist_test.txt filter=lfs diff=lfs merge=lfs -text
 /COM/syntspec/p5777_g+4.4_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod_6400.-6800._xit1.0-LTE-intens.spec_benchmark filter=lfs diff=lfs merge=lfs -text
 /vald-3800-4200.list filter=lfs diff=lfs merge=lfs -text
+/DATA/ATOM/atom.fe607a filter=lfs diff=lfs merge=lfs -text
+/DATA/DEP/auxData_Fe_MARCS_May-07-2021.dat filter=lfs diff=lfs merge=lfs -text

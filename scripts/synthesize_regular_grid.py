@@ -523,6 +523,10 @@ def main() -> None:
 
     workers_raw = _coalesce(args.workers, cfg, ("runtime", "workers"), None)
     workers = int(workers_raw) if workers_raw not in (None, "") else None
+    shard_count_raw = _cfg_get(cfg, ("runtime", "shard_count"), None)
+    shard_count = int(shard_count_raw) if shard_count_raw not in (None, "") else None
+    rows_per_shard_raw = _cfg_get(cfg, ("runtime", "rows_per_shard"), None)
+    rows_per_shard = int(rows_per_shard_raw) if rows_per_shard_raw not in (None, "") else None
     chunk_rows = int(_coalesce(args.chunk_rows, cfg, ("runtime", "chunk_rows"), 32))
     scratch_default_base = os.environ.get("TMPDIR") or os.path.join(run_root, "tmp")
     scratch_default = os.path.join(scratch_default_base, "synthesis")
@@ -593,6 +597,8 @@ def main() -> None:
         "scratch": scratch,
         "output_tmp": output_tmp,
         "workers": workers,
+        "shard_count": shard_count,
+        "rows_per_shard": rows_per_shard,
         "chunk_rows": chunk_rows,
         "log_level": log_level,
         "log_file": log_file,
