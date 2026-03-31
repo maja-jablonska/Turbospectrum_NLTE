@@ -634,16 +634,17 @@ START_TIME=$(date +%s)
 SAFETY_BUFFER="${SAFETY_BUFFER:-900}"
 EST_RUNTIME="${EST_RUNTIME:-600}"
 SHARD_RETRY_ATTEMPTS="${SHARD_RETRY_ATTEMPTS:-3}"
-SINGLE_JOB_SHARD_WORKERS="${SINGLE_JOB_SHARD_WORKERS:-1}"
-if ! [[ "${SINGLE_JOB_SHARD_WORKERS}" =~ ^[0-9]+$ ]] || (( SINGLE_JOB_SHARD_WORKERS < 1 )); then
-    echo "[regular-grid] WARN: invalid SINGLE_JOB_SHARD_WORKERS='${SINGLE_JOB_SHARD_WORKERS}', defaulting to 1." >&2
-    SINGLE_JOB_SHARD_WORKERS=1
+SINGLE_JOB_SHARD_WORKERS_OVERRIDE="${SINGLE_JOB_SHARD_WORKERS:-}"
+if [[ -n "${SINGLE_JOB_SHARD_WORKERS_OVERRIDE}" ]] && { ! [[ "${SINGLE_JOB_SHARD_WORKERS_OVERRIDE}" =~ ^[0-9]+$ ]] || (( SINGLE_JOB_SHARD_WORKERS_OVERRIDE < 1 )); }; then
+    echo "[regular-grid] WARN: invalid SINGLE_JOB_SHARD_WORKERS='${SINGLE_JOB_SHARD_WORKERS_OVERRIDE}', ignoring override." >&2
+    SINGLE_JOB_SHARD_WORKERS_OVERRIDE=""
 fi
 ARRAY_SHARD_WORKERS="${ARRAY_SHARD_WORKERS:-${WORKERS}}"
 if ! [[ "${ARRAY_SHARD_WORKERS}" =~ ^[0-9]+$ ]] || (( ARRAY_SHARD_WORKERS < 1 )); then
     echo "[regular-grid] WARN: invalid ARRAY_SHARD_WORKERS='${ARRAY_SHARD_WORKERS}', defaulting to WORKERS=${WORKERS}." >&2
     ARRAY_SHARD_WORKERS="${WORKERS}"
 fi
+SINGLE_JOB_SHARD_WORKERS_EFFECTIVE=1
 
 time_left () {
     echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
@@ -728,14 +729,15 @@ worker() {
             break
         fi
 
-        if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15 "${SINGLE_JOB_SHARD_WORKERS}"; then
+        if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15 "${SINGLE_JOB_SHARD_WORKERS_EFFECTIVE}"; then
             echo "Shard ${shard} failed after ${SHARD_RETRY_ATTEMPTS} attempts in main loop." >> "${LOG_DIR}/shard_${shard}.log"
         fi
     done
 }
 
 export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO PYTHON \
-       GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SHARD_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE
+       GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SHARD_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE \
+       SINGLE_JOB_SHARD_WORKERS_EFFECTIVE
 
 ############################################
 # Launch workers / array shard
@@ -769,8 +771,24 @@ elif (( PENDING_COUNT > 0 )); then
         echo "[regular-grid] WARN: only ${REMAINING_AT_LAUNCH}s remain before walltime, but the worker guard requires at least ${MIN_REQUIRED_SECONDS}s (EST_RUNTIME=${EST_RUNTIME}s + SAFETY_BUFFER=${SAFETY_BUFFER}s). No shard attempts will be started in this job."
         echo "[regular-grid] WARN: rerun with more walltime or lower SAFETY_BUFFER/EST_RUNTIME if that is safe for your workload."
     else
-        echo "[regular-grid] Launching ${WORKERS} outer workers for ${PENDING_COUNT} pending shards (${SINGLE_JOB_SHARD_WORKERS} synthesis worker(s) per shard subprocess)..."
-        for ((i=0; i<WORKERS; i++)); do
+        ACTIVE_OUTER_WORKERS="${WORKERS}"
+        if (( PENDING_COUNT < ACTIVE_OUTER_WORKERS )); then
+            ACTIVE_OUTER_WORKERS="${PENDING_COUNT}"
+        fi
+        SINGLE_JOB_SHARD_WORKERS_EFFECTIVE="${SINGLE_JOB_SHARD_WORKERS_OVERRIDE}"
+        if [[ -z "${SINGLE_JOB_SHARD_WORKERS_EFFECTIVE}" ]]; then
+            if (( ACTIVE_OUTER_WORKERS > 0 )); then
+                SINGLE_JOB_SHARD_WORKERS_EFFECTIVE=$(( WORKERS / ACTIVE_OUTER_WORKERS ))
+            else
+                SINGLE_JOB_SHARD_WORKERS_EFFECTIVE=1
+            fi
+            if (( SINGLE_JOB_SHARD_WORKERS_EFFECTIVE < 1 )); then
+                SINGLE_JOB_SHARD_WORKERS_EFFECTIVE=1
+            fi
+        fi
+        export SINGLE_JOB_SHARD_WORKERS_EFFECTIVE
+        echo "[regular-grid] Launching ${ACTIVE_OUTER_WORKERS} outer workers for ${PENDING_COUNT} pending shards (${SINGLE_JOB_SHARD_WORKERS_EFFECTIVE} synthesis worker(s) per shard subprocess)..."
+        for ((i=0; i<ACTIVE_OUTER_WORKERS; i++)); do
             worker &
         done
         wait
