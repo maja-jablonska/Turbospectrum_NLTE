@@ -11,6 +11,11 @@
 #PBS -m bae
 #PBS -l storage=scratch/mk27+scratch/y89
 
+# Usage examples:
+#   qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json turbospectrum_regular_grid_example.pbs
+#   qsub -J 0-511 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_regular_grid_example.pbs
+#   qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,FINALIZE_ONLY=1 turbospectrum_regular_grid_example.pbs
+
 set -euo pipefail
 cd "${PBS_O_WORKDIR}"
 
@@ -87,11 +92,15 @@ RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE_regular}
 REPO="${REPO:-${PBS_O_WORKDIR}}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_regular_grid.example.json}"
 WORKERS_OVERRIDE="${WORKERS:-}"
+SHARD_COUNT_OVERRIDE="${SHARD_COUNT:-}"
+ROWS_PER_SHARD_OVERRIDE="${ROWS_PER_SHARD:-}"
 SKIP_SYNTHESIS_OVERRIDE="${SKIP_SYNTHESIS:-}"
+FINALIZE_ONLY="${FINALIZE_ONLY:-0}"
 FORCE_RESTART="${FORCE_RESTART:-0}"
 ALLOW_PARTIAL_MERGE="${ALLOW_PARTIAL_MERGE:-1}"
 ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
 SKIP_BAD_SHARDS="${SKIP_BAD_SHARDS:-1}"
+AUTO_PRUNE_STALE_SHARDS="${AUTO_PRUNE_STALE_SHARDS:-1}"
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
@@ -145,6 +154,8 @@ fields = [
     "scratch",
     "output_tmp",
     "workers",
+    "shard_count",
+    "rows_per_shard",
     "chunk_rows",
     "log_level",
     "log_file",
@@ -168,10 +179,12 @@ CFG_SYNTH_CONFIG="${_runtime_lines[5]:-}"
 CFG_SCRATCH="${_runtime_lines[6]:-}"
 CFG_OUTPUT_TMP="${_runtime_lines[7]:-}"
 CFG_WORKERS="${_runtime_lines[8]:-}"
-CFG_CHUNK_ROWS="${_runtime_lines[9]:-32}"
-CFG_LOG_LEVEL="${_runtime_lines[10]:-INFO}"
-CFG_LOG_FILE="${_runtime_lines[11]:-}"
-CFG_SKIP_SYNTHESIS="${_runtime_lines[12]:-False}"
+CFG_SHARD_COUNT="${_runtime_lines[9]:-}"
+CFG_ROWS_PER_SHARD="${_runtime_lines[10]:-}"
+CFG_CHUNK_ROWS="${_runtime_lines[11]:-32}"
+CFG_LOG_LEVEL="${_runtime_lines[12]:-INFO}"
+CFG_LOG_FILE="${_runtime_lines[13]:-}"
+CFG_SKIP_SYNTHESIS="${_runtime_lines[14]:-False}"
 
 if [[ -n "${CFG_RUN_ROOT}" ]]; then
     RUN_ROOT="${CFG_RUN_ROOT}"
@@ -221,6 +234,21 @@ NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
 LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
 SYNTH_LOG_LEVEL="${SYNTH_LOG_LEVEL:-${CFG_LOG_LEVEL:-INFO}}"
 SYNTH_LOG_FILE="${SYNTH_LOG_FILE:-${CFG_LOG_FILE:-${LOG_DIR}/regular_grid_synthesis.log}}"
+ROWS_PER_SHARD="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
+ARRAY_TASK_MODE=0
+if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
+    ARRAY_TASK_MODE=1
+fi
+FINALIZE_ONLY_EFFECTIVE="$(to_bool01 "${FINALIZE_ONLY}")"
+FORCE_RESTART_EFFECTIVE="$(to_bool01 "${FORCE_RESTART}")"
+JOB_ID_BASE="${PBS_JOBID:-manual}"
+JOB_ID_BASE="${JOB_ID_BASE%%[*}"
+ARRAY_PREP_MARKER="${RUN_ROOT}/.regular_grid_array_prepare_${JOB_ID_BASE}.done"
+ARRAY_PREP_TIMEOUT="${ARRAY_PREP_TIMEOUT:-3600}"
+if ! [[ "${ARRAY_PREP_TIMEOUT}" =~ ^[0-9]+$ ]] || (( ARRAY_PREP_TIMEOUT < 1 )); then
+    echo "[regular-grid] WARN: invalid ARRAY_PREP_TIMEOUT='${ARRAY_PREP_TIMEOUT}', defaulting to 3600." >&2
+    ARRAY_PREP_TIMEOUT=3600
+fi
 
 mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${MERGED_ZARR}")" \
          "$(dirname "${NEXT_WORK_ITEM}")" "$(dirname "${LOCK_FILE}")" \
@@ -286,6 +314,20 @@ render_shard_path() {
     printf '%s\n' "${SHARD_TEMPLATE//\{shard_index\}/${shard}}"
 }
 
+wait_for_array_prepare() {
+    local waited=0
+    while (( waited < ARRAY_PREP_TIMEOUT )); do
+        if [[ -f "${ARRAY_PREP_MARKER}" ]] && is_valid_grid_zarr "${GRID_ZARR}"; then
+            return 0
+        fi
+        sleep 15
+        waited=$((waited + 15))
+    done
+
+    echo "[regular-grid] ERROR: timed out after ${ARRAY_PREP_TIMEOUT}s waiting for array preparation marker ${ARRAY_PREP_MARKER}." >&2
+    return 1
+}
+
 write_missing_shards_file() {
     "${PYTHON}" - <<PY
 import os
@@ -296,7 +338,8 @@ import numpy as np
 import zarr
 
 shard_dir = Path(r"${SHARDS_DIR}")
-expected = int(r"${ROW_COUNT}")
+expected_shards = int(r"${SHARD_COUNT}")
+row_count = int(r"${ROW_COUNT}")
 out_path = Path(r"${MISSING_FILE}")
 out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -308,38 +351,194 @@ for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
     if match is None:
         continue
     shard_idx = int(match.group(1))
-    if shard_idx < 0 or shard_idx >= expected:
+    if shard_idx < 0 or shard_idx >= expected_shards:
         continue
     try:
         root = zarr.open_group(str(shard_path), mode="r")
-        for key in ("global_index", "flux", "status", "message"):
+        for key in ("wavelength", "global_index", "flux", "status", "message"):
             if key not in root:
                 raise KeyError(key)
+        expected_indices = np.arange(shard_idx, row_count, expected_shards, dtype=np.int64)
         gidx = np.asarray(root["global_index"][:], dtype=np.int64)
-        if gidx.shape != (1,) or int(gidx[0]) != shard_idx:
+        if gidx.shape != expected_indices.shape or not np.array_equal(gidx, expected_indices):
             continue
         statuses = [str(x).strip().lower() for x in np.asarray(root["status"][:]).tolist()]
-        if len(statuses) != 1 or statuses[0] not in {"success", "skipped"}:
+        if len(statuses) != expected_indices.size or any(status not in {"success", "skipped"} for status in statuses):
             continue
         flux = np.asarray(root["flux"][:], dtype=np.float32)
-        if flux.shape[0] != 1 or not np.all(np.isfinite(flux)):
+        if flux.shape[0] != expected_indices.size:
+            continue
+        if flux.size and not np.all(np.isfinite(flux)):
             continue
         if "continuum" in root:
             continuum = np.asarray(root["continuum"][:], dtype=np.float32)
-            if continuum.shape != flux.shape or not np.any(np.isfinite(continuum[0])):
+            if continuum.shape != flux.shape:
+                continue
+            if continuum.size and not np.all(np.isfinite(continuum)):
                 continue
         seen.add(shard_idx)
     except Exception:
         continue
 
-missing = sorted(set(range(expected)) - seen)
+missing = sorted(set(range(expected_shards)) - seen)
 text = "\n".join(str(x) for x in missing)
 out_path.write_text(f"{text}\n" if text else "", encoding="utf-8")
 print(
-    f"[regular-grid missing] expected={expected} seen={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('spectra_shard_*.zarr')))}"
+    f"[regular-grid missing] expected_shards={expected_shards} seen={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('spectra_shard_*.zarr')))}"
 )
 PY
 }
+
+prune_incompatible_shards() {
+    "${PYTHON}" - <<PY
+import re
+import shutil
+from pathlib import Path
+
+import numpy as np
+import zarr
+
+shard_dir = Path(r"${SHARDS_DIR}")
+expected_shards = int(r"${SHARD_COUNT}")
+row_count = int(r"${ROW_COUNT}")
+pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
+removed: list[str] = []
+
+for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
+    match = pattern.match(shard_path.name)
+    if match is None:
+        continue
+    shard_idx = int(match.group(1))
+    remove_reason = None
+    if shard_idx < 0 or shard_idx >= expected_shards:
+        remove_reason = "outside_expected_range"
+    else:
+        try:
+            root = zarr.open_group(str(shard_path), mode="r")
+            expected_indices = np.arange(shard_idx, row_count, expected_shards, dtype=np.int64)
+            gidx = np.asarray(root["global_index"][:], dtype=np.int64)
+            if gidx.shape != expected_indices.shape or not np.array_equal(gidx, expected_indices):
+                remove_reason = "layout_mismatch"
+        except Exception:
+            remove_reason = "unreadable_or_missing_global_index"
+    if remove_reason is not None:
+        shutil.rmtree(shard_path, ignore_errors=True)
+        removed.append(f"{shard_path.name}:{remove_reason}")
+
+preview = removed[:10]
+suffix = " (truncated)" if len(removed) > 10 else ""
+print(f"[regular-grid prune] removed={len(removed)} preview={preview}{suffix}")
+PY
+}
+
+############################################
+# Grid generation / shard layout
+############################################
+
+generate_grid_if_needed() {
+    if [[ ! -d "${GRID_ZARR}" ]]; then
+        echo "[regular-grid] Grid not found; generating regular grid."
+        GRID_CMD=(
+            "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
+            --config-json "${CONFIG_PATH}"
+            --skip-synthesis
+        )
+        if [[ -n "${WORKERS_OVERRIDE}" ]]; then
+            GRID_CMD+=(--workers "${WORKERS_OVERRIDE}")
+        fi
+        "${GRID_CMD[@]}"
+    else
+        echo "[regular-grid] Using existing grid: ${GRID_ZARR}"
+    fi
+}
+
+clear_restart_outputs() {
+    echo "[regular-grid] Force restart requested; clearing previous shard outputs."
+    find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
+    rm -f "${PENDING_SHARDS_FILE}" "${MISSING_FILE}" "${NEXT_WORK_ITEM}" "${ARRAY_PREP_MARKER}"
+    if [[ -d "${MERGED_ZARR}" ]]; then
+        rm -rf "${MERGED_ZARR}"
+    fi
+}
+
+if (( ARRAY_TASK_MODE == 1 )) && [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
+    echo "[regular-grid] ERROR: FINALIZE_ONLY=1 should be submitted as a normal job, not as a PBS array task." >&2
+    exit 1
+fi
+
+if (( ARRAY_TASK_MODE == 1 )); then
+    if ! [[ "${PBS_ARRAY_INDEX}" =~ ^[0-9]+$ ]]; then
+        echo "[regular-grid] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${PBS_ARRAY_INDEX:-}'." >&2
+        exit 1
+    fi
+    if (( PBS_ARRAY_INDEX == 0 )); then
+        rm -f "${ARRAY_PREP_MARKER}"
+        if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" && -d "${GRID_ZARR}" ]]; then
+            echo "[regular-grid] Force restart requested; removing existing grid: ${GRID_ZARR}"
+            rm -rf "${GRID_ZARR}"
+        fi
+        if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
+            clear_restart_outputs
+        fi
+        generate_grid_if_needed
+        printf 'ready\n' > "${ARRAY_PREP_MARKER}"
+    else
+        echo "[regular-grid] Array task ${PBS_ARRAY_INDEX} waiting for task 0 to prepare grid/shards..."
+        wait_for_array_prepare
+    fi
+else
+    if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" && -d "${GRID_ZARR}" ]]; then
+        echo "[regular-grid] Force restart requested; removing existing grid: ${GRID_ZARR}"
+        rm -rf "${GRID_ZARR}"
+    fi
+    generate_grid_if_needed
+    if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
+        clear_restart_outputs
+    fi
+fi
+
+if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+    echo "[regular-grid] ERROR: grid output is missing or invalid: ${GRID_ZARR}" >&2
+    exit 1
+fi
+
+ROW_COUNT="$(grid_row_count)"
+echo "[regular-grid] Grid rows: ${ROW_COUNT}"
+
+if [[ -n "${ROWS_PER_SHARD}" ]]; then
+    if ! [[ "${ROWS_PER_SHARD}" =~ ^[0-9]+$ ]] || (( ROWS_PER_SHARD < 1 )); then
+        echo "[regular-grid] ERROR: ROWS_PER_SHARD must be a positive integer, got '${ROWS_PER_SHARD}'." >&2
+        exit 1
+    fi
+fi
+
+SHARD_COUNT="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
+if [[ -n "${ROWS_PER_SHARD}" && -z "${SHARD_COUNT_OVERRIDE}" && -z "${CFG_SHARD_COUNT}" ]]; then
+    SHARD_COUNT=$(( (ROW_COUNT + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
+fi
+if [[ -z "${SHARD_COUNT}" ]]; then
+    SHARD_COUNT="${ROW_COUNT}"
+fi
+if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
+    echo "[regular-grid] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
+    exit 1
+fi
+
+EST_ROWS_PER_SHARD=0
+if (( SHARD_COUNT > 0 )); then
+    EST_ROWS_PER_SHARD=$(( (ROW_COUNT + SHARD_COUNT - 1) / SHARD_COUNT ))
+fi
+
+SHARD_INDEX="${PBS_ARRAY_INDEX:-}"
+if (( ARRAY_TASK_MODE == 1 )) && (( SHARD_INDEX >= SHARD_COUNT )); then
+    echo "[regular-grid] INFO: array task ${SHARD_INDEX} is outside SHARD_COUNT=${SHARD_COUNT}; exiting cleanly."
+    exit 0
+fi
+
+ARRAY_SHARD_ROWS=0
+if (( ARRAY_TASK_MODE == 1 )) && (( SHARD_INDEX < ROW_COUNT )); then
+    ARRAY_SHARD_ROWS=$(( (ROW_COUNT - SHARD_INDEX + SHARD_COUNT - 1) / SHARD_COUNT ))
+fi
 
 ############################################
 # Logging
@@ -358,42 +557,16 @@ echo "[regular-grid] Synthesis scratch root: ${SYNTH_SCRATCH}"
 echo "[regular-grid] Workers: ${WORKERS}"
 echo "[regular-grid] Validate workers: ${VALIDATE_WORKERS}"
 echo "[regular-grid] Merge chunk rows: ${MERGE_CHUNK_ROWS}"
+echo "[regular-grid] Shard count: ${SHARD_COUNT}"
+echo "[regular-grid] Rows per shard target: ${ROWS_PER_SHARD:-<one-row shards unless SHARD_COUNT set>}"
+echo "[regular-grid] Estimated rows per shard: ${EST_ROWS_PER_SHARD}"
+echo "[regular-grid] Array mode: ${ARRAY_TASK_MODE}"
+echo "[regular-grid] Finalize only: ${FINALIZE_ONLY_EFFECTIVE}"
+echo "[regular-grid] Array index: ${PBS_ARRAY_INDEX:-<none>}"
 echo "[regular-grid] Skip synthesis: ${SKIP_SYNTHESIS_EFFECTIVE}"
-echo "[regular-grid] Force restart: $(to_bool01 "${FORCE_RESTART}")"
+echo "[regular-grid] Force restart: ${FORCE_RESTART_EFFECTIVE}"
 echo "[regular-grid] Missing shard report: ${MISSING_FILE}"
 echo "[regular-grid] Run policy: preserve valid shards and resume missing ones."
-
-############################################
-# Grid generation
-############################################
-
-if [[ "$(to_bool01 "${FORCE_RESTART}")" == "1" && -d "${GRID_ZARR}" ]]; then
-    echo "[regular-grid] Force restart requested; removing existing grid: ${GRID_ZARR}"
-    rm -rf "${GRID_ZARR}"
-fi
-
-if [[ ! -d "${GRID_ZARR}" ]]; then
-    echo "[regular-grid] Grid not found; generating regular grid."
-    GRID_CMD=(
-        "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
-        --config-json "${CONFIG_PATH}"
-        --skip-synthesis
-    )
-    if [[ -n "${WORKERS_OVERRIDE}" ]]; then
-        GRID_CMD+=(--workers "${WORKERS_OVERRIDE}")
-    fi
-    "${GRID_CMD[@]}"
-else
-    echo "[regular-grid] Using existing grid: ${GRID_ZARR}"
-fi
-
-if ! is_valid_grid_zarr "${GRID_ZARR}"; then
-    echo "[regular-grid] ERROR: grid output is missing or invalid: ${GRID_ZARR}" >&2
-    exit 1
-fi
-
-ROW_COUNT="$(grid_row_count)"
-echo "Grid rows: ${ROW_COUNT}"
 
 if [[ "${SKIP_SYNTHESIS_EFFECTIVE}" == "1" ]]; then
     echo "[regular-grid] Completed grid generation only."
@@ -404,26 +577,25 @@ fi
 # Fresh run / resume setup
 ############################################
 
-if [[ "$(to_bool01 "${FORCE_RESTART}")" == "1" ]]; then
-    echo "[regular-grid] Force restart requested; clearing previous shard outputs."
-    find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
-    rm -f "${PENDING_SHARDS_FILE}" "${MISSING_FILE}" "${NEXT_WORK_ITEM}"
-    if [[ -d "${MERGED_ZARR}" ]]; then
-        rm -rf "${MERGED_ZARR}"
+if (( ARRAY_TASK_MODE == 0 || FINALIZE_ONLY_EFFECTIVE == 1 )); then
+    if [[ "$(to_bool01 "${AUTO_PRUNE_STALE_SHARDS}")" == "1" ]]; then
+        prune_incompatible_shards
     fi
-fi
+    write_missing_shards_file
+    cp "${MISSING_FILE}" "${PENDING_SHARDS_FILE}"
+    PENDING_COUNT="$(wc -l < "${PENDING_SHARDS_FILE}" | tr -d '[:space:]')"
+    echo 0 > "${NEXT_WORK_ITEM}"
 
-write_missing_shards_file
-cp "${MISSING_FILE}" "${PENDING_SHARDS_FILE}"
-PENDING_COUNT="$(wc -l < "${PENDING_SHARDS_FILE}" | tr -d '[:space:]')"
-echo 0 > "${NEXT_WORK_ITEM}"
+    COMPLETED_COUNT=$((SHARD_COUNT - PENDING_COUNT))
+    echo "[regular-grid] Existing valid shards: ${COMPLETED_COUNT}/${SHARD_COUNT}"
 
-COMPLETED_COUNT=$((ROW_COUNT - PENDING_COUNT))
-echo "[regular-grid] Existing valid shard rows: ${COMPLETED_COUNT}/${ROW_COUNT}"
-
-if (( PENDING_COUNT == 0 )) && is_valid_merged_zarr "${MERGED_ZARR}"; then
-    echo "[regular-grid] All shard rows already present and merged output is valid; skipping work."
-    exit 0
+    if (( PENDING_COUNT == 0 )) && is_valid_merged_zarr "${MERGED_ZARR}"; then
+        echo "[regular-grid] All shards are already present and merged output is valid; skipping work."
+        exit 0
+    fi
+else
+    PENDING_COUNT=0
+    echo "[regular-grid] Array task ${SHARD_INDEX}/${SHARD_COUNT} assigned approximately ${ARRAY_SHARD_ROWS} grid rows."
 fi
 
 ############################################
@@ -462,6 +634,16 @@ START_TIME=$(date +%s)
 SAFETY_BUFFER="${SAFETY_BUFFER:-900}"
 EST_RUNTIME="${EST_RUNTIME:-600}"
 SHARD_RETRY_ATTEMPTS="${SHARD_RETRY_ATTEMPTS:-3}"
+SINGLE_JOB_SHARD_WORKERS="${SINGLE_JOB_SHARD_WORKERS:-1}"
+if ! [[ "${SINGLE_JOB_SHARD_WORKERS}" =~ ^[0-9]+$ ]] || (( SINGLE_JOB_SHARD_WORKERS < 1 )); then
+    echo "[regular-grid] WARN: invalid SINGLE_JOB_SHARD_WORKERS='${SINGLE_JOB_SHARD_WORKERS}', defaulting to 1." >&2
+    SINGLE_JOB_SHARD_WORKERS=1
+fi
+ARRAY_SHARD_WORKERS="${ARRAY_SHARD_WORKERS:-${WORKERS}}"
+if ! [[ "${ARRAY_SHARD_WORKERS}" =~ ^[0-9]+$ ]] || (( ARRAY_SHARD_WORKERS < 1 )); then
+    echo "[regular-grid] WARN: invalid ARRAY_SHARD_WORKERS='${ARRAY_SHARD_WORKERS}', defaulting to WORKERS=${WORKERS}." >&2
+    ARRAY_SHARD_WORKERS="${WORKERS}"
+fi
 
 time_left () {
     echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
@@ -473,6 +655,7 @@ run_shard_attempts () {
     local scratch_root="$3"
     local log_file="$4"
     local sleep_base="$5"
+    local worker_count="$6"
 
     local shard_out tmp_out
     shard_out="$(render_shard_path "${shard}")"
@@ -490,13 +673,13 @@ run_shard_attempts () {
             --output-zarr "${shard_out}" \
             --output-tmp "${tmp_out}" \
             --shard-index "${shard}" \
-            --shard-count "${ROW_COUNT}" \
-            --workers 1 \
+            --shard-count "${SHARD_COUNT}" \
+            --workers "${worker_count}" \
             --scratch "${attempt_scratch}" \
             --log-level "${SYNTH_LOG_LEVEL}" \
             >> "${log_file}" 2>&1; then
             end=$(date +%s)
-            echo "runtime_seconds=$((end-start)) attempt=${attempt}" >> "${log_file}"
+            echo "runtime_seconds=$((end-start)) attempt=${attempt} workers=${worker_count}" >> "${log_file}"
             return 0
         fi
 
@@ -545,39 +728,60 @@ worker() {
             break
         fi
 
-        if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15; then
+        if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15 "${SINGLE_JOB_SHARD_WORKERS}"; then
             echo "Shard ${shard} failed after ${SHARD_RETRY_ATTEMPTS} attempts in main loop." >> "${LOG_DIR}/shard_${shard}.log"
         fi
     done
 }
 
 export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO PYTHON \
-       GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE
+       GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SHARD_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE
 
 ############################################
-# Launch workers
+# Launch workers / array shard
 ############################################
 
-if (( PENDING_COUNT > 0 )); then
-    MIN_REQUIRED_SECONDS=$((EST_RUNTIME + SAFETY_BUFFER))
-    REMAINING_AT_LAUNCH="$(time_left)"
+MIN_REQUIRED_SECONDS=$((EST_RUNTIME + SAFETY_BUFFER))
+REMAINING_AT_LAUNCH="$(time_left)"
+
+if (( ARRAY_TASK_MODE == 1 )); then
+    if (( REMAINING_AT_LAUNCH < MIN_REQUIRED_SECONDS )); then
+        echo "[regular-grid] WARN: only ${REMAINING_AT_LAUNCH}s remain before walltime, but the worker guard requires at least ${MIN_REQUIRED_SECONDS}s (EST_RUNTIME=${EST_RUNTIME}s + SAFETY_BUFFER=${SAFETY_BUFFER}s). No shard attempt will be started in this array task."
+        echo "[regular-grid] WARN: rerun with more walltime or lower SAFETY_BUFFER/EST_RUNTIME if that is safe for your workload."
+        exit 0
+    fi
+
+    ARRAY_LOG_FILE="${LOG_DIR}/shard_${SHARD_INDEX}.log"
+    echo "[regular-grid] Array task ${SHARD_INDEX}/${SHARD_COUNT} starting with ${ARRAY_SHARD_WORKERS} synthesis workers across ~${ARRAY_SHARD_ROWS} grid rows."
+    if ! run_shard_attempts "${SHARD_INDEX}" "${SHARD_RETRY_ATTEMPTS}" "${TMP_WORK_DIR}/array_${SHARD_INDEX}" "${ARRAY_LOG_FILE}" 15 "${ARRAY_SHARD_WORKERS}"; then
+        echo "Shard ${SHARD_INDEX} failed after ${SHARD_RETRY_ATTEMPTS} attempts in array mode." >> "${ARRAY_LOG_FILE}"
+        print_log_excerpt "${ARRAY_LOG_FILE}" "Array shard log excerpt"
+        exit 1
+    fi
+    echo "[regular-grid] Array task ${SHARD_INDEX} completed: $(render_shard_path "${SHARD_INDEX}")"
+    exit 0
+fi
+
+if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
+    echo "[regular-grid] FINALIZE_ONLY=1: skipping shard synthesis and moving directly to validation/merge."
+elif (( PENDING_COUNT > 0 )); then
     if (( REMAINING_AT_LAUNCH < MIN_REQUIRED_SECONDS )); then
         echo "[regular-grid] WARN: only ${REMAINING_AT_LAUNCH}s remain before walltime, but the worker guard requires at least ${MIN_REQUIRED_SECONDS}s (EST_RUNTIME=${EST_RUNTIME}s + SAFETY_BUFFER=${SAFETY_BUFFER}s). No shard attempts will be started in this job."
         echo "[regular-grid] WARN: rerun with more walltime or lower SAFETY_BUFFER/EST_RUNTIME if that is safe for your workload."
     else
-        echo "[regular-grid] Launching ${WORKERS} workers for ${PENDING_COUNT} pending shard rows..."
+        echo "[regular-grid] Launching ${WORKERS} outer workers for ${PENDING_COUNT} pending shards (${SINGLE_JOB_SHARD_WORKERS} synthesis worker(s) per shard subprocess)..."
         for ((i=0; i<WORKERS; i++)); do
             worker &
         done
         wait
     fi
 else
-    echo "[regular-grid] No pending shard rows detected; moving directly to validation/merge."
+    echo "[regular-grid] No pending shards detected; moving directly to validation/merge."
 fi
 
 CURRENT="$(cat "${NEXT_WORK_ITEM}")"
-if (( PENDING_COUNT > 0 && CURRENT == 0 )); then
-    echo "[regular-grid] NOTICE: no shard rows were assigned in this job. If no per-shard logs were written, the walltime guard likely prevented the first shard attempt."
+if (( FINALIZE_ONLY_EFFECTIVE == 0 && PENDING_COUNT > 0 && CURRENT == 0 )); then
+    echo "[regular-grid] NOTICE: no shards were assigned in this job. If no per-shard logs were written, the walltime guard likely prevented the first shard attempt."
 fi
 
 write_missing_shards_file
@@ -593,7 +797,7 @@ echo "[regular-grid] Validating shard outputs..."
 VALIDATE_CMD=(
     "${PYTHON}" "${REPO}/scripts/validate_dataset.py"
     --shard-dir "${SHARDS_DIR}"
-    --expected-shards "${ROW_COUNT}"
+    --expected-shards "${SHARD_COUNT}"
     --workers "${VALIDATE_WORKERS}"
 )
 if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
@@ -650,10 +854,10 @@ fi
 
 if (( FINAL_MISSING > 0 )); then
     if [[ "$(to_bool01 "${ALLOW_PARTIAL_MERGE}")" == "1" ]]; then
-        echo "[regular-grid] WARN: missing shard rows detected; enabling partial merge (--allow-missing --skip-nonexistent-shards)."
+        echo "[regular-grid] WARN: missing shards detected; enabling partial merge (--allow-missing --skip-nonexistent-shards)."
         MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
     else
-        echo "[regular-grid] ERROR: ${FINAL_MISSING} shard rows are still missing; merge aborted." >&2
+        echo "[regular-grid] ERROR: ${FINAL_MISSING} shards are still missing; merge aborted." >&2
         exit 1
     fi
 fi

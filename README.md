@@ -320,6 +320,41 @@ Behavior summary:
 - for large grids, set `ROWS_PER_SHARD` or `runtime.rows_per_shard` to reduce per-shard startup overhead
 - use `FORCE_RESTART=1` only when you want to discard prior shard outputs and start again from scratch
 
+## Regular-grid Gadi Synthesis (PBS)
+
+For the regular Cartesian-grid workflow, use:
+
+```bash
+qsub turbospectrum_regular_grid_example.pbs
+```
+
+The regular-grid wrapper now supports the same chunked shard layout idea as `turbospectrum_example_array.pbs`, so you can avoid the inefficient one-row-per-shard pattern.
+
+Single-job chunked run:
+
+```bash
+qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_regular_grid_example.pbs
+```
+
+PBS array synthesis:
+
+```bash
+qsub -J 0-511 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_regular_grid_example.pbs
+```
+
+Finalize/merge after the array completes:
+
+```bash
+qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,FINALIZE_ONLY=1 turbospectrum_regular_grid_example.pbs
+```
+
+Behavior summary:
+- reads `runtime.shard_count` / `runtime.rows_per_shard` from the regular-grid config and falls back to one-row shards only when neither is set
+- in array mode, task `0` prepares the grid once and later tasks wait for it before starting synthesis
+- array tasks beyond the true shard count exit cleanly, so it is safe to submit a slightly oversized `-J` range
+- non-array runs still support resume/merge in one submission, but chunked shards reduce startup overhead and usually improve CPU utilization substantially
+- `FINALIZE_ONLY=1` skips synthesis and just validates/merges the shard directory, which is the intended post-array follow-up step
+
 ## W&B on Gadi/HPC (MLP)
 
 W&B defaults for `wandb_agent.pbs` and `wandb_sync.pbs` are now centralized in:

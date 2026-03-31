@@ -7,10 +7,10 @@
 # atomic number / name / (n)lte / model atom / departure file / binary or ascii departure file
 #
 # path for model atom files     ! don't change this line !
-/Users/mjablons/Documents/Turbospectrum_NLTE/DATA/ATOM
+/g/data/y89/mj8805/DATA/ATOM
 #
 # path for departure files      ! don't change this line !
-/Users/mjablons/Documents/Turbospectrum_NLTE/DATA/DEP
+/g/data/y89/mj8805/DATA/DEP
 #
 # atomic (N)LTE setup
 #1	'H'	'lte'	'atom.h20'	'nlte_dep_h_12000_t5777g44m00_staggerAv3d_job0.dat' 'ascii'
