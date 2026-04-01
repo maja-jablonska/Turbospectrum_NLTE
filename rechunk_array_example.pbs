@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N rechunk_harps
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=16
+#PBS -l mem=16GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=scratch/y89+scratch/dg97+scratch/mk27+gdata/y89
+#PBS -J 0-9
+#PBS -r y
+#PBS -j oe
+#PBS -M maja.jablonska@anu.edu.au
+#PBS -m bae
+
+set -euo pipefail
+
+# -------- REQUIRED --------
+: "${INPUT_ZARR:?Need INPUT_ZARR via -v}"
+: "${OUTPUT_DIR:?Need OUTPUT_DIR via -v}"
+
+# -------- OPTIONAL --------
+CHUNK_ROWS=${CHUNK_ROWS:-1500}
+
+# -------- PYTHON --------
+PYTHON=${PYTHON:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}
+
+# -------- JOB INDEX --------
+JOB_ID=${PBS_ARRAY_INDEX}
+
+START=$(( JOB_ID * CHUNK_ROWS ))
+END=$(( START + CHUNK_ROWS ))
+
+echo "====================================="
+echo "Job $JOB_ID"
+echo "INPUT_ZARR = $INPUT_ZARR"
+echo "OUTPUT_DIR = $OUTPUT_DIR"
+echo "ROWS       = [$START:$END]"
+echo "PYTHON     = $PYTHON"
+echo "====================================="
+
+mkdir -p "$OUTPUT_DIR"
+
+$PYTHON rechunk_worker.py \
+    "$INPUT_ZARR" \
+    "$OUTPUT_DIR" \
+    "$START" \
+    "$END" \
+    "$JOB_ID"
+
+echo "✅ Job $JOB_ID done"
