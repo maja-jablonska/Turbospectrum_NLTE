@@ -1,0 +1,32 @@
+#!/bin/bash
+#PBS -N merge_harps
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -l ncpus=16
+#PBS -l mem=32GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=scratch/y89+scratch/dg97+scratch/mk27+gdata/y89
+#PBS -r y
+#PBS -j oe
+#PBS -M maja.jablonska@anu.edu.au
+#PBS -m bae
+
+set -euo pipefail
+
+# -------- REQUIRED --------
+: "${OUTPUT_DIR:?Need OUTPUT_DIR via -v}"
+: "${FINAL_ZARR:?Need FINAL_ZARR via -v}"
+
+# -------- PYTHON --------
+PYTHON=${PYTHON:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}
+
+echo "====================================="
+echo "Merging shards"
+echo "INPUT DIR  = $OUTPUT_DIR"
+echo "FINAL ZARR = $FINAL_ZARR"
+echo "PYTHON     = $PYTHON"
+echo "====================================="
+
+$PYTHON merge_rechunked.py "$OUTPUT_DIR" "$FINAL_ZARR"
+
+echo "✅ Merge complete"
