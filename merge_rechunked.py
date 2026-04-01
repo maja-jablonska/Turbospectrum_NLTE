@@ -104,11 +104,11 @@ if "parameter_columns" in src:
     pc_src = src["parameter_columns"]
     pc_dst = dst.create_group("parameter_columns")
 
-    for name, arr in pc_src.items():
-        print(f"  → {name}")
+    for k in pc_src.keys():
+        arr = pc_src[k]
 
         out = pc_dst.create_array(
-            name,
+            k,
             shape=(END - START,),
             dtype=arr.dtype,
             chunks=(ONE_D_CHUNK,),
