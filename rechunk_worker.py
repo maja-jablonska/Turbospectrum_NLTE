@@ -3,6 +3,7 @@
 import sys
 import os
 import zarr
+import numpy as np
 
 INPUT = sys.argv[1]
 OUTDIR = sys.argv[2]
@@ -10,15 +11,12 @@ START = int(sys.argv[3])
 END = int(sys.argv[4])
 JOB_ID = int(sys.argv[5])
 
-# -------- CHUNK CONFIG --------
 ROW_CHUNK = 128
 LAMBDA_CHUNK = 8192
 PARAM_CHUNK = 512
 ONE_D_CHUNK = 1024
 
 COMPRESSORS = [zarr.codecs.Blosc(cname="zstd", clevel=3)]
-
-# -----------------------------
 
 os.makedirs(OUTDIR, exist_ok=True)
 out_path = os.path.join(OUTDIR, f"shard_{JOB_ID:03d}.zarr")
@@ -29,17 +27,17 @@ src = zarr.open(INPUT, mode="r")
 N = src["flux"].shape[0]
 END = min(END, N)
 
-print(f"[INFO] Writing shard {JOB_ID}: rows [{START}:{END}] → {out_path}")
+print(f"[INFO] Writing shard {JOB_ID}: rows [{START}:{END}]")
 
 dst = zarr.open(out_path, mode="w")
 
-# ---------- 2D arrays ----------
+# ---------- 2D ----------
 def copy_2d(name):
     arr = src[name]
     shape = (END - START, arr.shape[1])
     chunks = (ROW_CHUNK, min(LAMBDA_CHUNK, arr.shape[1]))
 
-    print(f"[2D] {name} → shape={shape}, chunks={chunks}")
+    print(f"[2D] {name} → {shape}, chunks={chunks}")
 
     out = dst.create_array(
         name,
@@ -51,12 +49,12 @@ def copy_2d(name):
 
     for i in range(START, END, ROW_CHUNK):
         i_end = min(i + ROW_CHUNK, END)
-        local_i0 = i - START
-        local_i1 = i_end - START
+        li0 = i - START
+        li1 = i_end - START
 
         for j in range(0, arr.shape[1], chunks[1]):
             j_end = min(j + chunks[1], arr.shape[1])
-            out[local_i0:local_i1, j:j_end] = arr[i:i_end, j:j_end]
+            out[li0:li1, j:j_end] = arr[i:i_end, j:j_end]
 
 
 for name in ["flux", "continuum"]:
@@ -64,7 +62,6 @@ for name in ["flux", "continuum"]:
 
 # ---------- params ----------
 params = src["params"]
-print("[PARAMS]")
 
 out = dst.create_array(
     "params",
@@ -76,17 +73,11 @@ out = dst.create_array(
 
 for i in range(START, END, PARAM_CHUNK):
     i_end = min(i + PARAM_CHUNK, END)
-    out[i - START : i_end - START] = params[i:i_end]
+    out[i - START:i_end - START] = params[i:i_end]
 
-# ---------- 1D arrays ----------
-for name in [
-    "global_index",
-    "model_id",
-    "mu_selected",
-    "mu_selected_index",
-]:
+# ---------- 1D ----------
+for name in ["global_index", "model_id", "mu_selected", "mu_selected_index"]:
     arr = src[name]
-    print(f"[1D] {name}")
 
     out = dst.create_array(
         name,
@@ -99,14 +90,11 @@ for name in [
 
 # ---------- parameter_columns ----------
 if "parameter_columns" in src:
-    print("[GROUP] parameter_columns")
-
     pc_src = src["parameter_columns"]
     pc_dst = dst.create_group("parameter_columns")
 
     for name in pc_src.keys():
         arr = pc_src[name]
-        print(f"  → {name}")
 
         out = pc_dst.create_array(
             name,
@@ -117,38 +105,30 @@ if "parameter_columns" in src:
         )
         out[:] = arr[START:END]
 
-# ---------- wavelength ----------
+# ---------- metadata (data-only mode) ----------
 if "wavelength" in src:
-    print("[META] wavelength")
-    wl = src["wavelength"]
-    dst.create_array(
-        "wavelength",
-        data=wl[:]
-    )
+    dst.create_array("wavelength", data=src["wavelength"][:])
 
-# ---------- param_names ----------
 if "param_names" in src:
-    print("[META] param_names")
-    dst.create_array(
-        "param_names",
-        data=src["param_names"][:]
-    )
+    dst.create_array("param_names", data=src["param_names"][:])
 
 # ---------- scalars ----------
 for name in ["physics_hash", "schema_version"]:
     if name in src:
-        print(f"[SCALAR] {name}")
-        dst.create_array(name, data=src[name][()])
+        val = src[name][()]
+        if isinstance(val, str):
+            val = np.array(val, dtype=object)
+        dst.create_array(name, data=val)
 
 # ---------- provenance ----------
 if "provenance" in src:
-    print("[GROUP] provenance")
     prov_src = src["provenance"]
     prov_dst = dst.create_group("provenance")
 
     for k in prov_src.keys():
-        v = prov_src[k]
-        print(f"  → {k}")
-        prov_dst.create_array(k, data=v[()])
+        val = prov_src[k][()]
+        if isinstance(val, str):
+            val = np.array(val, dtype=object)
+        prov_dst.create_array(k, data=val)
 
 print(f"[DONE] shard {JOB_ID}")
