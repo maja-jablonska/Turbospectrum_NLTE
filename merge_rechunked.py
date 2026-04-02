@@ -9,11 +9,6 @@ from zarr.core.dtype import VariableLengthUTF8
 INPUT_DIR = sys.argv[1]
 OUTPUT = sys.argv[2]
 
-def to_zarr_string(val):
-    if isinstance(val, str):
-        return np.array(val, dtype=VariableLengthUTF8())
-    return val
-
 shards = sorted(glob.glob(f"{INPUT_DIR}/shard_*.zarr"))
 if not shards:
     raise RuntimeError("No shards found")
@@ -46,7 +41,8 @@ def concat(name):
             out_arr[offset+i:offset+i_end] = a[i:i_end]
         offset += n
 
-# ---------- main arrays ----------
+
+# ---------- main ----------
 for k in ["flux", "continuum", "params"]:
     concat(k)
 
@@ -81,13 +77,26 @@ if "wavelength" in arrays[0]:
     out.create_array("wavelength", data=arrays[0]["wavelength"][:])
 
 if "param_names" in arrays[0]:
-    out.create_array("param_names", data=arrays[0]["param_names"][:])
+    out.create_array(
+        "param_names",
+        data=list(arrays[0]["param_names"][:]),
+        dtype=VariableLengthUTF8(),
+    )
 
 # ---------- scalars ----------
 for name in ["physics_hash", "schema_version"]:
     if name in arrays[0]:
-        val = to_zarr_string(arrays[0][name][()])
-        out.create_array(name, data=val)
+        val = arrays[0][name][()]
+
+        if isinstance(val, str):
+            out.create_array(
+                name,
+                shape=(),
+                dtype=VariableLengthUTF8(),
+                data=val,
+            )
+        else:
+            out.create_array(name, data=val)
 
 # ---------- provenance ----------
 if "provenance" in arrays[0]:
@@ -95,7 +104,16 @@ if "provenance" in arrays[0]:
     prov_out = out.create_group("provenance")
 
     for k in prov_src.keys():
-        val = to_zarr_string(prov_src[k][()])
-        prov_out.create_array(k, data=val)
+        val = prov_src[k][()]
+
+        if isinstance(val, str):
+            prov_out.create_array(
+                k,
+                shape=(),
+                dtype=VariableLengthUTF8(),
+                data=val,
+            )
+        else:
+            prov_out.create_array(k, data=val)
 
 print("✅ Merge complete")
