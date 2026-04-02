@@ -1,134 +1,97 @@
-=#!/usr/bin/env python3
+#!/usr/bin/env python3
 
 import sys
 import glob
 import zarr
+import numpy as np
 
 INPUT_DIR = sys.argv[1]
 OUTPUT = sys.argv[2]
 
 shards = sorted(glob.glob(f"{INPUT_DIR}/shard_*.zarr"))
-
 if not shards:
     raise RuntimeError("No shards found")
-
-print(f"[INFO] Found {len(shards)} shards")
 
 arrays = [zarr.open(s, mode="r") for s in shards]
 out = zarr.open(OUTPUT, mode="w")
 
-# ---------- helper ----------
-def concat_array(name):
+def concat(name):
     print(f"[MERGE] {name}")
 
-    src_arrays = [a[name] for a in arrays]
-    total_rows = sum(a.shape[0] for a in src_arrays)
-
-    first = src_arrays[0]
+    srcs = [a[name] for a in arrays]
+    total = sum(a.shape[0] for a in srcs)
+    first = srcs[0]
 
     out_arr = out.create_array(
         name,
-        shape=(total_rows,) + first.shape[1:],
+        shape=(total,) + first.shape[1:],
         dtype=first.dtype,
         chunks=first.chunks,
         compressors=first.compressors,
     )
 
     offset = 0
-    step = 512  # streaming block size
+    step = 512
 
-    for a in src_arrays:
+    for a in srcs:
         n = a.shape[0]
-
         for i in range(0, n, step):
             i_end = min(i + step, n)
-            out_arr[offset + i : offset + i_end] = a[i:i_end]
-
+            out_arr[offset+i:offset+i_end] = a[i:i_end]
         offset += n
 
-    print(f"[DONE] {name}")
+for k in ["flux", "continuum", "params"]:
+    concat(k)
 
+for k in ["global_index", "model_id", "mu_selected", "mu_selected_index"]:
+    concat(k)
 
-# ---------- 2D ----------
-for name in ["flux", "continuum"]:
-    concat_array(name)
-
-# ---------- params ----------
-concat_array("params")
-
-# ---------- 1D ----------
-for name in [
-    "global_index",
-    "model_id",
-    "mu_selected",
-    "mu_selected_index",
-]:
-    concat_array(name)
-
-# ---------- parameter_columns ----------
+# parameter_columns
 if "parameter_columns" in arrays[0]:
-    print("[MERGE] parameter_columns")
-
     pc_out = out.create_group("parameter_columns")
-    keys = arrays[0]["parameter_columns"].keys()
-
-    for key in keys:
-        print(f"  → {key}")
-
-        src_arrays = [a["parameter_columns"][key] for a in arrays]
-        total_rows = sum(a.shape[0] for a in src_arrays)
-
-        first = src_arrays[0]
+    for key in arrays[0]["parameter_columns"].keys():
+        srcs = [a["parameter_columns"][key] for a in arrays]
+        total = sum(a.shape[0] for a in srcs)
+        first = srcs[0]
 
         out_arr = pc_out.create_array(
             key,
-            shape=(total_rows,),
+            shape=(total,),
             dtype=first.dtype,
             chunks=first.chunks,
             compressors=first.compressors,
         )
 
         offset = 0
-        for a in src_arrays:
+        for a in srcs:
             n = a.shape[0]
-            out_arr[offset:offset + n] = a[:]  # safe for 1D
+            out_arr[offset:offset+n] = a[:]
             offset += n
 
-
-# ---------- wavelength (copy once) ----------
+# metadata
 if "wavelength" in arrays[0]:
-    print("[COPY] wavelength")
-    wl = arrays[0]["wavelength"]
-    out.create_array(
-        "wavelength",
-        data=wl[:]
-    )
+    out.create_array("wavelength", data=arrays[0]["wavelength"][:])
 
-# ---------- param_names ----------
 if "param_names" in arrays[0]:
-    print("[COPY] param_names")
-    pn = arrays[0]["param_names"]
-    out.create_array(
-        "param_names",
-        data=pn[:]
-    )
+    out.create_array("param_names", data=arrays[0]["param_names"][:])
 
-# ---------- scalars ----------
+# scalars
 for name in ["physics_hash", "schema_version"]:
     if name in arrays[0]:
-        print(f"[COPY] {name}")
-        out.create_array(name, data=arrays[0][name][()])
+        val = arrays[0][name][()]
+        if isinstance(val, str):
+            val = np.array(val, dtype=object)
+        out.create_array(name, data=val)
 
-# ---------- provenance ----------
+# provenance
 if "provenance" in arrays[0]:
-    print("[COPY] provenance")
-
     prov_src = arrays[0]["provenance"]
     prov_out = out.create_group("provenance")
 
     for k in prov_src.keys():
-        v = prov_src[k]
-        print(f"  → {k}")
-        prov_out.create_array(k, data=v[()])
+        val = prov_src[k][()]
+        if isinstance(val, str):
+            val = np.array(val, dtype=object)
+        prov_out.create_array(k, data=val)
 
 print("✅ Merge complete")
