@@ -19,11 +19,6 @@ ONE_D_CHUNK = 1024
 
 COMPRESSORS = [zarr.codecs.Blosc(cname="zstd", clevel=3)]
 
-def to_zarr_string(val):
-    if isinstance(val, str):
-        return np.array(val, dtype=VariableLengthUTF8())
-    return val
-
 os.makedirs(OUTDIR, exist_ok=True)
 out_path = os.path.join(OUTDIR, f"shard_{JOB_ID:03d}.zarr")
 
@@ -116,13 +111,27 @@ if "wavelength" in src:
     dst.create_array("wavelength", data=src["wavelength"][:])
 
 if "param_names" in src:
-    dst.create_array("param_names", data=src["param_names"][:])
+    # safer conversion (avoids FixedLengthUTF32 warning)
+    dst.create_array(
+        "param_names",
+        data=list(src["param_names"][:]),
+        dtype=VariableLengthUTF8(),
+    )
 
 # ---------- scalars ----------
 for name in ["physics_hash", "schema_version"]:
     if name in src:
-        val = to_zarr_string(src[name][()])
-        dst.create_array(name, data=val)
+        val = src[name][()]
+
+        if isinstance(val, str):
+            dst.create_array(
+                name,
+                shape=(),
+                dtype=VariableLengthUTF8(),
+                data=val,
+            )
+        else:
+            dst.create_array(name, data=val)
 
 # ---------- provenance ----------
 if "provenance" in src:
@@ -130,7 +139,16 @@ if "provenance" in src:
     prov_dst = dst.create_group("provenance")
 
     for k in prov_src.keys():
-        val = to_zarr_string(prov_src[k][()])
-        prov_dst.create_array(k, data=val)
+        val = prov_src[k][()]
+
+        if isinstance(val, str):
+            prov_dst.create_array(
+                k,
+                shape=(),
+                dtype=VariableLengthUTF8(),
+                data=val,
+            )
+        else:
+            prov_dst.create_array(k, data=val)
 
 print(f"[DONE] shard {JOB_ID}")
