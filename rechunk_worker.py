@@ -4,6 +4,7 @@ import sys
 import os
 import zarr
 import numpy as np
+from zarr.core.dtype import VariableLengthUTF8
 
 INPUT = sys.argv[1]
 OUTDIR = sys.argv[2]
@@ -17,6 +18,11 @@ PARAM_CHUNK = 512
 ONE_D_CHUNK = 1024
 
 COMPRESSORS = [zarr.codecs.Blosc(cname="zstd", clevel=3)]
+
+def to_zarr_string(val):
+    if isinstance(val, str):
+        return np.array(val, dtype=VariableLengthUTF8())
+    return val
 
 os.makedirs(OUTDIR, exist_ok=True)
 out_path = os.path.join(OUTDIR, f"shard_{JOB_ID:03d}.zarr")
@@ -105,7 +111,7 @@ if "parameter_columns" in src:
         )
         out[:] = arr[START:END]
 
-# ---------- metadata (data-only mode) ----------
+# ---------- metadata ----------
 if "wavelength" in src:
     dst.create_array("wavelength", data=src["wavelength"][:])
 
@@ -115,9 +121,7 @@ if "param_names" in src:
 # ---------- scalars ----------
 for name in ["physics_hash", "schema_version"]:
     if name in src:
-        val = src[name][()]
-        if isinstance(val, str):
-            val = np.array(val, dtype=object)
+        val = to_zarr_string(src[name][()])
         dst.create_array(name, data=val)
 
 # ---------- provenance ----------
@@ -126,9 +130,7 @@ if "provenance" in src:
     prov_dst = dst.create_group("provenance")
 
     for k in prov_src.keys():
-        val = prov_src[k][()]
-        if isinstance(val, str):
-            val = np.array(val, dtype=object)
+        val = to_zarr_string(prov_src[k][()])
         prov_dst.create_array(k, data=val)
 
 print(f"[DONE] shard {JOB_ID}")
