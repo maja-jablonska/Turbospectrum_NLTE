@@ -117,14 +117,13 @@ if "parameter_columns" in src:
         )
         out[:] = arr[START:END]
 
-# ---------- wavelength (copied fully per shard) ----------
+# ---------- wavelength ----------
 if "wavelength" in src:
     print("[META] wavelength")
     wl = src["wavelength"]
     dst.create_array(
         "wavelength",
-        data=wl[:],
-        shape=wl.shape,
+        data=wl[:],   # ✅ no shape here
         dtype=wl.dtype,
     )
 
@@ -133,8 +132,7 @@ if "param_names" in src:
     print("[META] param_names")
     dst.create_array(
         "param_names",
-        data=src["param_names"][:],
-        shape=src["param_names"].shape,
+        data=src["param_names"][:],  # ✅ no shape
         dtype=src["param_names"].dtype,
     )
 
@@ -147,9 +145,11 @@ for name in ["physics_hash", "schema_version"]:
 # ---------- provenance ----------
 if "provenance" in src:
     print("[GROUP] provenance")
+    prov_src = src["provenance"]
     prov_dst = dst.create_group("provenance")
 
-    for k, v in src["provenance"].items():
+    for k in prov_src.keys():
+        v = prov_src[k]
         print(f"  → {k}")
         prov_dst.create_array(k, data=v[()])
 
