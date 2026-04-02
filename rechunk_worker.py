@@ -3,8 +3,9 @@
 import sys
 import os
 import zarr
+import zarr.codecs as zc
 import numpy as np
-from zarr.core.dtype import VariableLengthUTF8
+from zarr.core.dtype.npy.string import VariableLengthUTF8
 
 INPUT = sys.argv[1]
 OUTDIR = sys.argv[2]
@@ -31,6 +32,39 @@ END = min(END, N)
 print(f"[INFO] Writing shard {JOB_ID}: rows [{START}:{END}]")
 
 dst = zarr.open(out_path, mode="w")
+
+
+def write_string_array(group, name, values, chunk_len=128):
+    vals = [str(value) for value in np.asarray(values).tolist()]
+    arr = group.create_array(
+        name,
+        shape=(len(vals),),
+        dtype=VariableLengthUTF8(),
+        serializer=zc.VLenUTF8Codec(),
+        chunks=(min(len(vals), chunk_len) if vals else 1,),
+    )
+    arr[:] = vals
+
+
+def write_string_scalar(group, name, value):
+    text = str(value)
+    try:
+        arr = group.create_array(
+            name,
+            shape=(),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+        )
+        arr[...] = text
+    except Exception:
+        arr = group.create_array(
+            name,
+            shape=(1,),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+            chunks=(1,),
+        )
+        arr[0] = text
 
 # ---------- 2D ----------
 def copy_2d(name):
@@ -111,25 +145,15 @@ if "wavelength" in src:
     dst.create_array("wavelength", data=src["wavelength"][:])
 
 if "param_names" in src:
-    # safer conversion (avoids FixedLengthUTF32 warning)
-    dst.create_array(
-        "param_names",
-        data=list(src["param_names"][:]),
-        dtype=VariableLengthUTF8(),
-    )
+    write_string_array(dst, "param_names", src["param_names"][:])
 
 # ---------- scalars ----------
 for name in ["physics_hash", "schema_version"]:
     if name in src:
         val = src[name][()]
 
-        if isinstance(val, str):
-            dst.create_array(
-                name,
-                shape=(),
-                dtype=VariableLengthUTF8(),
-                data=val,
-            )
+        if isinstance(val, (str, np.str_)):
+            write_string_scalar(dst, name, val)
         else:
             dst.create_array(name, data=val)
 
@@ -141,13 +165,8 @@ if "provenance" in src:
     for k in prov_src.keys():
         val = prov_src[k][()]
 
-        if isinstance(val, str):
-            prov_dst.create_array(
-                k,
-                shape=(),
-                dtype=VariableLengthUTF8(),
-                data=val,
-            )
+        if isinstance(val, (str, np.str_)):
+            write_string_scalar(prov_dst, k, val)
         else:
             prov_dst.create_array(k, data=val)
 

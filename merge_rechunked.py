@@ -3,8 +3,9 @@
 import sys
 import glob
 import zarr
+import zarr.codecs as zc
 import numpy as np
-from zarr.core.dtype import VariableLengthUTF8
+from zarr.core.dtype.npy.string import VariableLengthUTF8
 
 INPUT_DIR = sys.argv[1]
 OUTPUT = sys.argv[2]
@@ -15,6 +16,39 @@ if not shards:
 
 arrays = [zarr.open(s, mode="r") for s in shards]
 out = zarr.open(OUTPUT, mode="w")
+
+
+def write_string_array(group, name, values, chunk_len=128):
+    vals = [str(value) for value in np.asarray(values).tolist()]
+    arr = group.create_array(
+        name,
+        shape=(len(vals),),
+        dtype=VariableLengthUTF8(),
+        serializer=zc.VLenUTF8Codec(),
+        chunks=(min(len(vals), chunk_len) if vals else 1,),
+    )
+    arr[:] = vals
+
+
+def write_string_scalar(group, name, value):
+    text = str(value)
+    try:
+        arr = group.create_array(
+            name,
+            shape=(),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+        )
+        arr[...] = text
+    except Exception:
+        arr = group.create_array(
+            name,
+            shape=(1,),
+            dtype=VariableLengthUTF8(),
+            serializer=zc.VLenUTF8Codec(),
+            chunks=(1,),
+        )
+        arr[0] = text
 
 def concat(name):
     print(f"[MERGE] {name}")
@@ -77,24 +111,15 @@ if "wavelength" in arrays[0]:
     out.create_array("wavelength", data=arrays[0]["wavelength"][:])
 
 if "param_names" in arrays[0]:
-    out.create_array(
-        "param_names",
-        data=list(arrays[0]["param_names"][:]),
-        dtype=VariableLengthUTF8(),
-    )
+    write_string_array(out, "param_names", arrays[0]["param_names"][:])
 
 # ---------- scalars ----------
 for name in ["physics_hash", "schema_version"]:
     if name in arrays[0]:
         val = arrays[0][name][()]
 
-        if isinstance(val, str):
-            out.create_array(
-                name,
-                shape=(),
-                dtype=VariableLengthUTF8(),
-                data=val,
-            )
+        if isinstance(val, (str, np.str_)):
+            write_string_scalar(out, name, val)
         else:
             out.create_array(name, data=val)
 
@@ -106,13 +131,8 @@ if "provenance" in arrays[0]:
     for k in prov_src.keys():
         val = prov_src[k][()]
 
-        if isinstance(val, str):
-            prov_out.create_array(
-                k,
-                shape=(),
-                dtype=VariableLengthUTF8(),
-                data=val,
-            )
+        if isinstance(val, (str, np.str_)):
+            write_string_scalar(prov_out, k, val)
         else:
             prov_out.create_array(k, data=val)
 
