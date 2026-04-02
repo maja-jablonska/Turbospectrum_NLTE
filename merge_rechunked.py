@@ -101,8 +101,7 @@ if "wavelength" in arrays[0]:
     wl = arrays[0]["wavelength"]
     out.create_array(
         "wavelength",
-        data=wl[:],   # ✅ no shape
-        dtype=wl.dtype,
+        data=wl[:]
     )
 
 # ---------- param_names ----------
@@ -111,8 +110,7 @@ if "param_names" in arrays[0]:
     pn = arrays[0]["param_names"]
     out.create_array(
         "param_names",
-        data=pn[:],   # ✅ no shape
-        dtype=pn.dtype,
+        data=pn[:]
     )
 
 # ---------- scalars ----------

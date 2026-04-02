@@ -123,8 +123,7 @@ if "wavelength" in src:
     wl = src["wavelength"]
     dst.create_array(
         "wavelength",
-        data=wl[:],   # ✅ no shape here
-        dtype=wl.dtype,
+        data=wl[:]
     )
 
 # ---------- param_names ----------
@@ -132,8 +131,7 @@ if "param_names" in src:
     print("[META] param_names")
     dst.create_array(
         "param_names",
-        data=src["param_names"][:],  # ✅ no shape
-        dtype=src["param_names"].dtype,
+        data=src["param_names"][:]
     )
 
 # ---------- scalars ----------
