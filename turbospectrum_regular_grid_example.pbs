@@ -171,7 +171,10 @@ for field in fields:
 PY
 )"
 
-mapfile -t _runtime_lines <<< "${RUNTIME_VALUES}"
+_runtime_lines=()
+while IFS= read -r _runtime_line; do
+    _runtime_lines+=("${_runtime_line}")
+done <<< "${RUNTIME_VALUES}"
 CFG_RUN_ROOT="${_runtime_lines[0]:-}"
 CFG_GRID_ZARR="${_runtime_lines[1]:-}"
 CFG_MERGED_ZARR="${_runtime_lines[2]:-}"
@@ -246,6 +249,8 @@ FORCE_RESTART_EFFECTIVE="$(to_bool01 "${FORCE_RESTART}")"
 JOB_ID_BASE="${PBS_JOBID:-manual}"
 JOB_ID_BASE="${JOB_ID_BASE%%[*}"
 ARRAY_PREP_MARKER="${RUN_ROOT}/.regular_grid_array_prepare_${JOB_ID_BASE}.done"
+ARRAY_PREP_FAILURE_MARKER="${RUN_ROOT}/.regular_grid_array_prepare_${JOB_ID_BASE}.failed"
+ARRAY_PREP_LOCK_DIR="${RUN_ROOT}/.regular_grid_array_prepare_${JOB_ID_BASE}.lock"
 ARRAY_PREP_TIMEOUT="${ARRAY_PREP_TIMEOUT:-3600}"
 if ! [[ "${ARRAY_PREP_TIMEOUT}" =~ ^[0-9]+$ ]] || (( ARRAY_PREP_TIMEOUT < 1 )); then
     echo "[regular-grid] WARN: invalid ARRAY_PREP_TIMEOUT='${ARRAY_PREP_TIMEOUT}', defaulting to 3600." >&2
@@ -322,12 +327,87 @@ wait_for_array_prepare() {
         if [[ -f "${ARRAY_PREP_MARKER}" ]] && is_valid_grid_zarr "${GRID_ZARR}"; then
             return 0
         fi
+        if [[ -f "${ARRAY_PREP_FAILURE_MARKER}" ]]; then
+            echo "[regular-grid] ERROR: one-time array preparation failed; details from ${ARRAY_PREP_FAILURE_MARKER}:" >&2
+            sed -n '1,80p' "${ARRAY_PREP_FAILURE_MARKER}" >&2 || true
+            return 1
+        fi
         sleep 15
         waited=$((waited + 15))
     done
 
-    echo "[regular-grid] ERROR: timed out after ${ARRAY_PREP_TIMEOUT}s waiting for array preparation marker ${ARRAY_PREP_MARKER}." >&2
+    if [[ -d "${ARRAY_PREP_LOCK_DIR}" ]]; then
+        echo "[regular-grid] ERROR: timed out after ${ARRAY_PREP_TIMEOUT}s waiting for one-time array preparation to finish (lock still present: ${ARRAY_PREP_LOCK_DIR})." >&2
+    else
+        echo "[regular-grid] ERROR: timed out after ${ARRAY_PREP_TIMEOUT}s waiting for array preparation marker ${ARRAY_PREP_MARKER}." >&2
+    fi
     return 1
+}
+
+prepare_array_if_needed() {
+    local owner_id prep_rc=0
+    owner_id="${PBS_JOBID:-manual}"
+    if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
+        owner_id="${owner_id} task=${PBS_ARRAY_INDEX}"
+    fi
+
+    while true; do
+        if [[ -f "${ARRAY_PREP_MARKER}" ]] && is_valid_grid_zarr "${GRID_ZARR}"; then
+            return 0
+        fi
+        if [[ -f "${ARRAY_PREP_FAILURE_MARKER}" ]]; then
+            echo "[regular-grid] ERROR: one-time array preparation previously failed; details from ${ARRAY_PREP_FAILURE_MARKER}:" >&2
+            sed -n '1,80p' "${ARRAY_PREP_FAILURE_MARKER}" >&2 || true
+            return 1
+        fi
+
+        if mkdir "${ARRAY_PREP_LOCK_DIR}" 2>/dev/null; then
+            rm -f "${ARRAY_PREP_FAILURE_MARKER}"
+
+            if [[ -f "${ARRAY_PREP_MARKER}" ]] && is_valid_grid_zarr "${GRID_ZARR}"; then
+                rmdir "${ARRAY_PREP_LOCK_DIR}" 2>/dev/null || true
+                return 0
+            fi
+
+            echo "[regular-grid] Array task ${PBS_ARRAY_INDEX:-<none>} acquired one-time grid-preparation lock."
+
+            if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" && -d "${GRID_ZARR}" ]]; then
+                echo "[regular-grid] Force restart requested; removing existing grid: ${GRID_ZARR}"
+                rm -rf "${GRID_ZARR}" || prep_rc=$?
+            fi
+            if (( prep_rc == 0 )) && [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
+                clear_restart_outputs || prep_rc=$?
+            fi
+            if (( prep_rc == 0 )); then
+                generate_grid_if_needed || prep_rc=$?
+            fi
+
+            if (( prep_rc == 0 )); then
+                {
+                    printf 'ready\n'
+                    printf 'prepared_by=%s\n' "${owner_id}"
+                    printf 'prepared_at=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+                } > "${ARRAY_PREP_MARKER}"
+                rm -f "${ARRAY_PREP_FAILURE_MARKER}"
+                rmdir "${ARRAY_PREP_LOCK_DIR}" 2>/dev/null || true
+                return 0
+            fi
+
+            {
+                printf 'prepare_failed_by=%s\n' "${owner_id}"
+                printf 'prepare_failed_at=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+                printf 'prepare_failed_rc=%s\n' "${prep_rc}"
+                printf 'run_root=%s\n' "${RUN_ROOT}"
+                printf 'grid_zarr=%s\n' "${GRID_ZARR}"
+            } > "${ARRAY_PREP_FAILURE_MARKER}"
+            rmdir "${ARRAY_PREP_LOCK_DIR}" 2>/dev/null || true
+            echo "[regular-grid] ERROR: one-time array preparation failed in ${owner_id}; see ${ARRAY_PREP_FAILURE_MARKER}." >&2
+            return "${prep_rc}"
+        fi
+
+        echo "[regular-grid] Array task ${PBS_ARRAY_INDEX:-<none>} waiting for one-time grid/shard preparation..."
+        wait_for_array_prepare || return $?
+    done
 }
 
 write_missing_shards_file() {
@@ -473,21 +553,7 @@ if (( ARRAY_TASK_MODE == 1 )); then
         echo "[regular-grid] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${PBS_ARRAY_INDEX:-}'." >&2
         exit 1
     fi
-    if (( PBS_ARRAY_INDEX == 0 )); then
-        rm -f "${ARRAY_PREP_MARKER}"
-        if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" && -d "${GRID_ZARR}" ]]; then
-            echo "[regular-grid] Force restart requested; removing existing grid: ${GRID_ZARR}"
-            rm -rf "${GRID_ZARR}"
-        fi
-        if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
-            clear_restart_outputs
-        fi
-        generate_grid_if_needed
-        printf 'ready\n' > "${ARRAY_PREP_MARKER}"
-    else
-        echo "[regular-grid] Array task ${PBS_ARRAY_INDEX} waiting for task 0 to prepare grid/shards..."
-        wait_for_array_prepare
-    fi
+    prepare_array_if_needed
 else
     if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" && -d "${GRID_ZARR}" ]]; then
         echo "[regular-grid] Force restart requested; removing existing grid: ${GRID_ZARR}"
