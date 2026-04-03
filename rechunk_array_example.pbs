@@ -29,16 +29,13 @@ fi
 : "${OUTPUT_DIR:?Need OUTPUT_DIR via -v}"
 
 # -------- OPTIONAL --------
-CHUNK_ROWS=${CHUNK_ROWS:-1500}
+DEFAULT_CHUNK_ROWS=1500
+CHUNK_ROWS_RAW=${CHUNK_ROWS:-}
+SHARD_COUNT_RAW=${SHARD_COUNT:-}
 QSUB_BIN=${QSUB_BIN:-qsub}
 
 # -------- PYTHON --------
 PYTHON=${PYTHON:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}
-
-if ! [[ "${CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( CHUNK_ROWS < 1 )); then
-    echo "[rechunk] ERROR: CHUNK_ROWS must be a positive integer, got '${CHUNK_ROWS}'." >&2
-    exit 1
-fi
 
 ROW_COUNT="$("${PYTHON}" - <<PY
 import zarr
@@ -57,9 +54,46 @@ if ! [[ "${ROW_COUNT}" =~ ^[0-9]+$ ]] || (( ROW_COUNT < 1 )); then
     exit 1
 fi
 
-SHARD_COUNT=${SHARD_COUNT:-$(( (ROW_COUNT + CHUNK_ROWS - 1) / CHUNK_ROWS ))}
+if [[ -n "${CHUNK_ROWS_RAW}" ]]; then
+    if ! [[ "${CHUNK_ROWS_RAW}" =~ ^[0-9]+$ ]] || (( CHUNK_ROWS_RAW < 1 )); then
+        echo "[rechunk] ERROR: CHUNK_ROWS must be a positive integer, got '${CHUNK_ROWS_RAW}'." >&2
+        exit 1
+    fi
+fi
+
+if [[ -n "${SHARD_COUNT_RAW}" ]]; then
+    if ! [[ "${SHARD_COUNT_RAW}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT_RAW < 1 )); then
+        echo "[rechunk] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT_RAW}'." >&2
+        exit 1
+    fi
+fi
+
+if [[ -n "${SHARD_COUNT_RAW}" && -z "${CHUNK_ROWS_RAW}" ]]; then
+    SHARD_COUNT=${SHARD_COUNT_RAW}
+    CHUNK_ROWS=$(( (ROW_COUNT + SHARD_COUNT - 1) / SHARD_COUNT ))
+elif [[ -n "${CHUNK_ROWS_RAW}" && -z "${SHARD_COUNT_RAW}" ]]; then
+    CHUNK_ROWS=${CHUNK_ROWS_RAW}
+    SHARD_COUNT=$(( (ROW_COUNT + CHUNK_ROWS - 1) / CHUNK_ROWS ))
+elif [[ -n "${CHUNK_ROWS_RAW}" && -n "${SHARD_COUNT_RAW}" ]]; then
+    CHUNK_ROWS=${CHUNK_ROWS_RAW}
+    SHARD_COUNT=${SHARD_COUNT_RAW}
+else
+    CHUNK_ROWS=${DEFAULT_CHUNK_ROWS}
+    SHARD_COUNT=$(( (ROW_COUNT + CHUNK_ROWS - 1) / CHUNK_ROWS ))
+fi
+
 if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
     echo "[rechunk] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
+    exit 1
+fi
+
+if ! [[ "${CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( CHUNK_ROWS < 1 )); then
+    echo "[rechunk] ERROR: CHUNK_ROWS must be a positive integer, got '${CHUNK_ROWS}'." >&2
+    exit 1
+fi
+
+if (( SHARD_COUNT * CHUNK_ROWS < ROW_COUNT )); then
+    echo "[rechunk] ERROR: SHARD_COUNT=${SHARD_COUNT} and CHUNK_ROWS=${CHUNK_ROWS} only cover $(( SHARD_COUNT * CHUNK_ROWS )) rows, but ROW_COUNT=${ROW_COUNT}." >&2
     exit 1
 fi
 
