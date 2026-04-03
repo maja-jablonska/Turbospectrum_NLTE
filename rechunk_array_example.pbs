@@ -6,7 +6,6 @@
 #PBS -l mem=16GB
 #PBS -l walltime=02:00:00
 #PBS -l storage=scratch/y89+scratch/dg97+scratch/mk27+gdata/y89
-#PBS -J 0-9
 #PBS -r y
 #PBS -j oe
 #PBS -M maja.jablonska@anu.edu.au
@@ -14,19 +13,94 @@
 
 set -euo pipefail
 
+WORKDIR="${PBS_O_WORKDIR:-$(pwd)}"
+cd "${WORKDIR}"
+
+SCRIPT_BASENAME="$(basename "${BASH_SOURCE[0]}")"
+if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
+    SCRIPT_PATH="${PBS_O_WORKDIR}/${SCRIPT_BASENAME}"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_BASENAME}"
+fi
+
 # -------- REQUIRED --------
 : "${INPUT_ZARR:?Need INPUT_ZARR via -v}"
 : "${OUTPUT_DIR:?Need OUTPUT_DIR via -v}"
 
 # -------- OPTIONAL --------
 CHUNK_ROWS=${CHUNK_ROWS:-1500}
+QSUB_BIN=${QSUB_BIN:-qsub}
 
 # -------- PYTHON --------
 PYTHON=${PYTHON:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}
 
+if ! [[ "${CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( CHUNK_ROWS < 1 )); then
+    echo "[rechunk] ERROR: CHUNK_ROWS must be a positive integer, got '${CHUNK_ROWS}'." >&2
+    exit 1
+fi
+
+ROW_COUNT="$("${PYTHON}" - <<PY
+import zarr
+root = zarr.open_group(r"${INPUT_ZARR}", mode="r")
+for key in ("flux", "continuum", "params", "global_index"):
+    if key in root and len(root[key].shape) >= 1:
+        print(int(root[key].shape[0]))
+        break
+else:
+    raise RuntimeError(f"Could not infer row count from {r'${INPUT_ZARR}'}")
+PY
+)"
+
+if ! [[ "${ROW_COUNT}" =~ ^[0-9]+$ ]] || (( ROW_COUNT < 1 )); then
+    echo "[rechunk] ERROR: failed to infer a positive ROW_COUNT from '${INPUT_ZARR}'." >&2
+    exit 1
+fi
+
+SHARD_COUNT=${SHARD_COUNT:-$(( (ROW_COUNT + CHUNK_ROWS - 1) / CHUNK_ROWS ))}
+if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
+    echo "[rechunk] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
+    exit 1
+fi
+
+if [[ -z "${PBS_ARRAY_INDEX:-}" ]]; then
+    if ! command -v "${QSUB_BIN}" >/dev/null 2>&1; then
+        echo "[rechunk] ERROR: qsub executable '${QSUB_BIN}' not found." >&2
+        exit 1
+    fi
+
+    ARRAY_RANGE="0-$(( SHARD_COUNT - 1 ))"
+    echo "====================================="
+    echo "Submitting rechunk array"
+    echo "INPUT_ZARR  = $INPUT_ZARR"
+    echo "OUTPUT_DIR  = $OUTPUT_DIR"
+    echo "ROW_COUNT   = $ROW_COUNT"
+    echo "CHUNK_ROWS  = $CHUNK_ROWS"
+    echo "SHARD_COUNT = $SHARD_COUNT"
+    echo "ARRAY_RANGE = $ARRAY_RANGE"
+    echo "PYTHON      = $PYTHON"
+    echo "SCRIPT_PATH = $SCRIPT_PATH"
+    echo "====================================="
+
+    "${QSUB_BIN}" \
+        -J "${ARRAY_RANGE}" \
+        -v "INPUT_ZARR=${INPUT_ZARR},OUTPUT_DIR=${OUTPUT_DIR},CHUNK_ROWS=${CHUNK_ROWS},PYTHON=${PYTHON},SHARD_COUNT=${SHARD_COUNT},QSUB_BIN=${QSUB_BIN}" \
+        "${SCRIPT_PATH}"
+    exit 0
+fi
+
+if ! [[ "${PBS_ARRAY_INDEX}" =~ ^[0-9]+$ ]] || (( PBS_ARRAY_INDEX < 0 )); then
+    echo "[rechunk] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${PBS_ARRAY_INDEX:-}'." >&2
+    exit 1
+fi
+
+if (( PBS_ARRAY_INDEX >= SHARD_COUNT )); then
+    echo "[rechunk] INFO: array task ${PBS_ARRAY_INDEX} is outside SHARD_COUNT=${SHARD_COUNT}; exiting cleanly."
+    exit 0
+fi
+
 # -------- JOB INDEX --------
 JOB_ID=${PBS_ARRAY_INDEX}
-
 START=$(( JOB_ID * CHUNK_ROWS ))
 END=$(( START + CHUNK_ROWS ))
 
@@ -34,6 +108,8 @@ echo "====================================="
 echo "Job $JOB_ID"
 echo "INPUT_ZARR = $INPUT_ZARR"
 echo "OUTPUT_DIR = $OUTPUT_DIR"
+echo "ROW_COUNT  = $ROW_COUNT"
+echo "SHARDS     = $SHARD_COUNT"
 echo "ROWS       = [$START:$END]"
 echo "PYTHON     = $PYTHON"
 echo "====================================="
