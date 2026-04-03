@@ -23,6 +23,8 @@ else
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
     SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_BASENAME}"
 fi
+REPO_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" >/dev/null 2>&1 && pwd)"
+LAYOUT_HELPER="${REPO_DIR}/scripts/resolve_shard_layout.py"
 
 # -------- REQUIRED --------
 : "${INPUT_ZARR:?Need INPUT_ZARR via -v}"
@@ -37,65 +39,33 @@ QSUB_BIN=${QSUB_BIN:-qsub}
 # -------- PYTHON --------
 PYTHON=${PYTHON:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}
 
-ROW_COUNT="$("${PYTHON}" - <<PY
-import zarr
-root = zarr.open_group(r"${INPUT_ZARR}", mode="r")
-for key in ("flux", "continuum", "params", "global_index"):
-    if key in root and len(root[key].shape) >= 1:
-        print(int(root[key].shape[0]))
-        break
-else:
-    raise RuntimeError(f"Could not infer row count from {r'${INPUT_ZARR}'}")
-PY
-)"
-
-if ! [[ "${ROW_COUNT}" =~ ^[0-9]+$ ]] || (( ROW_COUNT < 1 )); then
-    echo "[rechunk] ERROR: failed to infer a positive ROW_COUNT from '${INPUT_ZARR}'." >&2
+if [[ ! -f "${LAYOUT_HELPER}" ]]; then
+    echo "[rechunk] ERROR: shard layout helper not found: ${LAYOUT_HELPER}" >&2
     exit 1
 fi
 
+LAYOUT_CMD=(
+    "${PYTHON}" "${LAYOUT_HELPER}"
+    --zarr-path "${INPUT_ZARR}"
+    --row-keys "flux,continuum,params,global_index"
+    --default-rows-per-shard "${DEFAULT_CHUNK_ROWS}"
+)
 if [[ -n "${CHUNK_ROWS_RAW}" ]]; then
-    if ! [[ "${CHUNK_ROWS_RAW}" =~ ^[0-9]+$ ]] || (( CHUNK_ROWS_RAW < 1 )); then
-        echo "[rechunk] ERROR: CHUNK_ROWS must be a positive integer, got '${CHUNK_ROWS_RAW}'." >&2
-        exit 1
-    fi
+    LAYOUT_CMD+=(--rows-per-shard "${CHUNK_ROWS_RAW}")
 fi
-
 if [[ -n "${SHARD_COUNT_RAW}" ]]; then
-    if ! [[ "${SHARD_COUNT_RAW}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT_RAW < 1 )); then
-        echo "[rechunk] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT_RAW}'." >&2
-        exit 1
-    fi
+    LAYOUT_CMD+=(--shard-count "${SHARD_COUNT_RAW}")
 fi
 
-if [[ -n "${SHARD_COUNT_RAW}" && -z "${CHUNK_ROWS_RAW}" ]]; then
-    SHARD_COUNT=${SHARD_COUNT_RAW}
-    CHUNK_ROWS=$(( (ROW_COUNT + SHARD_COUNT - 1) / SHARD_COUNT ))
-elif [[ -n "${CHUNK_ROWS_RAW}" && -z "${SHARD_COUNT_RAW}" ]]; then
-    CHUNK_ROWS=${CHUNK_ROWS_RAW}
-    SHARD_COUNT=$(( (ROW_COUNT + CHUNK_ROWS - 1) / CHUNK_ROWS ))
-elif [[ -n "${CHUNK_ROWS_RAW}" && -n "${SHARD_COUNT_RAW}" ]]; then
-    CHUNK_ROWS=${CHUNK_ROWS_RAW}
-    SHARD_COUNT=${SHARD_COUNT_RAW}
-else
-    CHUNK_ROWS=${DEFAULT_CHUNK_ROWS}
-    SHARD_COUNT=$(( (ROW_COUNT + CHUNK_ROWS - 1) / CHUNK_ROWS ))
-fi
-
-if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
-    echo "[rechunk] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
-    exit 1
-fi
-
-if ! [[ "${CHUNK_ROWS}" =~ ^[0-9]+$ ]] || (( CHUNK_ROWS < 1 )); then
-    echo "[rechunk] ERROR: CHUNK_ROWS must be a positive integer, got '${CHUNK_ROWS}'." >&2
-    exit 1
-fi
-
-if (( SHARD_COUNT * CHUNK_ROWS < ROW_COUNT )); then
-    echo "[rechunk] ERROR: SHARD_COUNT=${SHARD_COUNT} and CHUNK_ROWS=${CHUNK_ROWS} only cover $(( SHARD_COUNT * CHUNK_ROWS )) rows, but ROW_COUNT=${ROW_COUNT}." >&2
-    exit 1
-fi
+LAYOUT_OUTPUT="$("${LAYOUT_CMD[@]}")"
+while IFS='=' read -r key value; do
+    case "${key}" in
+        ROW_COUNT) ROW_COUNT="${value}" ;;
+        ROWS_PER_SHARD) CHUNK_ROWS="${value}" ;;
+        SHARD_COUNT) SHARD_COUNT="${value}" ;;
+        ARRAY_RANGE) ARRAY_RANGE="${value}" ;;
+    esac
+done <<< "${LAYOUT_OUTPUT}"
 
 if [[ -z "${PBS_ARRAY_INDEX:-}" ]]; then
     if ! command -v "${QSUB_BIN}" >/dev/null 2>&1; then
@@ -103,7 +73,6 @@ if [[ -z "${PBS_ARRAY_INDEX:-}" ]]; then
         exit 1
     fi
 
-    ARRAY_RANGE="0-$(( SHARD_COUNT - 1 ))"
     echo "====================================="
     echo "Submitting rechunk array"
     echo "INPUT_ZARR  = $INPUT_ZARR"
