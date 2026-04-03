@@ -136,8 +136,54 @@ def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir
     return tmp_path
 
 
+def _find_flag_value(cmd: list[str], flag: str) -> tuple[Optional[int], Optional[str]]:
+    for idx, token in enumerate(cmd[:-1]):
+        if token == flag:
+            return idx + 1, cmd[idx + 1]
+    return None, None
+
+
+def _replace_flag_value(cmd: list[str], flag: str, value: str) -> list[str]:
+    updated = list(cmd)
+    idx, _ = _find_flag_value(updated, flag)
+    if idx is None:
+        updated.extend([flag, value])
+    else:
+        updated[idx] = value
+    return updated
+
+
+def _is_sigkill_returncode(returncode: int) -> bool:
+    return int(returncode) in (-9, 137)
+
+
 def _run(cmd: list[str]) -> None:
-    subprocess.run(cmd, check=True)
+    current_cmd = list(cmd)
+
+    while True:
+        try:
+            subprocess.run(current_cmd, check=True)
+            return
+        except subprocess.CalledProcessError as exc:
+            _, workers_raw = _find_flag_value(current_cmd, "--workers")
+            try:
+                workers = int(str(workers_raw)) if workers_raw is not None else None
+            except ValueError:
+                workers = None
+
+            if _is_sigkill_returncode(exc.returncode) and workers and workers > 1:
+                next_workers = max(1, workers // 2)
+                if next_workers == workers:
+                    raise
+                print(
+                    "Synthesis subprocess was killed with SIGKILL while using "
+                    f"{workers} workers; retrying with {next_workers}.",
+                    file=sys.stderr,
+                )
+                current_cmd = _replace_flag_value(current_cmd, "--workers", str(next_workers))
+                continue
+
+            raise
 
 
 def main() -> None:

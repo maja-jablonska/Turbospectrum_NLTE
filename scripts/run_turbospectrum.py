@@ -175,6 +175,8 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["compiler"] = cfg_data.get("compiler", "gf")
     flat["force"] = cfg_data.get("force", False)
     flat["max_workers"] = cfg_data.get("max_workers", None)
+    flat["worker_memory_gb"] = cfg_data.get("worker_memory_gb", None)
+    flat["worker_memory_reserve_gb"] = cfg_data.get("worker_memory_reserve_gb", 8.0)
 
     executables = cfg_data.get("executables", {}) or {}
     flat["babsma_exec"] = executables.get("babsma_exec", "babsma_lu")
@@ -383,6 +385,9 @@ class TurbospectrumConfig:
     # Parallelization
     # If None, the script will try to detect the assigned CPUs from the environment
     max_workers: Optional[int] = None
+    # Optional safety valves for memory-aware worker clamping on HPC nodes.
+    worker_memory_gb: Optional[float] = None
+    worker_memory_reserve_gb: float = 8.0
 
     # Grid Points
     # Format: [[Teff, logg, Fe/H, microturb_str], ...]
@@ -409,6 +414,15 @@ class TurbospectrumConfig:
             mode = str(self.mu_sampling.get("mode", "none")).strip().lower()
             if mode in {"", "none"}:
                 self.mu_sampling["mode"] = "random"
+        if self.worker_memory_gb not in (None, ""):
+            self.worker_memory_gb = float(self.worker_memory_gb)
+            if self.worker_memory_gb <= 0:
+                raise ValueError(f"worker_memory_gb must be > 0, got {self.worker_memory_gb!r}")
+        self.worker_memory_reserve_gb = float(self.worker_memory_reserve_gb)
+        if self.worker_memory_reserve_gb < 0:
+            raise ValueError(
+                f"worker_memory_reserve_gb must be >= 0, got {self.worker_memory_reserve_gb!r}"
+            )
 
         # Set derived paths if not provided
         if self.model_atmosphere_path:
@@ -633,10 +647,114 @@ def _parse_int_env(var_name: str) -> Optional[int]:
     return None
 
 
-def determine_worker_count(config: TurbospectrumConfig) -> int:
+def _parse_memory_limit(raw_value: Any, *, default_unit: str = "bytes") -> Optional[int]:
+    """Parse scheduler/cgroup memory values into bytes."""
+    if raw_value is None:
+        return None
+
+    text = str(raw_value).strip()
+    if not text or text.lower() == "max":
+        return None
+
+    match = re.fullmatch(r"(?i)(\d+(?:\.\d+)?)([kmgtpe]?i?b?)?", text.replace(" ", ""))
+    if not match:
+        return None
+
+    try:
+        magnitude = float(match.group(1))
+    except ValueError:
+        return None
+
+    unit = (match.group(2) or "").lower()
+    if not unit:
+        unit = {
+            "bytes": "b",
+            "kb": "kb",
+            "mb": "mb",
+            "gb": "gb",
+        }.get(str(default_unit).lower(), "b")
+
+    factors = {
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "ki": 1024,
+        "kib": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "mi": 1024**2,
+        "mib": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "gi": 1024**3,
+        "gib": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+        "ti": 1024**4,
+        "tib": 1024**4,
+        "p": 1024**5,
+        "pb": 1024**5,
+        "pi": 1024**5,
+        "pib": 1024**5,
+        "e": 1024**6,
+        "eb": 1024**6,
+        "ei": 1024**6,
+        "eib": 1024**6,
+    }
+    factor = factors.get(unit)
+    if factor is None:
+        return None
+    return int(magnitude * factor)
+
+
+def _detect_memory_limit_bytes(cpu_count: Optional[int]) -> Tuple[Optional[int], Optional[str]]:
+    """Best-effort memory limit detection for scheduler-managed jobs."""
+    env_specs = [
+        ("PBS_RESOURCE_LIST_MEM", "bytes"),
+        ("PBS_MEM", "bytes"),
+        ("PBS_VMEM", "bytes"),
+        ("SLURM_MEM_PER_NODE", "mb"),
+    ]
+    for env_name, default_unit in env_specs:
+        parsed = _parse_memory_limit(os.environ.get(env_name), default_unit=default_unit)
+        if parsed and parsed > 0:
+            return parsed, env_name
+
+    slurm_mem_per_cpu = _parse_memory_limit(os.environ.get("SLURM_MEM_PER_CPU"), default_unit="mb")
+    if slurm_mem_per_cpu and slurm_mem_per_cpu > 0 and cpu_count and cpu_count > 0:
+        return slurm_mem_per_cpu * int(cpu_count), "SLURM_MEM_PER_CPU"
+
+    cgroup_candidates = (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    )
+    for candidate in cgroup_candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8") as handle:
+                parsed = _parse_memory_limit(handle.read().strip(), default_unit="bytes")
+        except OSError:
+            continue
+        if parsed and 0 < parsed < (1 << 60):
+            return parsed, candidate
+
+    return None, None
+
+
+def _default_worker_memory_gb(config: TurbospectrumConfig) -> float:
+    """Conservative per-worker memory heuristic for Turbospectrum runs."""
+    output_mode = str(getattr(config, "output_mode", "Flux")).strip().lower()
+    if output_mode == "intensity":
+        return 6.0
+    if bool(getattr(config, "nlte", False)):
+        return 5.0
+    return 4.0
+
+
+def determine_worker_count(config: TurbospectrumConfig, requested_workers: Optional[int] = None) -> int:
     """Determine how many worker processes to spawn on HPC systems."""
     # Prefer explicit configuration
-    configured = config.max_workers if config.max_workers and config.max_workers > 0 else None
+    requested = requested_workers if requested_workers and requested_workers > 0 else None
+    configured = requested or (config.max_workers if config.max_workers and config.max_workers > 0 else None)
 
     # Respect SLURM, PBS, and similar schedulers
     scheduler_env_vars = [
@@ -673,15 +791,47 @@ def determine_worker_count(config: TurbospectrumConfig) -> int:
     if affinity_count:
         worker_count = min(worker_count, affinity_count)
 
+    memory_limit_bytes, memory_source = _detect_memory_limit_bytes(
+        affinity_count or env_value or host_cpu_count
+    )
+    worker_memory_gb = (
+        float(config.worker_memory_gb)
+        if getattr(config, "worker_memory_gb", None) not in (None, "")
+        else _default_worker_memory_gb(config)
+    )
+    reserve_gb = max(0.0, float(getattr(config, "worker_memory_reserve_gb", 8.0)))
+    memory_cap = None
+    if memory_limit_bytes and worker_memory_gb > 0:
+        usable_bytes = max(
+            int(worker_memory_gb * (1024**3)),
+            int(memory_limit_bytes - reserve_gb * (1024**3)),
+        )
+        per_worker_bytes = max(1, int(worker_memory_gb * (1024**3)))
+        memory_cap = max(1, usable_bytes // per_worker_bytes)
+        worker_count = min(worker_count, memory_cap)
+
     worker_count = max(1, worker_count)
 
     print("Parallelization setup:")
-    if configured:
+    if requested:
+        print(f"  Requested workers={requested}")
+    elif configured:
         print(f"  Using user-configured max_workers={configured}")
     if env_source:
         print(f"  Detected {env_value} CPUs from {env_source}")
     if affinity_count:
         print(f"  CPU affinity allows {affinity_count} workers")
+    if memory_limit_bytes and memory_source:
+        print(
+            "  Detected memory limit "
+            f"{memory_limit_bytes / (1024**3):.1f} GiB from {memory_source}"
+        )
+        if memory_cap is not None:
+            print(
+                "  Memory-aware cap allows "
+                f"{memory_cap} workers "
+                f"(reserve={reserve_gb:.1f} GiB, estimate={worker_memory_gb:.1f} GiB/worker)"
+            )
     print(f"  Host reports {host_cpu_count} CPUs")
     print(f"  Spawning {worker_count} worker processes")
 

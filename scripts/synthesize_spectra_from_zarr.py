@@ -1101,7 +1101,7 @@ def main() -> None:
     mu_selected_index = np.full(row_count, -1, dtype=np.int16)
 
     tasks = _build_tasks(row_count, column_data, config)
-    worker_count = int(args.workers) if args.workers and args.workers > 0 else determine_worker_count(config)
+    worker_count = determine_worker_count(config, requested_workers=args.workers)
 
     compressor_cfg: Dict[str, object] = {}
     if args.compressor:
