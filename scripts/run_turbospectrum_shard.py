@@ -1054,11 +1054,7 @@ def main():
     # Workers
     ############################################
 
-    worker_count = (
-        args.workers
-        if args.workers
-        else determine_worker_count(config)
-    )
+    worker_count = determine_worker_count(config, requested_workers=args.workers)
 
     ############################################
     # Build adaptive batches
