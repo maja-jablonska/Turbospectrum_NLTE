@@ -14,6 +14,7 @@
 # Usage examples:
 #   qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json turbospectrum_regular_grid_example.pbs
 #   qsub -J 0-511 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_regular_grid_example.pbs
+#   qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,SHARD_COUNT=10,WORKERS=32 turbospectrum_regular_grid_example.pbs
 #   qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,FINALIZE_ONLY=1 turbospectrum_regular_grid_example.pbs
 
 set -euo pipefail
@@ -106,6 +107,7 @@ if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
 fi
 REPO="$(cd "${REPO}" >/dev/null 2>&1 && pwd)"
+LAYOUT_HELPER="${REPO}/scripts/resolve_shard_layout.py"
 
 if [[ "${CONFIG_PATH}" != /* ]]; then
     CONFIG_PATH="${REPO}/${CONFIG_PATH}"
@@ -234,7 +236,7 @@ NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
 LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
 SYNTH_LOG_LEVEL="${SYNTH_LOG_LEVEL:-${CFG_LOG_LEVEL:-INFO}}"
 SYNTH_LOG_FILE="${SYNTH_LOG_FILE:-${CFG_LOG_FILE:-${LOG_DIR}/regular_grid_synthesis.log}}"
-ROWS_PER_SHARD="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
+ROWS_PER_SHARD_RAW="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
 ARRAY_TASK_MODE=0
 if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
     ARRAY_TASK_MODE=1
@@ -505,29 +507,35 @@ fi
 ROW_COUNT="$(grid_row_count)"
 echo "[regular-grid] Grid rows: ${ROW_COUNT}"
 
-if [[ -n "${ROWS_PER_SHARD}" ]]; then
-    if ! [[ "${ROWS_PER_SHARD}" =~ ^[0-9]+$ ]] || (( ROWS_PER_SHARD < 1 )); then
-        echo "[regular-grid] ERROR: ROWS_PER_SHARD must be a positive integer, got '${ROWS_PER_SHARD}'." >&2
-        exit 1
-    fi
-fi
-
-SHARD_COUNT="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
-if [[ -n "${ROWS_PER_SHARD}" && -z "${SHARD_COUNT_OVERRIDE}" && -z "${CFG_SHARD_COUNT}" ]]; then
-    SHARD_COUNT=$(( (ROW_COUNT + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
-fi
-if [[ -z "${SHARD_COUNT}" ]]; then
-    SHARD_COUNT="${ROW_COUNT}"
-fi
-if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
-    echo "[regular-grid] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
+if [[ ! -f "${LAYOUT_HELPER}" ]]; then
+    echo "[regular-grid] ERROR: shard layout helper not found: ${LAYOUT_HELPER}" >&2
     exit 1
 fi
 
-EST_ROWS_PER_SHARD=0
-if (( SHARD_COUNT > 0 )); then
-    EST_ROWS_PER_SHARD=$(( (ROW_COUNT + SHARD_COUNT - 1) / SHARD_COUNT ))
+SHARD_COUNT_RAW="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
+LAYOUT_CMD=(
+    "${PYTHON}" "${LAYOUT_HELPER}"
+    --row-count "${ROW_COUNT}"
+    --default-rows-per-shard 1
+)
+if [[ -n "${ROWS_PER_SHARD_RAW}" ]]; then
+    LAYOUT_CMD+=(--rows-per-shard "${ROWS_PER_SHARD_RAW}")
 fi
+if [[ -n "${SHARD_COUNT_RAW}" ]]; then
+    LAYOUT_CMD+=(--shard-count "${SHARD_COUNT_RAW}")
+fi
+
+LAYOUT_OUTPUT="$("${LAYOUT_CMD[@]}")"
+while IFS='=' read -r key value; do
+    case "${key}" in
+        ROW_COUNT) ROW_COUNT="${value}" ;;
+        ROWS_PER_SHARD) ROWS_PER_SHARD="${value}" ;;
+        SHARD_COUNT) SHARD_COUNT="${value}" ;;
+        ARRAY_RANGE) ARRAY_RANGE="${value}" ;;
+    esac
+done <<< "${LAYOUT_OUTPUT}"
+
+EST_ROWS_PER_SHARD="${ROWS_PER_SHARD}"
 
 SHARD_INDEX="${PBS_ARRAY_INDEX:-}"
 if (( ARRAY_TASK_MODE == 1 )) && (( SHARD_INDEX >= SHARD_COUNT )); then
@@ -558,8 +566,9 @@ echo "[regular-grid] Workers: ${WORKERS}"
 echo "[regular-grid] Validate workers: ${VALIDATE_WORKERS}"
 echo "[regular-grid] Merge chunk rows: ${MERGE_CHUNK_ROWS}"
 echo "[regular-grid] Shard count: ${SHARD_COUNT}"
-echo "[regular-grid] Rows per shard target: ${ROWS_PER_SHARD:-<one-row shards unless SHARD_COUNT set>}"
+echo "[regular-grid] Rows per shard: ${ROWS_PER_SHARD}"
 echo "[regular-grid] Estimated rows per shard: ${EST_ROWS_PER_SHARD}"
+echo "[regular-grid] Array range: ${ARRAY_RANGE}"
 echo "[regular-grid] Array mode: ${ARRAY_TASK_MODE}"
 echo "[regular-grid] Finalize only: ${FINALIZE_ONLY_EFFECTIVE}"
 echo "[regular-grid] Array index: ${PBS_ARRAY_INDEX:-<none>}"

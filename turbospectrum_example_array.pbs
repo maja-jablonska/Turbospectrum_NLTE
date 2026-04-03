@@ -91,11 +91,13 @@ REPO="${REPO:-${PBS_O_WORKDIR}}"
 CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
 WORKERS="${WORKERS:-${PBS_NCPUS:-32}}"
 SHARD_COUNT_OVERRIDE="${SHARD_COUNT:-}"
+ROWS_PER_SHARD_OVERRIDE="${ROWS_PER_SHARD:-}"
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
 fi
 REPO="$(cd "${REPO}" >/dev/null 2>&1 && pwd)"
+LAYOUT_HELPER="${REPO}/scripts/resolve_shard_layout.py"
 
 if [[ "${CONFIG_PATH}" != /* ]]; then
     CONFIG_PATH="${REPO}/${CONFIG_PATH}"
@@ -178,32 +180,40 @@ if [[ ! -d "${GRID_ZARR}" ]]; then
     exit 1
 fi
 
-ROW_COUNT="$("${PYTHON}" - <<PY
-import zarr
-root = zarr.open_group(r"${GRID_ZARR}", mode="r")
-for key in ("teff", "params", "global_index"):
-    if key in root and len(root[key].shape) >= 1:
-        print(int(root[key].shape[0]))
-        break
-else:
-    raise RuntimeError(f"Could not infer row count from {r'${GRID_ZARR}'}")
-PY
-)"
+if [[ ! -f "${LAYOUT_HELPER}" ]]; then
+    echo "[turbospec-array] ERROR: shard layout helper not found: ${LAYOUT_HELPER}" >&2
+    exit 1
+fi
 
-ROWS_PER_SHARD="${ROWS_PER_SHARD:-${CFG_ROWS_PER_SHARD:-}}"
-SHARD_COUNT="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
-if [[ -n "${ROWS_PER_SHARD}" && -z "${SHARD_COUNT_OVERRIDE}" && -z "${CFG_SHARD_COUNT}" ]]; then
-    SHARD_COUNT=$(( (ROW_COUNT + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
-fi
-if [[ -z "${SHARD_COUNT}" ]]; then
+ROWS_PER_SHARD_RAW="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
+SHARD_COUNT_RAW="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
+if [[ -z "${ROWS_PER_SHARD_RAW}" && -z "${SHARD_COUNT_RAW}" ]]; then
     echo "[turbospec-array] ERROR: SHARD_COUNT is not set and runtime.shard_count is missing in the config." >&2
-    echo "[turbospec-array] ERROR: submit with qsub -J 0-\$((N-1)) -v SHARD_COUNT=N,CONFIG_PATH=... turbospectrum_example_array.pbs" >&2
+    echo "[turbospec-array] ERROR: provide SHARD_COUNT=N or ROWS_PER_SHARD=N (or set runtime.shard_count / runtime.rows_per_shard in the config)." >&2
     exit 1
 fi
-if ! [[ "${SHARD_COUNT}" =~ ^[0-9]+$ ]] || (( SHARD_COUNT < 1 )); then
-    echo "[turbospec-array] ERROR: SHARD_COUNT must be a positive integer, got '${SHARD_COUNT}'." >&2
-    exit 1
+
+LAYOUT_CMD=(
+    "${PYTHON}" "${LAYOUT_HELPER}"
+    --zarr-path "${GRID_ZARR}"
+    --row-keys "teff,params,global_index"
+)
+if [[ -n "${ROWS_PER_SHARD_RAW}" ]]; then
+    LAYOUT_CMD+=(--rows-per-shard "${ROWS_PER_SHARD_RAW}")
 fi
+if [[ -n "${SHARD_COUNT_RAW}" ]]; then
+    LAYOUT_CMD+=(--shard-count "${SHARD_COUNT_RAW}")
+fi
+
+LAYOUT_OUTPUT="$("${LAYOUT_CMD[@]}")"
+while IFS='=' read -r key value; do
+    case "${key}" in
+        ROW_COUNT) ROW_COUNT="${value}" ;;
+        ROWS_PER_SHARD) ROWS_PER_SHARD="${value}" ;;
+        SHARD_COUNT) SHARD_COUNT="${value}" ;;
+        ARRAY_RANGE) ARRAY_RANGE="${value}" ;;
+    esac
+done <<< "${LAYOUT_OUTPUT}"
 
 SHARD_INDEX="${PBS_ARRAY_INDEX:-0}"
 if ! [[ "${SHARD_INDEX}" =~ ^[0-9]+$ ]] || (( SHARD_INDEX < 0 )); then
@@ -236,7 +246,10 @@ echo "[turbospec-array] Run root: ${RUN_ROOT}"
 echo "[turbospec-array] Log dir: ${LOG_DIR}"
 echo "[turbospec-array] Grid: ${GRID_ZARR}"
 echo "[turbospec-array] Shards: ${SHARDS_DIR}"
+echo "[turbospec-array] Grid rows: ${ROW_COUNT}"
+echo "[turbospec-array] Rows per shard: ${ROWS_PER_SHARD}"
 echo "[turbospec-array] Shard count: ${SHARD_COUNT}"
+echo "[turbospec-array] Array range: ${ARRAY_RANGE}"
 echo "[turbospec-array] Shard index: ${SHARD_INDEX}"
 echo "[turbospec-array] Output: ${SHARD_OUT}"
 echo "[turbospec-array] Scratch: ${SCRATCH}"

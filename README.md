@@ -242,6 +242,69 @@ python3 scripts/merge_spectra_shards.py \
   --output-zarr runs/local-dev/outputs/zarr/synthesized_spectra.zarr
 ```
 
+### Shard Layout And Chunking
+
+The repository now uses one shared shard-layout rule across the PBS wrappers via `scripts/resolve_shard_layout.py`.
+
+- `SHARD_COUNT` means “split the dataset into this many shards”.
+- `ROWS_PER_SHARD` means “target this many rows per shard”.
+- `CHUNK_ROWS` in `rechunk_array_example.pbs` is the rechunking equivalent of `ROWS_PER_SHARD`.
+- `chunk_rows` in pipeline config or synthesis scripts controls Zarr storage chunking, not how many PBS shards/jobs run.
+
+The wrappers resolve the missing value with ceiling division:
+
+```text
+rows_per_shard = ceil(row_count / shard_count)
+shard_count    = ceil(row_count / rows_per_shard)
+```
+
+If both are supplied, they must cover the full dataset. If neither is supplied:
+
+- `rechunk_array_example.pbs` defaults to `CHUNK_ROWS=1500`
+- `turbospectrum_regular_grid_example.pbs` defaults to one-row shards unless config or env overrides say otherwise
+- `turbospectrum_example_array.pbs` requires one of `SHARD_COUNT` or `ROWS_PER_SHARD`
+
+You can preview the resolved layout before submitting:
+
+```bash
+python3 scripts/resolve_shard_layout.py \
+  --zarr-path runs/local-dev/outputs/grids/parameter_grid.zarr \
+  --shard-count 10
+```
+
+Example output:
+
+```text
+ROW_COUNT=15001
+ROWS_PER_SHARD=1501
+SHARD_COUNT=10
+ARRAY_RANGE=0-9
+```
+
+For rechunking on PBS, you can now submit from the login node with `bash` and let the script compute and submit the correct array itself:
+
+```bash
+INPUT_ZARR=/g/data/y89/mj8805/your_input.zarr \
+OUTPUT_DIR=/scratch/mk27/$USER/harps2_rechunked \
+SHARD_COUNT=10 \
+PYTHON=$(which python) \
+bash rechunk_array_example.pbs
+```
+
+For synthesis array jobs, compute the layout first or set the matching `-J` range yourself:
+
+```bash
+python3 scripts/resolve_shard_layout.py \
+  --zarr-path runs/local-dev/outputs/grids/parameter_grid.zarr \
+  --rows-per-shard 128
+
+qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_pipeline.json,SHARD_COUNT=10 turbospectrum_example_array.pbs
+
+qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,SHARD_COUNT=10,WORKERS=32 turbospectrum_regular_grid_example.pbs
+```
+
+The array wrappers now log `ROW_COUNT`, `ROWS_PER_SHARD`, `SHARD_COUNT`, and `ARRAY_RANGE` so it is obvious how the grid is being split before any synthesis work starts.
+
 ### Legacy split scripts (optional)
 
 Manual split scripts are still present for backward compatibility:
