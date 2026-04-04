@@ -131,7 +131,12 @@ print_log_excerpt() {
     local label="$2"
     if [[ -f "${log_path}" ]]; then
         echo "[regular-grid] ${label}: ${log_path}" >&2
-        sed -n '1,120p' "${log_path}" >&2 || true
+        if grep -Einq 'error|failed|exception|traceback|missing spectrum|forrtl|killed|oom|assert' "${log_path}"; then
+            echo "[regular-grid] Matching error lines from ${log_path} (last 80):" >&2
+            grep -Ein 'error|failed|exception|traceback|missing spectrum|forrtl|killed|oom|assert' "${log_path}" | tail -n 80 >&2 || true
+        fi
+        echo "[regular-grid] Last 120 lines from ${log_path}:" >&2
+        tail -n 120 "${log_path}" >&2 || true
     fi
 }
 
@@ -537,7 +542,9 @@ generate_grid_if_needed() {
 clear_restart_outputs() {
     echo "[regular-grid] Force restart requested; clearing previous shard outputs."
     find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
-    rm -f "${PENDING_SHARDS_FILE}" "${MISSING_FILE}" "${NEXT_WORK_ITEM}" "${ARRAY_PREP_MARKER}"
+    rm -f "${PENDING_SHARDS_FILE}" "${MISSING_FILE}" "${NEXT_WORK_ITEM}" \
+          "${ARRAY_PREP_MARKER}" "${ARRAY_PREP_FAILURE_MARKER}"
+    rm -rf "${ARRAY_PREP_LOCK_DIR}"
     if [[ -d "${MERGED_ZARR}" ]]; then
         rm -rf "${MERGED_ZARR}"
     fi
@@ -742,6 +749,10 @@ run_shard_attempts () {
         start=$(date +%s)
         attempt_scratch="${scratch_root}/shard_${shard}_a${attempt}"
         mkdir -p "${attempt_scratch}"
+        {
+            printf '[regular-grid] shard=%s attempt=%s/%s workers=%s scratch=%s started_at=%s\n' \
+                "${shard}" "${attempt}" "${max_attempts}" "${worker_count}" "${attempt_scratch}" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+        } >> "${log_file}"
 
         if "${PYTHON}" "${REPO}/scripts/run_turbospectrum_shard.py" \
             --grid-zarr "${GRID_ZARR}" \
@@ -755,10 +766,18 @@ run_shard_attempts () {
             --log-level "${SYNTH_LOG_LEVEL}" \
             >> "${log_file}" 2>&1; then
             end=$(date +%s)
-            echo "runtime_seconds=$((end-start)) attempt=${attempt} workers=${worker_count}" >> "${log_file}"
+            {
+                printf '[regular-grid] shard=%s attempt=%s/%s completed_at=%s runtime_seconds=%s workers=%s\n' \
+                    "${shard}" "${attempt}" "${max_attempts}" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$((end-start))" "${worker_count}"
+            } >> "${log_file}"
             return 0
         fi
 
+        rc=$?
+        {
+            printf '[regular-grid] shard=%s attempt=%s/%s failed_rc=%s failed_at=%s workers=%s\n' \
+                "${shard}" "${attempt}" "${max_attempts}" "${rc}" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${worker_count}"
+        } >> "${log_file}"
         rm -rf "${tmp_out}"
         sleep $(( (RANDOM % 10) + attempt * sleep_base ))
     done
@@ -771,9 +790,10 @@ run_shard_attempts () {
 ############################################
 
 worker() {
-    local jobfs_dir task_index shard
+    local jobfs_dir task_index shard available_kb
     jobfs_dir="${TMP_WORK_DIR}/worker_${RANDOM}"
     mkdir -p "${jobfs_dir}"
+    trap 'rc=$?; if (( rc != 0 )); then echo "[regular-grid] WARN: outer worker aborted unexpectedly with rc=${rc} task_index=${task_index:-<unset>} shard=${shard:-<unset>} jobfs=${jobfs_dir:-<unset>}." >&2; fi' EXIT
 
     while true; do
         if (( $(time_left) < EST_RUNTIME + SAFETY_BUFFER )); then
@@ -781,8 +801,14 @@ worker() {
             break
         fi
 
-        AVAILABLE=$(df -Pk "${jobfs_dir}" | awk 'NR==2 {print $4}')
-        if (( AVAILABLE < 5*1024*1024 )); then
+        available_kb="$(df -Pk "${jobfs_dir}" 2>/dev/null | awk 'NR==2 {print $4}')"
+        if ! [[ "${available_kb}" =~ ^[0-9]+$ ]]; then
+            echo "[regular-grid] WARN: could not determine scratch availability for ${jobfs_dir}; retrying in 15s."
+            sleep 15
+            continue
+        fi
+
+        if (( available_kb < 5*1024*1024 )); then
             echo "Low scratch — sleeping."
             sleep 60
             continue
@@ -790,7 +816,13 @@ worker() {
 
         exec 9<>"${LOCK_FILE}"
         flock -x 9
-        task_index=$(cat "${NEXT_WORK_ITEM}")
+        task_index="$(cat "${NEXT_WORK_ITEM}" 2>/dev/null || printf '')"
+        if ! [[ "${task_index}" =~ ^[0-9]+$ ]]; then
+            flock -u 9
+            exec 9>&-
+            echo "[regular-grid] WARN: next-work counter ${NEXT_WORK_ITEM} is missing or invalid; stopping this worker."
+            break
+        fi
         echo $((task_index + 1)) > "${NEXT_WORK_ITEM}"
         flock -u 9
         exec 9>&-
@@ -808,6 +840,8 @@ worker() {
             echo "Shard ${shard} failed after ${SHARD_RETRY_ATTEMPTS} attempts in main loop." >> "${LOG_DIR}/shard_${shard}.log"
         fi
     done
+
+    trap - EXIT
 }
 
 export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO PYTHON \
@@ -863,10 +897,24 @@ elif (( PENDING_COUNT > 0 )); then
         fi
         export SINGLE_JOB_SHARD_WORKERS_EFFECTIVE
         echo "[regular-grid] Launching ${ACTIVE_OUTER_WORKERS} outer workers for ${PENDING_COUNT} pending shards (${SINGLE_JOB_SHARD_WORKERS_EFFECTIVE} synthesis worker(s) per shard subprocess)..."
+        WORKER_PIDS=()
         for ((i=0; i<ACTIVE_OUTER_WORKERS; i++)); do
             worker &
+            WORKER_PIDS+=("$!")
         done
-        wait
+        WORKER_FAILURES=0
+        for worker_pid in "${WORKER_PIDS[@]}"; do
+            if wait "${worker_pid}"; then
+                :
+            else
+                worker_rc=$?
+                WORKER_FAILURES=$((WORKER_FAILURES + 1))
+                echo "[regular-grid] WARN: outer worker pid=${worker_pid} exited unexpectedly with rc=${worker_rc}."
+            fi
+        done
+        if (( WORKER_FAILURES > 0 )); then
+            echo "[regular-grid] WARN: ${WORKER_FAILURES}/${#WORKER_PIDS[@]} outer workers exited unexpectedly; continuing to validation/merge with completed shards."
+        fi
     fi
 else
     echo "[regular-grid] No pending shards detected; moving directly to validation/merge."
