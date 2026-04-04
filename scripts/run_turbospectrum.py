@@ -1613,12 +1613,14 @@ def run_single_synthesis(args):
     
     # If exact model doesn't exist, pick a nearest-neighbor MARCS atmosphere (no interpolation).
     model_input_path = model_path
+    fallback_model_message = ""
     if not os.path.exists(model_path):
         model_lib = ModelInterpolator(config)
         nearest, message = model_lib.find_nearest_model(teff, logg, feh, model_turb_str)
         if not nearest:
             return build_result("error", f"Model missing and nearest-neighbor selection failed: {message}")
         model_input_path = nearest["path"]
+        fallback_model_message = message
 
     nlte_info_file_for_run = (
         os.path.abspath(str(config.nlte_info_file))
@@ -1668,6 +1670,12 @@ def run_single_synthesis(args):
                 "Shortened synthesis stem to satisfy Fortran path limits: "
                 f"original={base_name_raw} shortened={base_name}\n"
             )
+        if fallback_model_message:
+            log.write(
+                "WARNING: requested atmosphere model was not found; "
+                f"requested={model_path} selected={model_input_path} "
+                f"reason={fallback_model_message}\n"
+            )
         if nlte_ascii_info is not None:
             log.write(
                 "NLTE ASCII departure override: "
@@ -1680,6 +1688,17 @@ def run_single_synthesis(args):
                 f"model_stem={nlte_ascii_info['model_stem']} "
                 f"file={nlte_ascii_info['departure_file']}\n"
             )
+            abundance_delta = abs(
+                float(nlte_ascii_info["departure_file_abundance"]) - float(nlte_ascii_info["target_abundance"])
+            )
+            if abundance_delta > 0.25:
+                log.write(
+                    "WARNING: NLTE ASCII override is using a distant abundance match; "
+                    f"delta={abundance_delta:+0.3f} "
+                    f"target={nlte_ascii_info['target_abundance']:+0.3f} "
+                    f"applied={nlte_ascii_info['departure_file_abundance']:+0.3f} "
+                    "consider setting nlte_ascii_match='exact' to fail fast instead of silently using the nearest file.\n"
+                )
         
         # ---------------------------------------------------------------------
         # Step 1: BABSMA (Continuous Opacity)
@@ -1703,6 +1722,7 @@ def run_single_synthesis(args):
         log.write("\n--- BABSMA INPUT ---\n")
         log.write(babsma_input)
         log.write("\n--------------------\n")
+        log.flush()
         
         try:
             process = subprocess.run(
@@ -1713,8 +1733,12 @@ def run_single_synthesis(args):
                 stderr=subprocess.STDOUT,
                 cwd=config.project_root # Run from root so relative paths in Fortran work if needed
             )
+            log.write(
+                f"\n--- BABSMA EXIT ---\nrc={process.returncode} opac_exists={os.path.exists(opac_path)} path={opac_path}\n"
+            )
+            log.write("-------------------\n")
+            log.flush()
             if process.returncode != 0:
-                log.flush()
                 return build_result(
                     "error",
                     _with_turbospectrum_log_context(
@@ -1725,7 +1749,6 @@ def run_single_synthesis(args):
                     log_path=log_file,
                 )
             if not os.path.exists(opac_path):
-                log.flush()
                 return build_result(
                     "error",
                     _with_turbospectrum_log_context(
@@ -1796,6 +1819,7 @@ def run_single_synthesis(args):
             log.write(f"\n--- BSYN INPUT ({mode_str}) ---\n")
             log.write(bsyn_input)
             log.write("\n------------------\n")
+            log.flush()
 
             try:
                 process = subprocess.run(
@@ -1806,8 +1830,14 @@ def run_single_synthesis(args):
                     stderr=subprocess.STDOUT,
                     cwd=config.project_root
                 )
+                log.write(
+                    f"\n--- BSYN EXIT ({mode_str}) ---\n"
+                    f"rc={process.returncode} result_exists={os.path.exists(current_result_file)} "
+                    f"path={current_result_file}\n"
+                )
+                log.write("---------------------------\n")
+                log.flush()
                 if process.returncode != 0:
-                    log.flush()
                     return build_result(
                         "error",
                         _with_turbospectrum_log_context(
@@ -1818,7 +1848,6 @@ def run_single_synthesis(args):
                         log_path=log_file,
                     )
                 if not os.path.exists(current_result_file):
-                    log.flush()
                     return build_result(
                         "error",
                         _with_turbospectrum_log_context(
