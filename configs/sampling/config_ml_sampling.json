@@ -1,4 +1,8 @@
 {
+    "_note": [
+        "Top-level run_root is the base output directory for relative outputs like outputs/grids/...",
+        "When this grid is synthesized, turbvel and t_value are both preserved as numeric parameter columns alongside vmicro."
+    ],
     "grid_version": "intensity-demo",
     "num_samples": 100,
     "seed": 1329397429,
