@@ -571,6 +571,11 @@ def _synthesis_task(batch):
                         chosen_idx=chosen_idx,
                         reduce_mode=reduce_mode,
                     )
+                else:
+                    flux, cont = extract_flux_and_continuum(
+                        data,
+                        is_intensity=is_intensity,
+                    )
 
                 spectrum = (flux, cont)
 
