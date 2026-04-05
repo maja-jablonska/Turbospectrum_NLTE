@@ -257,6 +257,24 @@ def _default_index_parquet_path(zarr_path: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(zarr_path)), "index.parquet")
 
 
+def _default_run_root() -> str:
+    run_root = os.environ.get("RUN_ROOT")
+    if run_root:
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(run_root)))
+    return os.path.join(REPO_ROOT, "runs", "local-dev")
+
+
+def _resolve_output_path(run_root: str, cfg_dir: str, maybe_relative: str | None, default_path: str) -> str:
+    if maybe_relative in (None, ""):
+        return os.path.abspath(default_path)
+    path = str(maybe_relative)
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+    if not path.startswith((".", "..")):
+        return os.path.abspath(os.path.join(run_root, path))
+    return os.path.abspath(os.path.join(cfg_dir, path))
+
+
 def _index_df_from_zarr(root, column_names: Sequence[str]) -> pl.DataFrame:
     payload: Dict[str, Any] = {}
     row_count: int | None = None
@@ -373,6 +391,7 @@ def main() -> None:
     t0 = time.perf_counter()
 
     config = _load_config(args.config)
+    cfg_dir = os.path.dirname(os.path.abspath(args.config))
     logger.debug("Config contents:\n%s", json.dumps(config, indent=2, sort_keys=True))
     sample_count = args.samples or int(config.get("num_samples", 50))
     seed = config.get("seed")
@@ -442,15 +461,33 @@ def main() -> None:
     turbvel_cfg = config.get("turbvel", "01")
     t_value_options = config.get("t_value_options", ["01"])
 
+    run_root_cfg = config.get("run_root")
+    if run_root_cfg not in (None, ""):
+        run_root = _resolve_output_path(REPO_ROOT, cfg_dir, run_root_cfg, _default_run_root())
+    else:
+        run_root = _default_run_root()
+
     zarr_cfg = config.get("zarr", {})
-    zarr_path = args.zarr_output or args.output or zarr_cfg.get("path") or DEFAULT_ZARR_PATH
-    index_parquet_path = args.index_parquet_output or config.get("index_parquet") or _default_index_parquet_path(zarr_path)
+    if args.zarr_output or args.output:
+        zarr_path = os.path.abspath(args.zarr_output or args.output)
+    else:
+        zarr_path = _resolve_output_path(run_root, cfg_dir, zarr_cfg.get("path"), DEFAULT_ZARR_PATH)
+    if args.index_parquet_output:
+        index_parquet_path = os.path.abspath(args.index_parquet_output)
+    else:
+        index_parquet_path = _resolve_output_path(
+            run_root,
+            cfg_dir,
+            config.get("index_parquet"),
+            _default_index_parquet_path(zarr_path),
+        )
     zarr_chunks = int(zarr_cfg.get("chunks", 2048)) if zarr_cfg else 2048
     zarr_compressor_cfg = zarr_cfg.get("compressor", {}) if zarr_cfg else {}
 
     if not zarr_path:
         raise ValueError("Zarr output path must be provided via config, --zarr-output, or --output (deprecated alias).")
     os.makedirs(os.path.dirname(os.path.abspath(zarr_path)), exist_ok=True)
+    logger.info("Run root: %s", os.path.abspath(run_root))
     logger.info("Zarr output: %s (chunks=%s)", os.path.abspath(zarr_path), zarr_chunks)
     logger.info("Index parquet: %s", os.path.abspath(index_parquet_path))
 
