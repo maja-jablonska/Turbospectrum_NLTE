@@ -1,0 +1,78 @@
+{
+  "_comment": "Tiny Gadi-oriented regular-grid smoke test for Fe NLTE generation with ASCII departures.",
+  "_note": [
+    "Use with the tiny PBS wrappers at the repo root or directly with turbospectrum_regular_grid_example.pbs.",
+    "This config intentionally omits explicit output paths so RUN_ROOT or SCRATCH can control where files land on Gadi.",
+    "The grid is deliberately tiny: 2 teff x 1 logg x 2 feh x 1 turbvel = 4 rows."
+  ],
+  "grid": {
+    "grid_version": "regular-fe-nlte-tiny-gadi-v1",
+    "axes": {
+      "teff": "5000,5250",
+      "logg": "4.0",
+      "feh": "-0.5,0.0",
+      "turbvel": "01"
+    },
+    "abundances": {},
+    "synthesis": {
+      "lam_min": 5000.0,
+      "lam_max": 5005.0,
+      "lam_step": 0.02,
+      "output_mode": "Flux",
+      "mode": "1D",
+      "calculation_mode": "NLTE"
+    },
+    "limits": {
+      "max_rows": 32
+    },
+    "io": {
+      "csv_compression": "zstd",
+      "csv_compression_level": 3,
+      "zarr_chunks": 64,
+      "zarr_compressor": {
+        "cname": "zstd",
+        "clevel": 3,
+        "shuffle": true
+      }
+    }
+  },
+  "nlte_ascii_departures": {
+    "_note": [
+      "Fe abundance is derived from [Fe/H] using the Magg 2022 solar abundance adopted by the runtime.",
+      "Nearest-file matching makes this safer as a smoke test when only a sparse departure subset is available."
+    ],
+    "directory": "../../DATA/DEP/nlte_departures_ascii",
+    "species": "Fe",
+    "abundance_column": "feh",
+    "abundance_scale": "relative",
+    "solar_abundance": 7.51,
+    "match": "nearest"
+  },
+  "turbospectrum": {
+    "config": "../synthesis/config_sample_comprehensive.json",
+    "overrides": {
+      "paths": {
+        "linelist_path": "../../input_files/linelists",
+        "linelist_files": [
+          "nlte_ges_linelist_jmg6may2025_I_II"
+        ]
+      },
+      "nlte": {
+        "enabled": true,
+        "nlte_info_file": "../../DATA/SPECIES_LTE_NLTE.dat"
+      }
+    }
+  },
+  "runtime": {
+    "_note": "Small shard sizes keep the smoke test quick while still exercising shard generation and merge paths.",
+    "workers": 2,
+    "shard_count": null,
+    "rows_per_shard": 2,
+    "scratch": null,
+    "chunk_rows": 2,
+    "output_tmp": null,
+    "log_level": "INFO",
+    "log_file": null,
+    "skip_synthesis": false
+  }
+}

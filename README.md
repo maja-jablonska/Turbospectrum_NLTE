@@ -418,6 +418,32 @@ Behavior summary:
 - non-array runs still support resume/merge in one submission, but chunked shards reduce startup overhead and usually improve CPU utilization substantially
 - `FINALIZE_ONLY=1` skips synthesis and just validates/merges the shard directory, which is the intended post-array follow-up step
 
+### Tiny NLTE Regular-grid Gadi Smoke Jobs
+
+For a very small Fe NLTE smoke test on Gadi, using the regular-grid workflow and ASCII departures, use:
+
+```bash
+qsub turbospectrum_regular_grid_nlte_tiny_gadi.pbs
+```
+
+Tiny PBS array version:
+
+```bash
+qsub turbospectrum_regular_grid_nlte_tiny_array_gadi.pbs
+```
+
+Finalize-only follow-up after the tiny array completes:
+
+```bash
+qsub turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
+```
+
+Notes:
+- these wrappers default to `configs/pipeline/config_regular_grid_nlte_fe_tiny_gadi.json`
+- the tiny config uses only 4 grid rows and defaults to `ROWS_PER_SHARD=2`, so the array job intentionally overshoots and lets extra tasks exit cleanly
+- outputs default under `/scratch/<PROJECT>/<USER>/Turbospectrum_NLTE_regular_nlte_tiny` unless you override `RUN_ROOT`
+- the goal is a quick scheduler and NLTE wiring check, not a science-scale production run
+
 ## W&B on Gadi/HPC (MLP)
 
 W&B defaults for `wandb_agent.pbs` and `wandb_sync.pbs` are now centralized in:
