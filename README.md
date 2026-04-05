@@ -440,7 +440,7 @@ qsub turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
 
 Notes:
 - these wrappers default to `configs/pipeline/config_regular_grid_nlte_fe_tiny_gadi.json`
-- the tiny config uses only 4 grid rows and defaults to `ROWS_PER_SHARD=2`, so the array job intentionally overshoots and lets extra tasks exit cleanly
+- the tiny config uses 8 grid rows and defaults to `ROWS_PER_SHARD=2`, so the array job intentionally overshoots and lets extra tasks exit cleanly
 - outputs default under `/scratch/<PROJECT>/<USER>/Turbospectrum_NLTE_regular_nlte_tiny` unless you override `RUN_ROOT`
 - the goal is a quick scheduler and NLTE wiring check, not a science-scale production run
 
