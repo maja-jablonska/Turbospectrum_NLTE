@@ -1,0 +1,26 @@
+#!/bin/bash
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -N ts-rg-nlte-tiny
+#PBS -l ncpus=4
+#PBS -l mem=16GB
+#PBS -l jobfs=20GB
+#PBS -l walltime=00:30:00
+#PBS -j oe
+#PBS -M maja.jablonska@anu.edu.au
+#PBS -m bae
+#PBS -l storage=scratch/mk27+scratch/y89
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+export CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_regular_grid_nlte_fe_tiny_gadi.json}"
+export PROJECT="${PROJECT:-mk27}"
+export USER_ID="${USER_ID:-$(whoami)}"
+export RUN_ROOT="${RUN_ROOT:-/scratch/${PROJECT}/${USER_ID}/Turbospectrum_NLTE_regular_nlte_tiny}"
+export WORKERS="${WORKERS:-2}"
+export ROWS_PER_SHARD="${ROWS_PER_SHARD:-2}"
+export VALIDATE_WORKERS="${VALIDATE_WORKERS:-2}"
+export MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-8}"
+
+exec bash "${PBS_O_WORKDIR}/turbospectrum_regular_grid_example.pbs"

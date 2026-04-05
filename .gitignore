@@ -68,5 +68,11 @@ input_files/*
 *.pbs
 
 # Keep template files that explicitly include "_EXAMPLE" in the name.
+!/configs/
+!/configs/pipeline/
 !/configs/**/_example*
 !*_example*.pbs
+!/configs/pipeline/config_regular_grid_nlte_fe_tiny_gadi.json
+!turbospectrum_regular_grid_nlte_tiny_gadi.pbs
+!turbospectrum_regular_grid_nlte_tiny_array_gadi.pbs
+!turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
