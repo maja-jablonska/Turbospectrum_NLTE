@@ -3,13 +3,13 @@
   "_note": [
     "Use with the tiny PBS wrappers at the repo root or directly with turbospectrum_regular_grid_example.pbs.",
     "This config intentionally omits explicit output paths so RUN_ROOT or SCRATCH can control where files land on Gadi.",
-    "The grid is deliberately tiny: 2 teff x 1 logg x 2 feh x 1 turbvel = 4 rows."
+    "The grid is deliberately tiny: 2 teff x 2 logg x 2 feh x 1 turbvel = 8 rows."
   ],
   "grid": {
     "grid_version": "regular-fe-nlte-tiny-gadi-v1",
     "axes": {
       "teff": "5000,5250",
-      "logg": "4.0",
+      "logg": "4.0,4.5",
       "feh": "-0.5,0.0",
       "turbvel": "01"
     },
