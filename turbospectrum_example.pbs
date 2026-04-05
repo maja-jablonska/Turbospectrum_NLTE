@@ -230,6 +230,10 @@ fi
 
 NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
 LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
+INITIAL_FAILURE_ABORT_THRESHOLD="${INITIAL_FAILURE_ABORT_THRESHOLD:-0}"
+INITIAL_FAILURE_COUNT_FILE="${INITIAL_FAILURE_COUNT_FILE:-${RUN_ROOT}/initial_failure_count.txt}"
+SUCCESS_COUNT_FILE="${SUCCESS_COUNT_FILE:-${RUN_ROOT}/success_count.txt}"
+EARLY_STOP_MARKER="${EARLY_STOP_MARKER:-${RUN_ROOT}/early_stop_marker.txt}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
@@ -238,7 +242,9 @@ TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 PENDING_SHARDS_FILE="${PENDING_SHARDS_FILE:-${RUN_ROOT}/pending_shards.txt}"
 mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${NEXT_WORK_ITEM}")" "$(dirname "${LOCK_FILE}")" \
-         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
+         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" \
+         "$(dirname "${INITIAL_FAILURE_COUNT_FILE}")" "$(dirname "${SUCCESS_COUNT_FILE}")" \
+         "$(dirname "${EARLY_STOP_MARKER}")"
 
 # Force mkstemp()/tempfile users to write under designated scratch temp.
 export TMPDIR="${TMP_SYSTEM_DIR}"
@@ -385,6 +391,64 @@ time_left () {
     echo $((WALLTIME_SECONDS - ($(date +%s) - START_TIME)))
 }
 
+initial_failure_stop_enabled () {
+    [[ "${INITIAL_FAILURE_ABORT_THRESHOLD}" =~ ^[0-9]+$ ]] && (( INITIAL_FAILURE_ABORT_THRESHOLD > 0 ))
+}
+
+initialize_initial_failure_tracking () {
+    local completed_count="${1:-0}"
+    if ! initial_failure_stop_enabled; then
+        return
+    fi
+    printf '0\n' > "${INITIAL_FAILURE_COUNT_FILE}"
+    printf '%s\n' "${completed_count}" > "${SUCCESS_COUNT_FILE}"
+    rm -f "${EARLY_STOP_MARKER}"
+}
+
+record_shard_outcome () {
+    local shard="$1"
+    local outcome="$2"
+    local log_file="$3"
+    if ! initial_failure_stop_enabled; then
+        return
+    fi
+
+    exec 8<>"${LOCK_FILE}"
+    flock -x 8
+    local success_count failure_count
+    success_count="$(cat "${SUCCESS_COUNT_FILE}" 2>/dev/null || printf '0')"
+    failure_count="$(cat "${INITIAL_FAILURE_COUNT_FILE}" 2>/dev/null || printf '0')"
+    [[ "${success_count}" =~ ^[0-9]+$ ]] || success_count=0
+    [[ "${failure_count}" =~ ^[0-9]+$ ]] || failure_count=0
+
+    if [[ "${outcome}" == "success" ]]; then
+        success_count=$((success_count + 1))
+        printf '%s\n' "${success_count}" > "${SUCCESS_COUNT_FILE}"
+    elif (( success_count == 0 )); then
+        failure_count=$((failure_count + 1))
+        printf '%s\n' "${failure_count}" > "${INITIAL_FAILURE_COUNT_FILE}"
+        if (( failure_count >= INITIAL_FAILURE_ABORT_THRESHOLD )) && [[ ! -f "${EARLY_STOP_MARKER}" ]]; then
+            {
+                printf 'reason=initial_failure_threshold_reached\n'
+                printf 'threshold=%s\n' "${INITIAL_FAILURE_ABORT_THRESHOLD}"
+                printf 'failure_count=%s\n' "${failure_count}"
+                printf 'success_count=%s\n' "${success_count}"
+                printf 'last_shard=%s\n' "${shard}"
+                printf 'last_log=%s\n' "${log_file}"
+                printf 'timestamp=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+            } > "${EARLY_STOP_MARKER}"
+            printf '[turbospec] EARLY STOP: first %s shard calculation(s) failed before any success; threshold=%s; last_shard=%s; log=%s\n' \
+                "${failure_count}" "${INITIAL_FAILURE_ABORT_THRESHOLD}" "${shard}" "${log_file}" >> "${LOG_DIR}/early_stop.log"
+        fi
+    fi
+    flock -u 8
+    exec 8>&-
+}
+
+should_stop_early () {
+    initial_failure_stop_enabled && [[ -f "${EARLY_STOP_MARKER}" ]]
+}
+
 run_shard_attempts () {
     local shard="$1"
     local max_attempts="$2"
@@ -517,6 +581,7 @@ PENDING_COUNT=$(wc -l < "${PENDING_SHARDS_FILE}" | tr -d '[:space:]')
 echo 0 > "${NEXT_WORK_ITEM}"
 
 COMPLETED_COUNT=$((SHARD_COUNT - PENDING_COUNT))
+initialize_initial_failure_tracking "${COMPLETED_COUNT}"
 echo "[turbospec] Existing valid shards: ${COMPLETED_COUNT}/${SHARD_COUNT}"
 
 ############################################
@@ -529,6 +594,10 @@ worker() {
     mkdir -p "${jobfs_dir}"
 
     while true; do
+        if should_stop_early; then
+            echo "[turbospec] Early-stop marker detected; worker is exiting without starting new shards."
+            break
+        fi
 
         #################################
         # Walltime protection
@@ -580,12 +649,20 @@ worker() {
 
         if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15; then
             echo "Shard ${shard} failed after ${SHARD_RETRY_ATTEMPTS} attempts in main loop." >> "${LOG_DIR}/shard_${shard}.log"
+            record_shard_outcome "${shard}" "failure" "${LOG_DIR}/shard_${shard}.log"
+            if should_stop_early; then
+                echo "[turbospec] Early-stop threshold reached after shard ${shard} failure; worker is exiting."
+                break
+            fi
+        else
+            record_shard_outcome "${shard}" "success" "${LOG_DIR}/shard_${shard}.log"
         fi
     done
 }
 
 export -f worker
-export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE SHARD_COUNT LOG_DIR REPO PYTHON PBS_JOBID CONFIG_PATH TMP_OUTPUT_DIR
+export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE SHARD_COUNT LOG_DIR REPO PYTHON PBS_JOBID CONFIG_PATH TMP_OUTPUT_DIR \
+       INITIAL_FAILURE_ABORT_THRESHOLD INITIAL_FAILURE_COUNT_FILE SUCCESS_COUNT_FILE EARLY_STOP_MARKER
 
 ############################################
 # Launch workers (start conservative!)
@@ -606,6 +683,12 @@ if (( PENDING_COUNT > 0 )); then
     fi
 else
     echo "[turbospec] No pending shard IDs detected; moving directly to validation/merge."
+fi
+
+if should_stop_early; then
+    echo "[turbospec] ERROR: early-stop threshold reached; aborting before validation/merge. See ${EARLY_STOP_MARKER}." >&2
+    cat "${EARLY_STOP_MARKER}" >&2 || true
+    exit 1
 fi
 
 CURRENT=$(cat "${NEXT_WORK_ITEM}")

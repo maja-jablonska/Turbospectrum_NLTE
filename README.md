@@ -382,6 +382,12 @@ Post-processing tuning overrides (optional):
 qsub -v WORKERS=32,VALIDATE_WORKERS=32,MERGE_CHUNK_ROWS=128 turbospectrum_example.pbs
 ```
 
+Optional early-abort safety:
+
+```bash
+qsub -v INITIAL_FAILURE_ABORT_THRESHOLD=3 turbospectrum_example.pbs
+```
+
 Behavior summary:
 - uses the one-config pipeline (`pipeline_from_config.py --synthesis-mode sharded`) for shard generation
 - reads default grid/shard/merged output paths from `outputs` in the pipeline config
@@ -420,12 +426,19 @@ Finalize/merge after the array completes:
 qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,FINALIZE_ONLY=1 turbospectrum_regular_grid_example.pbs
 ```
 
+Optional early-abort safety for cold starts:
+
+```bash
+qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,INITIAL_FAILURE_ABORT_THRESHOLD=3 turbospectrum_regular_grid_example.pbs
+```
+
 Behavior summary:
 - reads `runtime.shard_count` / `runtime.rows_per_shard` from the regular-grid config and falls back to one-row shards only when neither is set
 - in array mode, task `0` prepares the grid once and later tasks wait for it before starting synthesis
 - array tasks beyond the true shard count exit cleanly, so it is safe to submit a slightly oversized `-J` range
 - non-array runs still support resume/merge in one submission, but chunked shards reduce startup overhead and usually improve CPU utilization substantially
 - `FINALIZE_ONLY=1` skips synthesis and just validates/merges the shard directory, which is the intended post-array follow-up step
+- `INITIAL_FAILURE_ABORT_THRESHOLD=N` aborts the job once the first `N` shard calculations all fail before any success, and writes a stop marker plus summary under `RUN_ROOT`
 
 ### Tiny NLTE Regular-grid Gadi Smoke Jobs
 

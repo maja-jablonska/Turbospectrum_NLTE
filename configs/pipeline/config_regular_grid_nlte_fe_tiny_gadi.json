@@ -52,9 +52,10 @@
     "config": "../synthesis/config_sample_comprehensive.json",
     "overrides": {
       "paths": {
+        "model_atmosphere_path": "../../input_files/model_atmospheres/1D/marcs_standard_comp",
         "linelist_path": "../../input_files/linelists",
         "linelist_files": [
-          "nlte_ges_linelist_jmg6may2025_I_II"
+          "nlte_ges_linelist_jmg16jan2026_I_II"
         ]
       },
       "nlte": {
