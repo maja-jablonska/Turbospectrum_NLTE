@@ -26,12 +26,13 @@
     },
     "mode": "1D",
     "calculation_mode": "LTE",
-    "output_csv": "../../runs/local-dev/outputs/grids/intensity_grid.csv",
+    "run_root": "../../runs/local-dev",
+    "output_csv": "outputs/grids/intensity_grid.csv",
     "csv_compression": "zstd",
     "csv_compression_level": 5,
-    "index_parquet": "../../runs/local-dev/outputs/grids/index.parquet",
+    "index_parquet": "outputs/grids/index.parquet",
     "zarr": {
-        "path": "../../runs/local-dev/outputs/grids/intensity_grid.zarr",
+        "path": "outputs/grids/intensity_grid.zarr",
         "chunks": 2048,
         "compressor": {
             "cname": "zstd",

@@ -132,6 +132,16 @@ def _parse_turbvel_values(raw: str) -> np.ndarray:
     return np.asarray(out, dtype=object)
 
 
+def _abs_output_from(run_root: str, cfg_dir: str, maybe_relative: str | None) -> str | None:
+    if not maybe_relative:
+        return None
+    if os.path.isabs(maybe_relative):
+        return maybe_relative
+    if not maybe_relative.startswith((".", "..")):
+        return os.path.abspath(os.path.join(run_root, maybe_relative))
+    return os.path.abspath(os.path.join(cfg_dir, maybe_relative))
+
+
 def _build_regular_columns(
     *,
     teff_axis: np.ndarray,
@@ -479,7 +489,7 @@ def main() -> None:
             return _as_abspath(str(cli_value))
         cfg_value = _cfg_get(cfg, cfg_keys, None)
         if cfg_value is not None:
-            return _abs_from(cfg_dir, str(cfg_value))
+            return _abs_output_from(run_root, cfg_dir, str(cfg_value))
         return os.path.abspath(default_path)
 
     grid_zarr = _resolve_path(
@@ -504,7 +514,7 @@ def main() -> None:
     )
     shard_template_cfg = _cfg_get(cfg, ("outputs", "spectra_shard_template"), None)
     if shard_template_cfg is not None:
-        spectra_shard_template = _abs_from(cfg_dir, str(shard_template_cfg))
+        spectra_shard_template = _abs_output_from(run_root, cfg_dir, str(shard_template_cfg))
     else:
         spectra_shard_template = os.path.abspath(_default_shard_template(run_root))
     spectra_shards_dir = os.path.dirname(spectra_shard_template)

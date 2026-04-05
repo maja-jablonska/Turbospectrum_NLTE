@@ -61,13 +61,13 @@
     }
   },
   "outputs": {
-    "_note": "Paths resolved relative to this config unless absolute.",
+    "_note": "run_root is resolved relative to this config unless absolute; output paths under outputs/... are resolved relative to run_root.",
     "run_root": "../../runs/regular-grid",
-    "grid_csv": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.csv",
-    "grid_zarr": "../../runs/regular-grid/outputs/grids/regular_parameter_grid.zarr",
-    "grid_index_parquet": "../../runs/regular-grid/outputs/grids/index.parquet",
-    "spectra_zarr": "../../runs/regular-grid/outputs/zarr/regular_synthesized_spectra.zarr",
-    "spectra_shard_template": "../../runs/regular-grid/outputs/shards/spectra_shard_{shard_index}.zarr"
+    "grid_csv": "outputs/grids/regular_parameter_grid.csv",
+    "grid_zarr": "outputs/grids/regular_parameter_grid.zarr",
+    "grid_index_parquet": "outputs/grids/index.parquet",
+    "spectra_zarr": "outputs/zarr/regular_synthesized_spectra.zarr",
+    "spectra_shard_template": "outputs/shards/spectra_shard_{shard_index}.zarr"
   },
   "runtime": {
     "_note": "rows_per_shard is recommended for regular-grid HPC runs; PBS arrays can overshoot the final index because extra tasks exit cleanly.",
