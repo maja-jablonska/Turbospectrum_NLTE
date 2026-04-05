@@ -10,6 +10,7 @@ import zarr
 
 from scripts.spectrum_output import extract_flux_and_continuum, infer_flux_metadata
 from scripts.run_turbospectrum import TurbospectrumConfig
+import scripts.run_turbospectrum_shard as synth_shard
 import scripts.synthesize_spectra_from_zarr as synth_from_zarr
 
 
@@ -114,6 +115,55 @@ class SpectrumOutputTests(unittest.TestCase):
             self.assertEqual(result["status"], "success")
             self.assertIsNotNone(result["spectrum"])
             flux, continuum = result["spectrum"]
+            np.testing.assert_allclose(flux, np.asarray([2.0, 1.0], dtype=np.float32))
+            np.testing.assert_allclose(continuum, np.asarray([4.0, 4.0], dtype=np.float32))
+
+    def test_shard_synthesis_task_reads_flux_spectrum_without_unbound_local(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec_path = os.path.join(tmpdir, "test.spec")
+            with open(spec_path, "w", encoding="utf-8") as handle:
+                handle.write("5000.0 0.50 2.00\n")
+                handle.write("5000.1 0.25 1.00\n")
+
+            config = TurbospectrumConfig(
+                project_root=tmpdir,
+                output_mode="Flux",
+                nlte=False,
+                output_dir=tmpdir,
+                log_dir=tmpdir,
+                tmp_dir=tmpdir,
+            )
+            synth_shard._init_worker(config)
+            row_values = {
+                "teff": 5000,
+                "logg": 4.0,
+                "feh": 0.0,
+                "lam_min": 5000.0,
+                "lam_max": 5000.1,
+                "lam_step": 0.1,
+                "turbvel": "01",
+                "t_value": "01",
+                "output_mode": "Flux",
+                "calculation_mode": "LTE",
+            }
+
+            with mock.patch.object(
+                synth_shard,
+                "run_single_synthesis",
+                return_value={
+                    "status": "success",
+                    "message": "ok",
+                    "output_path": spec_path,
+                    "base_name": "test",
+                    "log_path": "",
+                },
+            ):
+                results = synth_shard._synthesis_task([(0, row_values)])
+
+            self.assertEqual(len(results), 1)
+            self.assertEqual(results[0]["status"], "success")
+            self.assertIsNotNone(results[0]["spectrum"])
+            flux, continuum = results[0]["spectrum"]
             np.testing.assert_allclose(flux, np.asarray([2.0, 1.0], dtype=np.float32))
             np.testing.assert_allclose(continuum, np.asarray([4.0, 4.0], dtype=np.float32))
 
