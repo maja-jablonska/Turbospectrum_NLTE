@@ -263,15 +263,13 @@ def _ordered_param_names(column_data: Mapping[str, np.ndarray]) -> List[str]:
         "mode",
         "calculation_mode",
         "turb",
-        "turbvel",
-        "t_value",
         *NLTE_ASCII_CONTROL_KEYS,
     }
-    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
+    candidate_order = ["teff", "logg", "feh", "vmicro", "turbvel", "t_value", "a", "c", "n", "o", "r", "s"]
     extras = sorted(
         name
         for name in column_data.keys()
-        if name not in reserved and name not in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"}
+        if name not in reserved and name not in {"teff", "logg", "feh", "turbvel", "t_value", "a", "c", "n", "o", "r", "s"}
     )
     return candidate_order + extras
 
@@ -292,8 +290,13 @@ def _build_params_matrix(column_data: Mapping[str, np.ndarray]) -> Tuple[np.ndar
     elif "t_value" in column_data:
         params_by_name["vmicro"] = _to_float32(np.asarray(column_data["t_value"]))
 
+    if "turbvel" in column_data:
+        params_by_name["turbvel"] = _to_float32(np.asarray(column_data["turbvel"]))
+    if "t_value" in column_data:
+        params_by_name["t_value"] = _to_float32(np.asarray(column_data["t_value"]))
+
     for name in candidate_order:
-        if name in {"teff", "logg", "feh", "vmicro"}:
+        if name in {"teff", "logg", "feh", "vmicro", "turbvel", "t_value"}:
             continue
         if name in column_data:
             params_by_name[name] = _to_float32(np.asarray(column_data[name]))

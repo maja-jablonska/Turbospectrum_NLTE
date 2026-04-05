@@ -139,6 +139,7 @@ The helper writes a compressed Zarr store plus a parameter lookup parquet:
 - grid Zarr: `runs/local-dev/outputs/grids/ml_parameter_grid.zarr` (override with `--zarr-output`)
 - parameter index: `runs/local-dev/outputs/grids/index.parquet` (override with `--index-parquet-output` or config `index_parquet`)
 - in sampling configs, `run_root` is the base directory and relative output paths like `outputs/grids/...` resolve underneath it
+- after synthesis, both `turbvel` and `t_value` are preserved as numeric parameter columns in addition to `vmicro` when present in the source grid
 
 `index.parquet` contains `row_index` and all grid parameter columns, so you can quickly filter by parameters and map directly to spectrum rows in downstream Zarr outputs. The helper uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream ingestion. Install dependencies with `pip install polars zarr numcodecs`. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the batch runners.
 
