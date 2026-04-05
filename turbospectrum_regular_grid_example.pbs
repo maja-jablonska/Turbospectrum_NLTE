@@ -242,6 +242,10 @@ PENDING_SHARDS_FILE="${PENDING_SHARDS_FILE:-${RUN_ROOT}/pending_shards.txt}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
 LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
+INITIAL_FAILURE_ABORT_THRESHOLD="${INITIAL_FAILURE_ABORT_THRESHOLD:-0}"
+INITIAL_FAILURE_COUNT_FILE="${INITIAL_FAILURE_COUNT_FILE:-${RUN_ROOT}/initial_failure_count.txt}"
+SUCCESS_COUNT_FILE="${SUCCESS_COUNT_FILE:-${RUN_ROOT}/success_count.txt}"
+EARLY_STOP_MARKER="${EARLY_STOP_MARKER:-${RUN_ROOT}/early_stop_marker.txt}"
 SYNTH_LOG_LEVEL="${SYNTH_LOG_LEVEL:-${CFG_LOG_LEVEL:-INFO}}"
 SYNTH_LOG_FILE="${SYNTH_LOG_FILE:-${CFG_LOG_FILE:-${LOG_DIR}/regular_grid_synthesis.log}}"
 ROWS_PER_SHARD_RAW="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
@@ -265,7 +269,9 @@ fi
 mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${MERGED_ZARR}")" \
          "$(dirname "${NEXT_WORK_ITEM}")" "$(dirname "${LOCK_FILE}")" \
          "$(dirname "${PENDING_SHARDS_FILE}")" "$(dirname "${MISSING_FILE}")" \
-         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" "${SYNTH_SCRATCH}"
+         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" "${SYNTH_SCRATCH}" \
+         "$(dirname "${INITIAL_FAILURE_COUNT_FILE}")" "$(dirname "${SUCCESS_COUNT_FILE}")" \
+         "$(dirname "${EARLY_STOP_MARKER}")"
 
 export TMPDIR="${TMP_SYSTEM_DIR}"
 export TMP="${TMP_SYSTEM_DIR}"
@@ -324,6 +330,64 @@ PY
 render_shard_path() {
     local shard="$1"
     printf '%s\n' "${SHARD_TEMPLATE//\{shard_index\}/${shard}}"
+}
+
+initial_failure_stop_enabled() {
+    [[ "${INITIAL_FAILURE_ABORT_THRESHOLD}" =~ ^[0-9]+$ ]] && (( INITIAL_FAILURE_ABORT_THRESHOLD > 0 ))
+}
+
+initialize_initial_failure_tracking() {
+    local completed_count="${1:-0}"
+    if ! initial_failure_stop_enabled; then
+        return
+    fi
+    printf '0\n' > "${INITIAL_FAILURE_COUNT_FILE}"
+    printf '%s\n' "${completed_count}" > "${SUCCESS_COUNT_FILE}"
+    rm -f "${EARLY_STOP_MARKER}"
+}
+
+record_shard_outcome() {
+    local shard="$1"
+    local outcome="$2"
+    local log_file="$3"
+    if ! initial_failure_stop_enabled; then
+        return
+    fi
+
+    exec 8<>"${LOCK_FILE}"
+    flock -x 8
+    local success_count failure_count
+    success_count="$(cat "${SUCCESS_COUNT_FILE}" 2>/dev/null || printf '0')"
+    failure_count="$(cat "${INITIAL_FAILURE_COUNT_FILE}" 2>/dev/null || printf '0')"
+    [[ "${success_count}" =~ ^[0-9]+$ ]] || success_count=0
+    [[ "${failure_count}" =~ ^[0-9]+$ ]] || failure_count=0
+
+    if [[ "${outcome}" == "success" ]]; then
+        success_count=$((success_count + 1))
+        printf '%s\n' "${success_count}" > "${SUCCESS_COUNT_FILE}"
+    elif (( success_count == 0 )); then
+        failure_count=$((failure_count + 1))
+        printf '%s\n' "${failure_count}" > "${INITIAL_FAILURE_COUNT_FILE}"
+        if (( failure_count >= INITIAL_FAILURE_ABORT_THRESHOLD )) && [[ ! -f "${EARLY_STOP_MARKER}" ]]; then
+            {
+                printf 'reason=initial_failure_threshold_reached\n'
+                printf 'threshold=%s\n' "${INITIAL_FAILURE_ABORT_THRESHOLD}"
+                printf 'failure_count=%s\n' "${failure_count}"
+                printf 'success_count=%s\n' "${success_count}"
+                printf 'last_shard=%s\n' "${shard}"
+                printf 'last_log=%s\n' "${log_file}"
+                printf 'timestamp=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+            } > "${EARLY_STOP_MARKER}"
+            printf '[regular-grid] EARLY STOP: first %s shard calculation(s) failed before any success; threshold=%s; last_shard=%s; log=%s\n' \
+                "${failure_count}" "${INITIAL_FAILURE_ABORT_THRESHOLD}" "${shard}" "${log_file}" >> "${LOG_DIR}/early_stop.log"
+        fi
+    fi
+    flock -u 8
+    exec 8>&-
+}
+
+should_stop_early() {
+    initial_failure_stop_enabled && [[ -f "${EARLY_STOP_MARKER}" ]]
 }
 
 wait_for_array_prepare() {
@@ -669,6 +733,7 @@ if (( ARRAY_TASK_MODE == 0 || FINALIZE_ONLY_EFFECTIVE == 1 )); then
     echo 0 > "${NEXT_WORK_ITEM}"
 
     COMPLETED_COUNT=$((SHARD_COUNT - PENDING_COUNT))
+    initialize_initial_failure_tracking "${COMPLETED_COUNT}"
     echo "[regular-grid] Existing valid shards: ${COMPLETED_COUNT}/${SHARD_COUNT}"
 
     if (( PENDING_COUNT == 0 )) && is_valid_merged_zarr "${MERGED_ZARR}"; then
@@ -677,6 +742,11 @@ if (( ARRAY_TASK_MODE == 0 || FINALIZE_ONLY_EFFECTIVE == 1 )); then
     fi
 else
     PENDING_COUNT=0
+    existing_shard_count="$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' | wc -l | tr -d '[:space:]')"
+    if ! [[ "${existing_shard_count}" =~ ^[0-9]+$ ]]; then
+        existing_shard_count=0
+    fi
+    initialize_initial_failure_tracking "${existing_shard_count}"
     echo "[regular-grid] Array task ${SHARD_INDEX}/${SHARD_COUNT} assigned approximately ${ARRAY_SHARD_ROWS} grid rows."
 fi
 
@@ -796,6 +866,10 @@ worker() {
     trap 'rc=$?; if (( rc != 0 )); then echo "[regular-grid] WARN: outer worker aborted unexpectedly with rc=${rc} task_index=${task_index:-<unset>} shard=${shard:-<unset>} jobfs=${jobfs_dir:-<unset>}." >&2; fi' EXIT
 
     while true; do
+        if should_stop_early; then
+            echo "[regular-grid] Early-stop marker detected; worker is exiting without starting new shards."
+            break
+        fi
         if (( $(time_left) < EST_RUNTIME + SAFETY_BUFFER )); then
             echo "Worker exiting safely before walltime."
             break
@@ -838,6 +912,13 @@ worker() {
 
         if ! run_shard_attempts "${shard}" "${SHARD_RETRY_ATTEMPTS}" "${jobfs_dir}" "${LOG_DIR}/shard_${shard}.log" 15 "${SINGLE_JOB_SHARD_WORKERS_EFFECTIVE}"; then
             echo "Shard ${shard} failed after ${SHARD_RETRY_ATTEMPTS} attempts in main loop." >> "${LOG_DIR}/shard_${shard}.log"
+            record_shard_outcome "${shard}" "failure" "${LOG_DIR}/shard_${shard}.log"
+            if should_stop_early; then
+                echo "[regular-grid] Early-stop threshold reached after shard ${shard} failure; worker is exiting."
+                break
+            fi
+        else
+            record_shard_outcome "${shard}" "success" "${LOG_DIR}/shard_${shard}.log"
         fi
     done
 
@@ -846,7 +927,8 @@ worker() {
 
 export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO PYTHON \
        GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SHARD_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE \
-       SINGLE_JOB_SHARD_WORKERS_EFFECTIVE
+       SINGLE_JOB_SHARD_WORKERS_EFFECTIVE INITIAL_FAILURE_ABORT_THRESHOLD \
+       INITIAL_FAILURE_COUNT_FILE SUCCESS_COUNT_FILE EARLY_STOP_MARKER
 
 ############################################
 # Launch workers / array shard
@@ -863,12 +945,23 @@ if (( ARRAY_TASK_MODE == 1 )); then
     fi
 
     ARRAY_LOG_FILE="${LOG_DIR}/shard_${SHARD_INDEX}.log"
+    if should_stop_early; then
+        echo "[regular-grid] Early-stop marker detected before array shard launch; see ${EARLY_STOP_MARKER}." >&2
+        cat "${EARLY_STOP_MARKER}" >&2 || true
+        exit 1
+    fi
     echo "[regular-grid] Array task ${SHARD_INDEX}/${SHARD_COUNT} starting with ${ARRAY_SHARD_WORKERS} synthesis workers across ~${ARRAY_SHARD_ROWS} grid rows."
     if ! run_shard_attempts "${SHARD_INDEX}" "${SHARD_RETRY_ATTEMPTS}" "${TMP_WORK_DIR}/array_${SHARD_INDEX}" "${ARRAY_LOG_FILE}" 15 "${ARRAY_SHARD_WORKERS}"; then
         echo "Shard ${SHARD_INDEX} failed after ${SHARD_RETRY_ATTEMPTS} attempts in array mode." >> "${ARRAY_LOG_FILE}"
+        record_shard_outcome "${SHARD_INDEX}" "failure" "${ARRAY_LOG_FILE}"
         print_log_excerpt "${ARRAY_LOG_FILE}" "Array shard log excerpt"
+        if should_stop_early; then
+            echo "[regular-grid] ERROR: early-stop threshold reached; see ${EARLY_STOP_MARKER}." >&2
+            cat "${EARLY_STOP_MARKER}" >&2 || true
+        fi
         exit 1
     fi
+    record_shard_outcome "${SHARD_INDEX}" "success" "${ARRAY_LOG_FILE}"
     echo "[regular-grid] Array task ${SHARD_INDEX} completed: $(render_shard_path "${SHARD_INDEX}")"
     exit 0
 fi
@@ -918,6 +1011,12 @@ elif (( PENDING_COUNT > 0 )); then
     fi
 else
     echo "[regular-grid] No pending shards detected; moving directly to validation/merge."
+fi
+
+if should_stop_early; then
+    echo "[regular-grid] ERROR: early-stop threshold reached; aborting before validation/merge. See ${EARLY_STOP_MARKER}." >&2
+    cat "${EARLY_STOP_MARKER}" >&2 || true
+    exit 1
 fi
 
 CURRENT="$(cat "${NEXT_WORK_ITEM}")"
