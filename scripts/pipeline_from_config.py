@@ -12,6 +12,7 @@ It exists to avoid managing separate config files for grid sampling vs synthesis
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -42,6 +43,42 @@ def _strip_private_keys(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_strip_private_keys(v) for v in obj]
     return obj
+
+
+def _deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+    return copy.deepcopy(override)
+
+
+def _normalize_synthesis_overrides(overrides: Mapping[str, Any], cfg_dir: str) -> Dict[str, Any]:
+    normalized = copy.deepcopy(dict(overrides))
+
+    project_root = normalized.get("project_root")
+    if isinstance(project_root, str) and project_root.strip():
+        normalized["project_root"] = _abs_from(cfg_dir, project_root)
+
+    paths = normalized.get("paths")
+    if isinstance(paths, dict):
+        for key in ("model_atmosphere_path", "linelist_path", "output_dir", "log_dir", "tmp_dir"):
+            value = paths.get(key)
+            if isinstance(value, str) and value.strip():
+                paths[key] = _abs_from(cfg_dir, value)
+
+    nlte = normalized.get("nlte")
+    if isinstance(nlte, dict):
+        for key in ("nlte_info_file", "model_atom_file", "departure_file"):
+            value = nlte.get(key)
+            if isinstance(value, str) and value.strip():
+                nlte[key] = _abs_from(cfg_dir, value)
+
+    return normalized
 
 
 def _ensure_parent(path: str) -> None:
@@ -121,6 +158,16 @@ def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir
     """Write a Turbospectrum config JSON file derived from pipeline_cfg."""
     ts_cfg = dict(pipeline_cfg.get("turbospectrum") or {})
     ts_cfg = _strip_private_keys(ts_cfg)
+
+    base_cfg_path_raw = ts_cfg.get("config")
+    overrides = ts_cfg.pop("overrides", None)
+    if base_cfg_path_raw:
+        base_cfg_path = _abs_from(config_dir, str(base_cfg_path_raw))
+        ts_cfg = _strip_private_keys(_load_json(base_cfg_path))
+        if overrides:
+            if not isinstance(overrides, Mapping):
+                raise ValueError("turbospectrum.overrides must be a JSON object")
+            ts_cfg = _deep_merge(ts_cfg, _normalize_synthesis_overrides(overrides, config_dir))
 
     # Ensure project_root is set to something usable on the current machine.
     project_root = ts_cfg.get("project_root")
