@@ -92,6 +92,22 @@ echo "Python: ${PYTHON_BIN}"
 echo "Mamba env: ${MAMBA_ENV_NAME}"
 echo "Conda prefix: ${CONDA_PREFIX:-<unset>}"
 
+# Compute --max-failures as 15% of rows in this shard (ceiling).
+ROW_COUNT=$("${PYTHON_BIN}" - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
+for key in ("teff", "params", "global_index"):
+    if key in root and len(root[key].shape) >= 1:
+        print(int(root[key].shape[0]))
+        break
+else:
+    raise RuntimeError(f"Could not infer row count from {r'${GRID_ZARR}'}")
+PY
+)
+ROWS_PER_SHARD=$(( (ROW_COUNT + N_SHARDS - 1) / N_SHARDS ))
+MAX_FAILURES=$(( (ROWS_PER_SHARD * 15 + 99) / 100 ))
+echo "Row count: ${ROW_COUNT}  Rows/shard: ~${ROWS_PER_SHARD}  Max failures: ${MAX_FAILURES}"
+
 "${PYTHON_BIN}" scripts/run_turbospectrum_shard.py \
   --grid-zarr "${GRID_ZARR}" \
   --config "${TS_CONFIG}" \
@@ -100,4 +116,5 @@ echo "Conda prefix: ${CONDA_PREFIX:-<unset>}"
   --shard-count "${N_SHARDS}" \
   --workers "${PBS_NP:-32}" \
   --scratch "${SCRATCH}" \
+  --max-failures "${MAX_FAILURES}" \
   --log-level INFO
