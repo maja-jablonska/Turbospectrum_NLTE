@@ -11,6 +11,7 @@ from scripts.synthesize_regular_grid import (
     _materialize_synthesis_config,
     _verify_continuum_saved,
 )
+from scripts.pipeline_from_config import _write_temp_turbospectrum_config
 from scripts.synthesize_spectra_from_zarr import _validate_synthesis_results
 
 
@@ -258,6 +259,70 @@ class RegularGridValidationTests(unittest.TestCase):
 
         np.testing.assert_array_equal(columns["teff"], np.asarray([4000, 4000, 4250, 4250], dtype=np.int64))
         np.testing.assert_allclose(columns["mu"], np.asarray([0.2, 0.8, 0.2, 0.8], dtype=np.float64))
+
+    def test_pipeline_temp_turbospectrum_config_applies_base_config_and_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_dir = os.path.join(tmpdir, "configs", "pipeline")
+            synth_dir = os.path.join(tmpdir, "configs", "synthesis")
+            linelist_dir = os.path.join(tmpdir, "input_files", "linelists")
+            nlte_info_path = os.path.join(tmpdir, "DATA", "SPECIES_LTE_NLTE.dat")
+            os.makedirs(cfg_dir, exist_ok=True)
+            os.makedirs(synth_dir, exist_ok=True)
+            os.makedirs(linelist_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(nlte_info_path), exist_ok=True)
+
+            with open(nlte_info_path, "w", encoding="utf-8") as handle:
+                handle.write("fake nlte info\n")
+
+            base_cfg_path = os.path.join(synth_dir, "config_sample_comprehensive.json")
+            with open(base_cfg_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "project_root": "",
+                        "paths": {
+                            "linelist_path": "",
+                            "linelist_files": ["base_list"]
+                        },
+                        "nlte": {
+                            "enabled": False,
+                            "nlte_info_file": ""
+                        },
+                        "synthesis_parameters": {
+                            "output_mode": "Flux"
+                        }
+                    },
+                    handle,
+                )
+
+            pipeline_cfg = {
+                "turbospectrum": {
+                    "config": "../synthesis/config_sample_comprehensive.json",
+                    "overrides": {
+                        "paths": {
+                            "linelist_path": "../../input_files/linelists",
+                            "linelist_files": ["custom_list"]
+                        },
+                        "nlte": {
+                            "enabled": True,
+                            "nlte_info_file": "../../DATA/SPECIES_LTE_NLTE.dat"
+                        }
+                    }
+                }
+            }
+
+            materialized = _write_temp_turbospectrum_config(
+                pipeline_cfg,
+                config_dir=cfg_dir,
+                scratch=None,
+            )
+
+            with open(materialized, "r", encoding="utf-8") as handle:
+                cfg = json.load(handle)
+
+            self.assertEqual(cfg["paths"]["linelist_path"], linelist_dir)
+            self.assertEqual(cfg["paths"]["linelist_files"], ["custom_list"])
+            self.assertTrue(cfg["nlte"]["enabled"])
+            self.assertEqual(cfg["nlte"]["nlte_info_file"], nlte_info_path)
 
 
 if __name__ == "__main__":
