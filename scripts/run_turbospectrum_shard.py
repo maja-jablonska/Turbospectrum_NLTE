@@ -561,7 +561,12 @@ def _synthesis_task(batch):
                             count = int(getattr(cfg, "mu_sampling", {}).get("count", 1) or 1)
                             chosen_idx = ranked[:count] if count <= ranked.size else np.resize(ranked, count)
                             chosen_idx = np.asarray(chosen_idx, dtype=np.int64)
-                            mu_selected = float("nan")
+                            logging.getLogger("zarr_synthesis_sharded").warning(
+                                "mu-points header missing from %s; using target_mu=%.6g as mu_selected estimate",
+                                spec_path,
+                                target_mu,
+                            )
+                            mu_selected = float(target_mu)
 
                     if chosen_idx.size > 0:
                         mu_selected_index = int(chosen_idx[0])
