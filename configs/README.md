@@ -10,6 +10,7 @@ Current canonical files:
 
 - `configs/pipeline/config_pipeline.example.json`: template.
 - `configs/pipeline/config_pipeline.json`: active pipeline config.
+- `configs/pipeline/config_ml_synthesis.example.json`: one-config ML sampling + synthesis template.
 - `configs/pipeline/config_regular_grid.example.json`: regular Cartesian grid template (linear interpolation workflows).
 - `configs/pipeline/config_regular_grid_nlte_fe.example.json`: Fe NLTE regular-grid template for flux synthesis with per-abundance ASCII departures.
 - `configs/pipeline/config_regular_grid_nlte_fe_intensity.example.json`: Fe NLTE regular-grid template for intensity synthesis with per-abundance ASCII departures and `mu_range` sampling.
@@ -28,5 +29,6 @@ Why this exists:
 Recommended usage:
 
 - Start from `configs/pipeline/config_pipeline.example.json`.
+- For one-config ML runs, start from `configs/pipeline/config_ml_synthesis.example.json`.
 - Write outputs to `runs/<run_name>/...` (already the default in provided configs).
 - In regular-grid and sampling configs, set `run_root` once and keep output paths as `outputs/...` relative to that run root.

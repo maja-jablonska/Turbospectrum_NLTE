@@ -135,6 +135,13 @@ python3 scripts/sample_machine_learning_grid.py \
   --config configs/sampling/config_ml_dataset.example.json
 ```
 
+If you want one config that handles both ML grid generation and later synthesis, use the pipeline example instead:
+
+```bash
+python3 scripts/pipeline_from_config.py \
+  --config configs/pipeline/config_ml_synthesis.example.json
+```
+
 The helper writes a compressed Zarr store plus a parameter lookup parquet:
 - grid Zarr: `runs/local-dev/outputs/grids/ml_parameter_grid.zarr` (override with `--zarr-output`)
 - parameter index: `runs/local-dev/outputs/grids/index.parquet` (override with `--index-parquet-output` or config `index_parquet`)
