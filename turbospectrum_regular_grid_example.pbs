@@ -242,8 +242,8 @@ PENDING_SHARDS_FILE="${PENDING_SHARDS_FILE:-${RUN_ROOT}/pending_shards.txt}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
 LOCK_FILE="${LOCK_FILE:-${RUN_ROOT}/counter.lock}"
-INITIAL_FAILURE_ABORT_THRESHOLD="${INITIAL_FAILURE_ABORT_THRESHOLD:-0}"
-INITIAL_FAILURE_COUNT_FILE="${INITIAL_FAILURE_COUNT_FILE:-${RUN_ROOT}/initial_failure_count.txt}"
+CONSECUTIVE_FAILURE_ABORT_THRESHOLD="${CONSECUTIVE_FAILURE_ABORT_THRESHOLD:-${INITIAL_FAILURE_ABORT_THRESHOLD:-10}}"
+CONSECUTIVE_FAILURE_COUNT_FILE="${CONSECUTIVE_FAILURE_COUNT_FILE:-${RUN_ROOT}/consecutive_failure_count.txt}"
 SUCCESS_COUNT_FILE="${SUCCESS_COUNT_FILE:-${RUN_ROOT}/success_count.txt}"
 EARLY_STOP_MARKER="${EARLY_STOP_MARKER:-${RUN_ROOT}/early_stop_marker.txt}"
 SYNTH_LOG_LEVEL="${SYNTH_LOG_LEVEL:-${CFG_LOG_LEVEL:-INFO}}"
@@ -332,16 +332,16 @@ render_shard_path() {
     printf '%s\n' "${SHARD_TEMPLATE//\{shard_index\}/${shard}}"
 }
 
-initial_failure_stop_enabled() {
-    [[ "${INITIAL_FAILURE_ABORT_THRESHOLD}" =~ ^[0-9]+$ ]] && (( INITIAL_FAILURE_ABORT_THRESHOLD > 0 ))
+consecutive_failure_stop_enabled() {
+    [[ "${CONSECUTIVE_FAILURE_ABORT_THRESHOLD}" =~ ^[0-9]+$ ]] && (( CONSECUTIVE_FAILURE_ABORT_THRESHOLD > 0 ))
 }
 
 initialize_initial_failure_tracking() {
     local completed_count="${1:-0}"
-    if ! initial_failure_stop_enabled; then
+    if ! consecutive_failure_stop_enabled; then
         return
     fi
-    printf '0\n' > "${INITIAL_FAILURE_COUNT_FILE}"
+    printf '0\n' > "${CONSECUTIVE_FAILURE_COUNT_FILE}"
     printf '%s\n' "${completed_count}" > "${SUCCESS_COUNT_FILE}"
     rm -f "${EARLY_STOP_MARKER}"
 }
@@ -350,7 +350,7 @@ record_shard_outcome() {
     local shard="$1"
     local outcome="$2"
     local log_file="$3"
-    if ! initial_failure_stop_enabled; then
+    if ! consecutive_failure_stop_enabled; then
         return
     fi
 
@@ -358,28 +358,39 @@ record_shard_outcome() {
     flock -x 8
     local success_count failure_count
     success_count="$(cat "${SUCCESS_COUNT_FILE}" 2>/dev/null || printf '0')"
-    failure_count="$(cat "${INITIAL_FAILURE_COUNT_FILE}" 2>/dev/null || printf '0')"
+    failure_count="$(cat "${CONSECUTIVE_FAILURE_COUNT_FILE}" 2>/dev/null || printf '0')"
     [[ "${success_count}" =~ ^[0-9]+$ ]] || success_count=0
     [[ "${failure_count}" =~ ^[0-9]+$ ]] || failure_count=0
 
     if [[ "${outcome}" == "success" ]]; then
         success_count=$((success_count + 1))
         printf '%s\n' "${success_count}" > "${SUCCESS_COUNT_FILE}"
-    elif (( success_count == 0 )); then
+        printf '0\n' > "${CONSECUTIVE_FAILURE_COUNT_FILE}"
+    else
         failure_count=$((failure_count + 1))
-        printf '%s\n' "${failure_count}" > "${INITIAL_FAILURE_COUNT_FILE}"
-        if (( failure_count >= INITIAL_FAILURE_ABORT_THRESHOLD )) && [[ ! -f "${EARLY_STOP_MARKER}" ]]; then
+        printf '%s\n' "${failure_count}" > "${CONSECUTIVE_FAILURE_COUNT_FILE}"
+        if (( failure_count >= CONSECUTIVE_FAILURE_ABORT_THRESHOLD )) && [[ ! -f "${EARLY_STOP_MARKER}" ]]; then
             {
-                printf 'reason=initial_failure_threshold_reached\n'
-                printf 'threshold=%s\n' "${INITIAL_FAILURE_ABORT_THRESHOLD}"
+                printf 'reason=consecutive_failure_threshold_reached\n'
+                printf 'threshold=%s\n' "${CONSECUTIVE_FAILURE_ABORT_THRESHOLD}"
                 printf 'failure_count=%s\n' "${failure_count}"
                 printf 'success_count=%s\n' "${success_count}"
                 printf 'last_shard=%s\n' "${shard}"
                 printf 'last_log=%s\n' "${log_file}"
                 printf 'timestamp=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
             } > "${EARLY_STOP_MARKER}"
-            printf '[regular-grid] EARLY STOP: first %s shard calculation(s) failed before any success; threshold=%s; last_shard=%s; log=%s\n' \
-                "${failure_count}" "${INITIAL_FAILURE_ABORT_THRESHOLD}" "${shard}" "${log_file}" >> "${LOG_DIR}/early_stop.log"
+            {
+                printf '[regular-grid] EARLY STOP: %s consecutive shard calculation(s) failed; threshold=%s; last_shard=%s; log=%s\n' \
+                    "${failure_count}" "${CONSECUTIVE_FAILURE_ABORT_THRESHOLD}" "${shard}" "${log_file}"
+                if [[ -f "${log_file}" ]]; then
+                    printf '[regular-grid] Last error excerpt from %s:\n' "${log_file}"
+                    if grep -Einq 'error|failed|exception|missing spectrum|traceback|forrtl|stop|log=' "${log_file}"; then
+                        grep -Ein 'error|failed|exception|missing spectrum|traceback|forrtl|stop|log=' "${log_file}" | tail -n 40
+                    else
+                        tail -n 40 "${log_file}"
+                    fi
+                fi
+            } >> "${LOG_DIR}/early_stop.log"
         fi
     fi
     flock -u 8
@@ -387,7 +398,7 @@ record_shard_outcome() {
 }
 
 should_stop_early() {
-    initial_failure_stop_enabled && [[ -f "${EARLY_STOP_MARKER}" ]]
+    consecutive_failure_stop_enabled && [[ -f "${EARLY_STOP_MARKER}" ]]
 }
 
 wait_for_array_prepare() {
@@ -927,8 +938,8 @@ worker() {
 
 export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO PYTHON \
        GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SHARD_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE \
-       SINGLE_JOB_SHARD_WORKERS_EFFECTIVE INITIAL_FAILURE_ABORT_THRESHOLD \
-       INITIAL_FAILURE_COUNT_FILE SUCCESS_COUNT_FILE EARLY_STOP_MARKER
+       SINGLE_JOB_SHARD_WORKERS_EFFECTIVE CONSECUTIVE_FAILURE_ABORT_THRESHOLD \
+       CONSECUTIVE_FAILURE_COUNT_FILE SUCCESS_COUNT_FILE EARLY_STOP_MARKER
 
 ############################################
 # Launch workers / array shard
