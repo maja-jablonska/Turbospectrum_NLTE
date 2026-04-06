@@ -270,7 +270,7 @@ mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${MERGED_ZARR}")" \
          "$(dirname "${NEXT_WORK_ITEM}")" "$(dirname "${LOCK_FILE}")" \
          "$(dirname "${PENDING_SHARDS_FILE}")" "$(dirname "${MISSING_FILE}")" \
          "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" "${SYNTH_SCRATCH}" \
-         "$(dirname "${INITIAL_FAILURE_COUNT_FILE}")" "$(dirname "${SUCCESS_COUNT_FILE}")" \
+         "$(dirname "${CONSECUTIVE_FAILURE_COUNT_FILE}")" "$(dirname "${SUCCESS_COUNT_FILE}")" \
          "$(dirname "${EARLY_STOP_MARKER}")"
 
 export TMPDIR="${TMP_SYSTEM_DIR}"
