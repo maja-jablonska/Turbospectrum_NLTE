@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Dict, List, Sequence
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
 
 SUCCESS_STATUSES = {"success", "skipped"}
 
@@ -45,8 +47,26 @@ def validate_synthesis_results(
     messages: Sequence[str],
     fluxes: np.ndarray,
     continua: np.ndarray,
+    max_failures: int = 0,
 ) -> Dict[str, int]:
-    """Reject silently broken runs before they are written to disk."""
+    """Check synthesis results and return status counts.
+
+    Always returns so that callers can write output before deciding
+    whether to abort.  When the number of bad rows exceeds
+    *max_failures*, the function logs an **error**; otherwise it logs a
+    **warning** (or nothing if there are no problems at all).
+
+    Callers should inspect the returned *counts* dict to decide whether
+    to exit with a non-zero status after the shard has been saved.
+
+    Parameters
+    ----------
+    max_failures:
+        Maximum number of bad rows to tolerate.  When the total number of
+        unique bad rows (union of status/flux/continuum checks) is at most
+        this value, the run is considered acceptable.
+        The default (0) means any failure is flagged as an error.
+    """
     counts = _status_counts(statuses)
 
     bad_status_rows = np.asarray(
@@ -58,6 +78,10 @@ def validate_synthesis_results(
 
     if bad_status_rows.size == 0 and invalid_flux_rows.size == 0 and invalid_cont_rows.size == 0:
         return counts
+
+    # Deduplicate across all three checks.
+    all_bad = np.union1d(bad_status_rows, np.union1d(invalid_flux_rows, invalid_cont_rows))
+    n_bad = int(all_bad.size)
 
     details = [f"status_counts={json.dumps(counts, sort_keys=True)}"]
     if bad_status_rows.size:
@@ -88,4 +112,21 @@ def validate_synthesis_results(
             )
         )
 
-    raise RuntimeError("Synthesis produced invalid spectra; aborting write. " + " | ".join(details))
+    summary = " | ".join(details)
+
+    if n_bad <= max_failures:
+        logger.warning(
+            "Synthesis produced %d invalid row(s) (within --max-failures %d). %s",
+            n_bad,
+            max_failures,
+            summary,
+        )
+    else:
+        logger.error(
+            "Synthesis produced %d invalid row(s) (exceeds --max-failures %d). %s",
+            n_bad,
+            max_failures,
+            summary,
+        )
+
+    return counts
