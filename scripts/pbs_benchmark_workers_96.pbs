@@ -241,6 +241,9 @@ if ! [[ "${ROW_COUNT}" =~ ^[0-9]+$ ]] || (( ROW_COUNT <= 0 )); then
     exit 1
 fi
 
+# Each benchmark shard processes 1 row (shard_count=ROW_COUNT); 15% of 1 → 1.
+BENCH_MAX_FAILURES=$(( (1 * 15 + 99) / 100 ))
+
 if ! [[ "${BENCHMARK_SHARDS}" =~ ^[0-9]+$ ]] || (( BENCHMARK_SHARDS <= 0 )); then
     echo "[bench96] ERROR: BENCHMARK_SHARDS must be a positive integer." >&2
     exit 1
@@ -378,6 +381,7 @@ worker_loop() {
                 --shard-count "${ROW_COUNT}" \
                 --workers 1 \
                 --scratch "${attempt_scratch}" \
+                --max-failures "${BENCH_MAX_FAILURES}" \
                 --log-level INFO \
                 >> "${log_path}" 2>&1 || true
 

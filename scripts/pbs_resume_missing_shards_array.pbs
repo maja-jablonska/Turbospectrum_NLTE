@@ -166,6 +166,22 @@ echo "[resume-missing] output=${OUT}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] scratch_tmp_root=${SCRATCH_TMP_ROOT}" | tee -a "${LOG_FILE}"
 echo "[resume-missing] python=${PYTHON_BIN}" | tee -a "${LOG_FILE}"
 
+# Compute --max-failures as 15% of rows in this shard (ceiling).
+ROW_COUNT=$("${PYTHON_BIN}" - <<PY
+import zarr
+root = zarr.open_group(r"${GRID_ZARR}", mode="r")
+for key in ("teff", "params", "global_index"):
+    if key in root and len(root[key].shape) >= 1:
+        print(int(root[key].shape[0]))
+        break
+else:
+    raise RuntimeError(f"Could not infer row count from {r'${GRID_ZARR}'}")
+PY
+)
+ROWS_PER_SHARD=$(( (ROW_COUNT + SHARD_COUNT - 1) / SHARD_COUNT ))
+MAX_FAILURES=$(( (ROWS_PER_SHARD * 15 + 99) / 100 ))
+echo "[resume-missing] row_count=${ROW_COUNT} rows_per_shard=~${ROWS_PER_SHARD} max_failures=${MAX_FAILURES}" | tee -a "${LOG_FILE}"
+
 if "${PYTHON_BIN}" - <<PY >/dev/null 2>&1
 import zarr
 root = zarr.open_group(r"${OUT}", mode="r")
@@ -189,6 +205,7 @@ for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
     --shard-count "${SHARD_COUNT}" \
     --workers "${PBS_NP:-32}" \
     --scratch "${SCRATCH}" \
+    --max-failures "${MAX_FAILURES}" \
     --log-level INFO \
     >> "${LOG_FILE}" 2>&1 || true
 
