@@ -658,6 +658,17 @@ def main() -> None:
             f"{float(np.min(mu_axis)):.6f}..{float(np.max(mu_axis)):.6f} "
             f"({mu_axis.size} uniformly spaced samples)"
         )
+        if shard_count is not None and mu_axis.size > 1 and shard_count % mu_axis.size == 0:
+            import warnings as _warnings
+            _warnings.warn(
+                f"shard_count={shard_count} is a multiple of the mu-axis length={mu_axis.size}. "
+                "With stride-based sharding this causes each shard to contain only rows with a "
+                "single target_mu value (stride alignment). Individual shards will show a "
+                "constant mu_selected; the merged output will vary correctly across shards. "
+                f"To mix mu values within each shard, choose a shard_count that is NOT a "
+                f"multiple of {mu_axis.size} (e.g. {shard_count + 1} or {shard_count - 1}).",
+                stacklevel=2,
+            )
     if nlte_ascii_selector is not None:
         print(
             "[regular-grid] NLTE ASCII departures: "

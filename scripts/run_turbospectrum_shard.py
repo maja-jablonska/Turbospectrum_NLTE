@@ -1060,6 +1060,26 @@ def main():
     )
     columns = {k: np.asarray(grid[k][indices]) for k in required_cols + optional_cols + passthrough_cols}
 
+    # Warn when stride alignment causes all shard rows to share the same target_mu.
+    # This happens when shard_count is a multiple of the mu-axis length (the tile period).
+    if "mu" in columns and len(indices) > 0:
+        mu_vals = np.asarray(columns["mu"], dtype=np.float64)
+        unique_mu = np.unique(mu_vals[np.isfinite(mu_vals)])
+        if unique_mu.size == 1:
+            logger.warning(
+                "All %d rows in shard %d/%d have the same target_mu=%.6g. "
+                "shard_count=%d may be a multiple of the mu-axis length, causing stride alignment: "
+                "each shard processes only one mu value, so mu_selected will be constant within "
+                "this shard. The merged output will show correctly varying mu_selected across shards. "
+                "To mix mu values within each shard, choose a shard_count that is NOT a multiple "
+                "of the mu-axis length.",
+                len(indices),
+                args.shard_index,
+                args.shard_count,
+                float(unique_mu[0]),
+                args.shard_count,
+            )
+
     ############################################
     # Workers
     ############################################
