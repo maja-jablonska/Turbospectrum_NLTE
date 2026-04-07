@@ -839,6 +839,27 @@ def main() -> None:
             if other.shape != wavelengths.shape or not np.allclose(other, wavelengths):
                 raise ValueError(f"Wavelength mismatch between shards: {shards[0]} vs {p}")
 
+    # Cross-check shard wavelengths against the grid's wavelength specification.
+    # This catches stale shards from a previous run with a different wavelength range.
+    if args.grid_zarr:
+        _grid_check = zarr.open_group(store=_zarr_store(_norm(args.grid_zarr)), mode="r")
+        if all(k in _grid_check for k in ("lam_min", "lam_max", "lam_step")):
+            _g_lam_min = float(np.unique(np.asarray(_grid_check["lam_min"][:]))[0])
+            _g_lam_max = float(np.unique(np.asarray(_grid_check["lam_max"][:]))[0])
+            _g_lam_step = float(np.unique(np.asarray(_grid_check["lam_step"][:]))[0])
+            if _g_lam_step > 0:
+                _g_npts = int(round((_g_lam_max - _g_lam_min) / _g_lam_step)) + 1
+                _g_expected_wl = np.asarray(
+                    _g_lam_min + _g_lam_step * np.arange(_g_npts), dtype=np.float32
+                )
+                if not np.allclose(wavelengths, _g_expected_wl, atol=1e-2):
+                    raise ValueError(
+                        f"Shard wavelengths ({float(wavelengths[0]):.4f}..{float(wavelengths[-1]):.4f}, "
+                        f"n={wl_count}) do not match grid specification "
+                        f"({_g_lam_min:.4f}..{_g_lam_max:.4f}, step={_g_lam_step}, n={_g_npts}). "
+                        "Shards may be stale from a previous run with a different wavelength range."
+                    )
+
     # Open grid once for metadata/params if provided.
     grid_root = None
     grid_attrs: Dict[str, Any] = {}

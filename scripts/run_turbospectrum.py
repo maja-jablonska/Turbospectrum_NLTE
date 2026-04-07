@@ -1189,8 +1189,15 @@ def _fit_stem_to_path_limits(
 
     # Final guard in case a target root is even longer than anticipated.
     if all(len(os.path.join(root, f"{shortened}{suffix}")) <= max_total_len for root, suffix in normalized_targets):
-        return shortened
-    return digest[:max_stem_len]
+        result = shortened
+    else:
+        result = digest[:max_stem_len]
+
+    logging.getLogger("turbospectrum").warning(
+        "Stem shortened for Fortran path limits (%d -> %d chars): '%s' -> '%s'",
+        len(stem), len(result), stem, result,
+    )
+    return result
 
 
 def _resolve_synthesis_request(params: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1790,9 +1797,13 @@ def run_single_synthesis(args):
         for run in synthesis_runs:
             mode_str = run['mode']
             suffix = run['suffix']
-            
+
             current_result_file = os.path.join(config.output_dir, f"{base_name}{suffix}.spec")
-            
+
+            logging.getLogger("turbospectrum").info(
+                "bsyn %s [%s]: lambda_min=%.4f lambda_max=%.4f lambda_step=%.6f",
+                base_name, mode_str, config.lambda_min, config.lambda_max, config.lambda_step,
+            )
             bsyn_input = f"""'NLTE :'          '{'.true.' if config.nlte else '.false.'}'
 'NLTEINFOFILE:'  '{nlte_info_file_for_run if config.nlte else (config.nlte_info_file if config.nlte_info_file else 'DATA/SPECIES_LTE_NLTE.dat')}'
 'LAMBDA_MIN:'     '{config.lambda_min}'

@@ -268,7 +268,12 @@ def _write_string_scalar(root, name: str, value: str) -> None:
     _write_string_1d(root, name, [str(value)], chunks=1)
 
 
-def _existing_shard_is_usable(path: str, expected_global_indices: np.ndarray) -> bool:
+def _existing_shard_is_usable(
+    path: str,
+    expected_global_indices: np.ndarray,
+    *,
+    expected_wavelengths: np.ndarray | None = None,
+) -> bool:
     try:
         root = _open_shard(path)
     except Exception:
@@ -289,6 +294,19 @@ def _existing_shard_is_usable(path: str, expected_global_indices: np.ndarray) ->
 
     if not np.array_equal(gidx, expected_global_indices.astype(np.int64, copy=False)):
         return False
+
+    # Validate that the stored wavelength grid matches the current request.
+    # Without this check, shards from a previous run with a different wavelength
+    # range at the same file path would be silently reused.
+    if expected_wavelengths is not None:
+        try:
+            wl = np.asarray(root["wavelength"][:], dtype=np.float64)
+        except Exception:
+            return False
+        if wl.size != expected_wavelengths.size:
+            return False
+        if not np.allclose(wl, expected_wavelengths, atol=1e-4):
+            return False
 
     try:
         statuses = [str(x).strip().lower() for x in np.asarray(root["status"][:]).tolist()]
@@ -972,8 +990,19 @@ def main():
         grid_output_mode_values = [str(getattr(config, "output_mode")).strip()]
     resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(grid_output_mode_values)
 
+    # Compute the expected wavelength grid early so it can be used for
+    # idempotency validation (detecting stale shards from a different run).
+    _expected_wl: np.ndarray | None = None
+    if all(k in grid for k in ("lam_min", "lam_max", "lam_step")):
+        _lam_min0 = float(np.asarray(grid["lam_min"][0]))
+        _lam_max0 = float(np.asarray(grid["lam_max"][0]))
+        _lam_step0 = float(np.asarray(grid["lam_step"][0]))
+        if _lam_step0 > 0:
+            _npts = int(round((_lam_max0 - _lam_min0) / _lam_step0)) + 1
+            _expected_wl = np.linspace(_lam_min0, _lam_max0, _npts)
+
     if os.path.exists(final_path):
-        if _existing_shard_is_usable(final_path, indices):
+        if _existing_shard_is_usable(final_path, indices, expected_wavelengths=_expected_wl):
             logger.warning("Shard output already exists and is valid — skipping.")
             return
         logger.warning("Shard output exists but is incomplete/invalid; removing and recomputing: %s", final_path)
