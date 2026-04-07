@@ -61,7 +61,7 @@ from provenance_contract import (  # noqa: E402
     file_sha256,
     is_meaningful_provenance_value,
 )
-from synthesis_validation import validate_synthesis_results
+from synthesis_validation import SUCCESS_STATUSES, validate_synthesis_results
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
 
 
@@ -756,7 +756,12 @@ def _synthesis_task(args) -> Dict:
                         count = int(getattr(cfg, "mu_sampling", {}).get("count", 1) or 1)
                         chosen_idx = ranked[:count] if count <= ranked.size else np.resize(ranked, count)
                         chosen_idx = np.asarray(chosen_idx, dtype=np.int64)
-                        mu_selected = float("nan")
+                        logging.getLogger("zarr_synthesis").warning(
+                            "mu-points header missing from %s; using target_mu=%.6g as mu_selected estimate",
+                            spec_path,
+                            target_mu,
+                        )
+                        mu_selected = float(target_mu)
 
                 if chosen_idx.size > 0:
                     mu_selected_index = int(chosen_idx[0])
@@ -1018,12 +1023,14 @@ def _validate_synthesis_results(
     messages: Sequence[str],
     fluxes: np.ndarray,
     continua: np.ndarray,
+    max_failures: int = 0,
 ) -> Dict[str, int]:
     return validate_synthesis_results(
         statuses=statuses,
         messages=messages,
         fluxes=fluxes,
         continua=continua,
+        max_failures=max_failures,
     )
 
 
@@ -1052,6 +1059,12 @@ def main() -> None:
         "--flux-definition",
         default="auto",
         help="Flux definition metadata. Use 'auto' to infer from output_mode.",
+    )
+    parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=0,
+        help="Maximum number of failed rows to tolerate before aborting the write (default: 0 = abort on any failure).",
     )
     parser.add_argument(
         "--allow-incomplete-provenance",
@@ -1175,7 +1188,11 @@ def main() -> None:
         messages=messages,
         fluxes=fluxes,
         continua=continua,
+        max_failures=args.max_failures,
     )
+
+    n_failures = sum(v for k, v in status_counts.items() if k.lower() not in SUCCESS_STATUSES)
+    validation_failed = n_failures > args.max_failures
 
     linelist_files_abs = _resolve_linelist_paths(config)
     linelist_files_manifest: List[Dict[str, Any]] = []
@@ -1357,6 +1374,15 @@ def main() -> None:
     if write_path != final_path:
         _finalize_zarr_store(write_path, final_path, logger=logger, label="Synthesis Zarr")
     logger.info("Completed synthesis in %.2fs", time.perf_counter() - t0)
+
+    if validation_failed:
+        logger.error(
+            "Output saved to %s but exiting with error: %d failure(s) exceed --max-failures %d",
+            final_path,
+            n_failures,
+            args.max_failures,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

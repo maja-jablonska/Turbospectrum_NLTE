@@ -561,7 +561,12 @@ def _synthesis_task(batch):
                             count = int(getattr(cfg, "mu_sampling", {}).get("count", 1) or 1)
                             chosen_idx = ranked[:count] if count <= ranked.size else np.resize(ranked, count)
                             chosen_idx = np.asarray(chosen_idx, dtype=np.int64)
-                            mu_selected = float("nan")
+                            logging.getLogger("zarr_synthesis_sharded").warning(
+                                "mu-points header missing from %s; using target_mu=%.6g as mu_selected estimate",
+                                spec_path,
+                                target_mu,
+                            )
+                            mu_selected = float(target_mu)
 
                     if chosen_idx.size > 0:
                         mu_selected_index = int(chosen_idx[0])
@@ -694,6 +699,12 @@ def main():
 
     parser.add_argument("--scratch", default=None)
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=0,
+        help="Maximum number of failed rows to tolerate before aborting the shard write (default: 0 = abort on any failure).",
+    )
     parser.add_argument(
         "--allow-incomplete-provenance",
         action="store_true",
@@ -1165,7 +1176,7 @@ def main():
                     )
 
     ############################################
-    # Write shard
+    # Validate & write shard (always write to preserve HPC work)
     ############################################
 
     status_counts = validate_synthesis_results(
@@ -1173,7 +1184,11 @@ def main():
         messages=messages,
         fluxes=fluxes,
         continua=continua,
+        max_failures=args.max_failures,
     )
+
+    n_failures = sum(v for k, v in status_counts.items() if k.lower() not in SUCCESS_STATUSES)
+    validation_failed = n_failures > args.max_failures
 
     logger.info(
         "Writing shard output: %s (rows=%d wl=%d)",
@@ -1260,6 +1275,15 @@ def main():
         _finalize_zarr_store(write_path, final_path, logger=logger, label="Shard")
     else:
         logger.info("Shard written to %s", final_path)
+
+    if validation_failed:
+        logger.error(
+            "Shard saved to %s but exiting with error: %d failure(s) exceed --max-failures %d",
+            final_path,
+            n_failures,
+            args.max_failures,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":

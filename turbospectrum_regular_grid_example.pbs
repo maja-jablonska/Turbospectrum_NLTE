@@ -684,6 +684,8 @@ while IFS='=' read -r key value; do
 done <<< "${LAYOUT_OUTPUT}"
 
 EST_ROWS_PER_SHARD="${ROWS_PER_SHARD}"
+MAX_FAILURES=$(( (ROWS_PER_SHARD * 15 + 99) / 100 ))
+echo "[regular-grid] Max failures per shard (15%): ${MAX_FAILURES}"
 
 SHARD_INDEX="${PBS_ARRAY_INDEX:-}"
 if (( ARRAY_TASK_MODE == 1 )) && (( SHARD_INDEX >= SHARD_COUNT )); then
@@ -844,6 +846,7 @@ run_shard_attempts () {
             --shard-count "${SHARD_COUNT}" \
             --workers "${worker_count}" \
             --scratch "${attempt_scratch}" \
+            --max-failures "${MAX_FAILURES}" \
             --log-level "${SYNTH_LOG_LEVEL}" \
             >> "${log_file}" 2>&1; then
             end=$(date +%s)
