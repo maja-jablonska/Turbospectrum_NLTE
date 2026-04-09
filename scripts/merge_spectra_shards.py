@@ -278,6 +278,49 @@ def _to_float32(values: np.ndarray) -> np.ndarray:
     return out
 
 
+# Group abundance display names — these are abundance *ratios*, not individual elements.
+_GROUP_ABUNDANCE_NAMES = {
+    "a": "[a/Fe]",
+    "c": "[C/Fe]",
+    "n": "[N/Fe]",
+    "o": "[O/Fe]",
+    "r": "[r/Fe]",
+    "s": "[s/Fe]",
+}
+
+# Known element symbols (lowercase key → capitalised symbol).
+_ELEMENT_SYMBOLS = {
+    "h": "H", "he": "He", "li": "Li", "be": "Be", "b": "B",
+    "ne": "Ne", "na": "Na", "mg": "Mg", "al": "Al", "si": "Si",
+    "p": "P", "cl": "Cl", "ar": "Ar", "k": "K", "ca": "Ca",
+    "sc": "Sc", "ti": "Ti", "v": "V", "cr": "Cr", "mn": "Mn",
+    "fe": "Fe", "co": "Co", "ni": "Ni", "cu": "Cu", "zn": "Zn",
+    "ga": "Ga", "ge": "Ge", "as": "As", "se": "Se", "br": "Br",
+    "kr": "Kr", "rb": "Rb", "sr": "Sr", "y": "Y", "zr": "Zr",
+    "nb": "Nb", "mo": "Mo", "ru": "Ru", "rh": "Rh", "pd": "Pd",
+    "ag": "Ag", "cd": "Cd", "in": "In", "sn": "Sn", "sb": "Sb",
+    "te": "Te", "i": "I", "xe": "Xe", "cs": "Cs", "ba": "Ba",
+    "la": "La", "ce": "Ce", "pr": "Pr", "nd": "Nd", "sm": "Sm",
+    "eu": "Eu", "gd": "Gd", "tb": "Tb", "dy": "Dy", "ho": "Ho",
+    "er": "Er", "tm": "Tm", "yb": "Yb", "lu": "Lu", "hf": "Hf",
+    "ta": "Ta", "w": "W", "re": "Re", "os": "Os", "ir": "Ir",
+    "pt": "Pt", "au": "Au", "hg": "Hg", "tl": "Tl", "pb": "Pb",
+    "bi": "Bi", "th": "Th", "u": "U",
+}
+
+
+def _display_param_name(internal_name: str) -> str:
+    """Map an internal column name to a descriptive parameter name."""
+    if internal_name == "feh":
+        return "[Fe/H]"
+    if internal_name in _GROUP_ABUNDANCE_NAMES:
+        return _GROUP_ABUNDANCE_NAMES[internal_name]
+    low = internal_name.lower()
+    if low in _ELEMENT_SYMBOLS:
+        return _ELEMENT_SYMBOLS[low]
+    return internal_name
+
+
 def _ordered_param_names(columns: Mapping[str, np.ndarray]) -> List[str]:
     reserved = {
         "grid_version",
@@ -289,11 +332,11 @@ def _ordered_param_names(columns: Mapping[str, np.ndarray]) -> List[str]:
         "calculation_mode",
         "turb",
     }
-    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s"]
+    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s", "mu"]
     extras = sorted(
         name
         for name in columns.keys()
-        if name not in reserved and name not in {"teff", "logg", "feh", "turbvel", "t_value", "a", "c", "n", "o", "r", "s"}
+        if name not in reserved and name not in {"teff", "logg", "feh", "turbvel", "t_value", "a", "c", "n", "o", "r", "s", "mu"}
     )
     return candidate_order + extras
 
@@ -319,11 +362,12 @@ def _build_params_matrix(columns: Mapping[str, np.ndarray]) -> Tuple[np.ndarray,
         if name in columns:
             params_by_name[name] = _to_float32(np.asarray(columns[name]))
 
-    param_names = [n for n in candidate_order if n in params_by_name]
-    if not param_names:
+    param_names_internal = [n for n in candidate_order if n in params_by_name]
+    if not param_names_internal:
         raise ValueError("Could not construct params matrix from merged metadata")
-    params = np.column_stack([params_by_name[n] for n in param_names]).astype(np.float32, copy=False)
-    return params, np.asarray(param_names, dtype=object)
+    params = np.column_stack([params_by_name[n] for n in param_names_internal]).astype(np.float32, copy=False)
+    display_names = [_display_param_name(n) for n in param_names_internal]
+    return params, np.asarray(display_names, dtype=object)
 
 
 def _compute_model_ids(params: np.ndarray) -> np.ndarray:
@@ -979,6 +1023,7 @@ def main() -> None:
                 "o",
                 "r",
                 "s",
+                "mu",
                 "lam_min",
                 "lam_max",
                 "lam_step",
@@ -1115,11 +1160,14 @@ def main() -> None:
             )
 
     # Build params matrix from original grid when available; otherwise fall back to merged shard metadata.
+    # Exclude the grid's target "mu" column — use mu_selected (the actual
+    # value used for calculations) instead.
+    _GRID_SKIP = {"lam_min", "lam_max", "lam_step", "output_mode", "mode", "calculation_mode", "grid_version", "mu"}
     if grid_root is not None:
         grid_cols: Dict[str, np.ndarray] = {}
         for name in grid_root.keys():
             if name in grid_root:
-                if name in {"lam_min", "lam_max", "lam_step", "output_mode", "mode", "calculation_mode", "grid_version"}:
+                if name in _GRID_SKIP:
                     continue
                 values = np.asarray(grid_root[name][:])
                 if effective_allow_missing:
@@ -1135,6 +1183,11 @@ def main() -> None:
             if effective_allow_missing:
                 turb_vals = turb_vals[selected_global_indices]
             grid_cols["turb"] = turb_vals
+        # Inject mu_selected as the "mu" param — it's the angle actually used.
+        if saw_mu_selected:
+            mu_sel_data = np.asarray(mu_selected_out[:], dtype=np.float32)
+            if not np.all(np.isnan(mu_sel_data)):
+                grid_cols["mu"] = mu_sel_data
         params, param_names = _build_params_matrix(grid_cols)
     else:
         params_source: Dict[str, np.ndarray] = {}
@@ -1147,6 +1200,11 @@ def main() -> None:
             params_source["turb"] = np.asarray(merged_meta["turbvel"])
         elif "t_value" in merged_meta and any(str(x).strip() for x in merged_meta["t_value"].tolist()):
             params_source["turb"] = np.asarray(merged_meta["t_value"])
+        # Same mu_selected injection for shard-only merges.
+        if saw_mu_selected:
+            mu_sel_data = np.asarray(mu_selected_out[:], dtype=np.float32)
+            if not np.all(np.isnan(mu_sel_data)):
+                params_source["mu"] = mu_sel_data
         params, param_names = _build_params_matrix(params_source)
 
     model_id = _compute_model_ids(params)

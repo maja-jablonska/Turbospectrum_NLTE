@@ -97,16 +97,17 @@ def _parse_numeric_axis(raw: str, name: str, *, integer: bool) -> np.ndarray:
         values = np.asarray([float(t) for t in tokens], dtype=np.float64)
         values = np.sort(np.unique(values))
 
-    if values.size < 2:
-        raise ValueError(f"{name} axis must contain at least two points for linear interpolation")
+    if values.size == 0:
+        raise ValueError(f"{name} axis must contain at least one value")
 
-    diffs = np.diff(values)
-    ref = float(diffs[0])
-    tol = max(1e-10, abs(ref) * 1e-8)
-    if not np.allclose(diffs, ref, rtol=0.0, atol=tol):
-        raise ValueError(
-            f"{name} axis is not uniformly spaced; got steps like {diffs[:5].tolist()}"
-        )
+    if values.size >= 2:
+        diffs = np.diff(values)
+        ref = float(diffs[0])
+        tol = max(1e-10, abs(ref) * 1e-8)
+        if not np.allclose(diffs, ref, rtol=0.0, atol=tol):
+            raise ValueError(
+                f"{name} axis is not uniformly spaced; got steps like {diffs[:5].tolist()}"
+            )
 
     if integer:
         ints = np.rint(values).astype(np.int64)
@@ -142,6 +143,35 @@ def _abs_output_from(run_root: str, cfg_dir: str, maybe_relative: str | None) ->
     return os.path.abspath(os.path.join(cfg_dir, maybe_relative))
 
 
+def _parse_abundance_spec(raw: Any, name: str) -> np.ndarray:
+    """Parse an abundance value: a single float/string or a 'start:end:step' range.
+
+    Returns an array of formatted abundance strings like '+0.00'.
+    """
+    text = str(raw).strip()
+    if not text:
+        return np.asarray(["+0.00"], dtype=object)
+
+    if ":" in text:
+        parts = [p.strip() for p in text.split(":")]
+        if len(parts) != 3:
+            raise ValueError(f"abundance '{name}' range must be start:end:step, got {text!r}")
+        start, stop, step = float(parts[0]), float(parts[1]), float(parts[2])
+        if step <= 0:
+            raise ValueError(f"abundance '{name}' step must be positive, got {step}")
+        if stop < start:
+            raise ValueError(f"abundance '{name}' stop must be >= start, got {start}..{stop}")
+        values = np.arange(start, stop + 0.5 * step, step)
+        return np.asarray([f"{v:+.2f}" for v in values], dtype=object)
+
+    try:
+        v = float(text)
+        return np.asarray([f"{v:+.2f}"], dtype=object)
+    except ValueError:
+        # Already a formatted string like "+0.00"
+        return np.asarray([text], dtype=object)
+
+
 def _build_regular_columns(
     *,
     teff_axis: np.ndarray,
@@ -156,16 +186,25 @@ def _build_regular_columns(
     output_mode: str,
     mode: str,
     calculation_mode: str,
-    abundances: Dict[str, str],
+    abundances: Dict[str, np.ndarray],
     max_rows: int,
     nlte_ascii_selector: Any = None,
 ) -> Dict[str, np.ndarray]:
+    # Axes that always participate in the cross-product.
     nt = int(teff_axis.size)
     ng = int(logg_axis.size)
     nf = int(feh_axis.size)
     nu = int(turbvel_axis.size)
     nm = int(mu_axis.size) if mu_axis is not None else 1
-    base_count = nt * ng * nf * nu
+
+    # Abundance axes — each may be a single value or a range.
+    abund_keys = ("a", "c", "n", "o", "r", "s")
+    abund_sizes = {k: int(abundances[k].size) for k in abund_keys}
+    abund_total = 1
+    for sz in abund_sizes.values():
+        abund_total *= sz
+
+    base_count = nt * ng * nf * nu * abund_total
     row_count = base_count * nm
     if row_count <= 0:
         raise ValueError("Computed row_count is zero")
@@ -175,16 +214,32 @@ def _build_regular_columns(
             "Lower axis resolutions or increase --max-rows."
         )
 
-    teff_base = np.repeat(teff_axis.astype(np.int64), ng * nf * nu)
-    logg_base = np.tile(np.repeat(logg_axis.astype(np.float64), nf * nu), nt)
-    feh_base = np.tile(np.repeat(feh_axis.astype(np.float64), nu), nt * ng)
-    turbvel_base = np.tile(turbvel_axis.astype(object), nt * ng * nf)
+    # Build the cross-product using the standard repeat/tile pattern.
+    # Axis order: teff (slowest) > logg > feh > turbvel > a > c > n > o > r > s (fastest before mu).
+    # suffix_count = product of all axis sizes that come *after* the current axis.
+    suffix_after_turbvel = abund_total
+    teff_base = np.repeat(teff_axis.astype(np.int64), ng * nf * nu * suffix_after_turbvel)
+    logg_base = np.tile(np.repeat(logg_axis.astype(np.float64), nf * nu * suffix_after_turbvel), nt)
+    feh_base = np.tile(np.repeat(feh_axis.astype(np.float64), nu * suffix_after_turbvel), nt * ng)
+    turbvel_base = np.tile(np.repeat(turbvel_axis.astype(object), suffix_after_turbvel), nt * ng * nf)
+
+    # Abundance columns via the same repeat/tile pattern.
+    prefix = nt * ng * nf * nu
+    abund_columns: Dict[str, np.ndarray] = {}
+    suffix = abund_total  # running product of sizes to the right
+    for k in abund_keys:
+        sz = abund_sizes[k]
+        suffix //= sz
+        col = np.tile(np.repeat(abundances[k], suffix), prefix * (abund_total // (sz * suffix)))
+        abund_columns[k] = col
 
     if mu_axis is not None:
         teff = np.repeat(teff_base, nm)
         logg = np.repeat(logg_base, nm)
         feh = np.repeat(feh_base, nm)
         turbvel = np.repeat(turbvel_base, nm)
+        for k in abund_keys:
+            abund_columns[k] = np.repeat(abund_columns[k], nm)
         mu = np.tile(mu_axis.astype(np.float64), base_count)
     else:
         teff = teff_base
@@ -204,12 +259,12 @@ def _build_regular_columns(
         "turbvel": turbvel,
         # Keep t_value aligned with turbvel for compatibility with older readers.
         "t_value": turbvel.copy(),
-        "a": np.full(row_count, abundances["a"], dtype=object),
-        "c": np.full(row_count, abundances["c"], dtype=object),
-        "n": np.full(row_count, abundances["n"], dtype=object),
-        "o": np.full(row_count, abundances["o"], dtype=object),
-        "r": np.full(row_count, abundances["r"], dtype=object),
-        "s": np.full(row_count, abundances["s"], dtype=object),
+        "a": abund_columns["a"],
+        "c": abund_columns["c"],
+        "n": abund_columns["n"],
+        "o": abund_columns["o"],
+        "r": abund_columns["r"],
+        "s": abund_columns["s"],
         "output_mode": np.full(row_count, output_mode, dtype=object),
         "mode": np.full(row_count, mode, dtype=object),
         "calculation_mode": np.full(row_count, calculation_mode, dtype=object),
@@ -362,12 +417,12 @@ def main() -> None:
     parser.add_argument("--mode", default=None)
     parser.add_argument("--calculation-mode", default=None)
 
-    parser.add_argument("--a", default=None, help="Fixed [alpha/Fe] value stored in grid column 'a'")
-    parser.add_argument("--c", default=None)
-    parser.add_argument("--n", default=None)
-    parser.add_argument("--o", default=None)
-    parser.add_argument("--r", default=None)
-    parser.add_argument("--s", default=None)
+    parser.add_argument("--a", default=None, help="[alpha/Fe]: single value (0.0, '+0.00') or range (start:end:step)")
+    parser.add_argument("--c", default=None, help="[C/Fe]: single value or range (start:end:step)")
+    parser.add_argument("--n", default=None, help="[N/Fe]: single value or range (start:end:step)")
+    parser.add_argument("--o", default=None, help="[O/Fe]: single value or range (start:end:step)")
+    parser.add_argument("--r", default=None, help="[r-process/Fe]: single value or range (start:end:step)")
+    parser.add_argument("--s", default=None, help="[s-process/Fe]: single value or range (start:end:step)")
     parser.add_argument(
         "--nlte-ascii-dir",
         default=None,
@@ -601,6 +656,11 @@ def main() -> None:
     grid_synth_overrides["lambda_min"] = lam_min
     grid_synth_overrides["lambda_max"] = lam_max
     grid_synth_overrides["lambda_step"] = lam_step
+    # Clear the base config's example grid_points — the pipeline uses its
+    # own grid Zarr, and leftover example points (e.g. teff=4000) confuse
+    # the TurbospectrumConfig printout.
+    synthesis_overrides["grid_points"] = []
+    synthesis_overrides["grid_points_file"] = ""
 
     config_path = _materialize_synthesis_config(
         base_config_path=config_path,
@@ -637,12 +697,8 @@ def main() -> None:
         return
 
     abundances = {
-        "a": str(_coalesce(args.a, cfg, ("grid", "abundances", "a"), "+0.00")),
-        "c": str(_coalesce(args.c, cfg, ("grid", "abundances", "c"), "+0.00")),
-        "n": str(_coalesce(args.n, cfg, ("grid", "abundances", "n"), "+0.00")),
-        "o": str(_coalesce(args.o, cfg, ("grid", "abundances", "o"), "+0.00")),
-        "r": str(_coalesce(args.r, cfg, ("grid", "abundances", "r"), "+0.00")),
-        "s": str(_coalesce(args.s, cfg, ("grid", "abundances", "s"), "+0.00")),
+        k: _parse_abundance_spec(_coalesce(getattr(args, k), cfg, ("grid", "abundances", k), "+0.00"), k)
+        for k in ("a", "c", "n", "o", "r", "s")
     }
     columns = _build_regular_columns(
         teff_axis=teff_axis,
@@ -662,9 +718,13 @@ def main() -> None:
         max_rows=max_rows,
     )
 
+    abund_axis_parts = "".join(
+        f" {k}={abundances[k].size}" for k in ("a", "c", "n", "o", "r", "s") if abundances[k].size > 1
+    )
     print(
         "[regular-grid] axes: "
-        f"teff={teff_axis.size} logg={logg_axis.size} feh={feh_axis.size} turbvel={turbvel_axis.size} "
+        f"teff={teff_axis.size} logg={logg_axis.size} feh={feh_axis.size} turbvel={turbvel_axis.size}"
+        f"{abund_axis_parts} "
         f"rows={len(columns['teff']):,}"
     )
     if mu_axis is not None:
