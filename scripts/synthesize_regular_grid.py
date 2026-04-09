@@ -587,6 +587,21 @@ def main() -> None:
 
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"Synthesis config not found: {config_path}")
+
+    # Inject grid synthesis parameters into the overrides so the
+    # materialized synthesis config is consistent with the pipeline config.
+    # Without this, the base config's defaults (e.g. output_mode=Flux)
+    # would persist even when the grid config says Intensity.
+    if synthesis_overrides is None:
+        synthesis_overrides = {}
+    else:
+        synthesis_overrides = copy.deepcopy(synthesis_overrides)
+    grid_synth_overrides = synthesis_overrides.setdefault("synthesis_parameters", {})
+    grid_synth_overrides["output_mode"] = output_mode
+    grid_synth_overrides["lambda_min"] = lam_min
+    grid_synth_overrides["lambda_max"] = lam_max
+    grid_synth_overrides["lambda_step"] = lam_step
+
     config_path = _materialize_synthesis_config(
         base_config_path=config_path,
         run_root=run_root,

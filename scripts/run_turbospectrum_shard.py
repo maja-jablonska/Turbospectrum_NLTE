@@ -790,6 +790,16 @@ def main():
         config.log_dir = os.path.join(scratch, "logs")
         config.output_dir = os.path.join(scratch, "spectra")
         config.model_opac_dir = os.path.join(scratch, "opac")
+        logger.info(
+            "Scratch override — effective paths: output_dir=%s  tmp_dir=%s  log_dir=%s",
+            config.output_dir, config.tmp_dir, config.log_dir,
+        )
+
+    logger.info(
+        "Effective config: output_mode=%s  lambda=%.1f-%.1f  step=%.4f  nlte=%s",
+        config.output_mode, config.lambda_min, config.lambda_max,
+        config.lambda_step, config.nlte,
+    )
 
     ensure_directories(config)
     validate_runtime_environment(config)

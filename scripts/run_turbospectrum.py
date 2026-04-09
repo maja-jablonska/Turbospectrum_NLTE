@@ -1945,22 +1945,28 @@ def run_grid(config: TurbospectrumConfig, grid_points: List[Tuple]):
     print(f"Summary log written to {summary_path}")
 
 def main():
+    import argparse as _ap
+
     # Detect project root (assuming this script is in scripts/ or root)
-    # Adjust this logic if you move the script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir) if os.path.basename(script_dir) == "scripts" else script_dir
-    
-    # Parse arguments manually to handle --force and config file
-    args = sys.argv[1:]
-    force_flag = False
-    if "--force" in args:
-        force_flag = True
-        args.remove("--force")
-    
-    # Load configuration from JSON file if provided as argument
-    if len(args) > 0:
-        config_path = args[0]
-        with open(config_path, 'r') as f:
+
+    parser = _ap.ArgumentParser(
+        description="Run Turbospectrum spectral synthesis over a grid of stellar parameters.",
+    )
+    parser.add_argument("config", nargs="?", default=None, help="Path to JSON config file")
+    parser.add_argument("--force", action="store_true", help="Re-run even if output already exists")
+    parser.add_argument("--output-dir", default=None, help="Override output directory for spectra")
+    parser.add_argument("--log-dir", default=None, help="Override log directory")
+    parser.add_argument("--tmp-dir", default=None, help="Override temporary directory")
+    parser.add_argument("--compiler", default=None, choices=["gf", "intel", "ifx"], help="Compiler variant")
+    parser.add_argument("--nlte", action="store_true", default=None, help="Enable NLTE mode")
+    parser.add_argument("--workers", type=int, default=None, help="Number of parallel workers (max_workers)")
+    cli = parser.parse_args()
+
+    # Load configuration from JSON file if provided
+    if cli.config is not None:
+        with open(cli.config, 'r') as f:
             cfg_data = json.load(f)
         cfg_data = _normalize_config_dict(cfg_data, default_project_root=project_root)
         accepted_fields = {fld.name for fld in dataclasses.fields(TurbospectrumConfig)}
@@ -1970,10 +1976,22 @@ def main():
         config = TurbospectrumConfig(**cfg_data)
     else:
         config = TurbospectrumConfig(project_root=project_root)
-    
-    # Apply force flag
-    if force_flag:
+
+    # CLI overrides take precedence over config file
+    if cli.force:
         config.force = True
+    if cli.output_dir is not None:
+        config.output_dir = os.path.abspath(cli.output_dir)
+    if cli.log_dir is not None:
+        config.log_dir = os.path.abspath(cli.log_dir)
+    if cli.tmp_dir is not None:
+        config.tmp_dir = os.path.abspath(cli.tmp_dir)
+    if cli.compiler is not None:
+        config.compiler = cli.compiler
+    if cli.nlte is True:
+        config.nlte = True
+    if cli.workers is not None:
+        config.max_workers = cli.workers
     
     # Load grid points from external file if specified
     if config.grid_points_file:
