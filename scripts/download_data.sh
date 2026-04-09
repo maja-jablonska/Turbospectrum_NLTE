@@ -17,6 +17,7 @@ usage() {
     echo "                         Use 'all' to download data for all available atoms."
     echo "  --linelists            Download the recommended line lists."
     echo "  --gold-sample          Download the gold sample dataset (configurable via GOLD_SAMPLE_URL/GOLD_SAMPLE_PATH)."
+    echo "  --output-dir <path>    Base directory for all downloaded files (default: <project>/input_files)."
     echo "  --force                Re-download files even if a previous run completed successfully."
     echo "  --all                  Download all available default files."
     echo "  -h, --help             Display this help message."
@@ -49,6 +50,33 @@ GOLD_SAMPLE_PATH="${GOLD_SAMPLE_PATH:-${PROJECT_ROOT}/gold_sample}"
 
 # Whether to force re-download even if a previous run completed
 FORCE_DOWNLOAD=false
+
+# --- Pre-scan for --output-dir (must apply before any download runs) ---
+
+_prev_arg=""
+for _arg in "$@"; do
+    if [[ "$_prev_arg" == "--output-dir" ]]; then
+        OUTPUT_DIR="$_arg"
+        break
+    fi
+    _prev_arg="$_arg"
+done
+unset _prev_arg _arg
+
+if [[ -n "${OUTPUT_DIR:-}" ]]; then
+    mkdir -p "$OUTPUT_DIR"
+    OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+    MODEL_PATH="${OUTPUT_DIR}/model_atmospheres/1D/marcs_standard_comp"
+    STAGGER_PATH="${OUTPUT_DIR}/model_atmospheres/STAGGER_grid"
+    NLTE_BASE_PATH="${OUTPUT_DIR}/nlte_data"
+    NLTE_ATOM_PATH="${NLTE_BASE_PATH}/model_atoms"
+    NLTE_GRID_PATH="${NLTE_BASE_PATH}/departure_grids"
+    LINELIST_PATH="${OUTPUT_DIR}/linelists"
+    GOLD_SAMPLE_PATH="${OUTPUT_DIR}/gold_sample"
+    TMP_PATH="${OUTPUT_DIR}/.tmp"
+    mkdir -p "$TMP_PATH"
+    echo "Output directory: $OUTPUT_DIR"
+fi
 
 # --- Helpers ---
 
@@ -231,6 +259,10 @@ fi
 # Parse command-line arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
+        --output-dir)
+            # Already handled in pre-scan; just consume the argument.
+            shift
+            ;;
         --force)
             FORCE_DOWNLOAD=true
             ;;
