@@ -132,77 +132,37 @@ def _ensure_zarr_available() -> None:
     )
 
 
-def _zarr_store(path: str):
-    # Match the helper used in other scripts in this repo.
-    _ensure_zarr_available()
-    if hasattr(zarr, "DirectoryStore"):
-        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
-    from zarr import storage as zstorage  # type: ignore
+try:
+    from zarr_compat import (
+        zarr_store as _zarr_store_impl,
+        compression_kwargs as _zarr_compression_kwargs_base,
+        create_root_group as _zc_create_root_group,
+        create_array as _zc_create_array,
+        write_string_scalar as _zc_write_string_scalar,
+    )
+except ImportError:
+    from .zarr_compat import (
+        zarr_store as _zarr_store_impl,
+        compression_kwargs as _zarr_compression_kwargs_base,
+        create_root_group as _zc_create_root_group,
+        create_array as _zc_create_array,
+        write_string_scalar as _zc_write_string_scalar,
+    )
 
-    if hasattr(zstorage, "DirectoryStore"):
-        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
-    if hasattr(zstorage, "LocalStore"):
-        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
-    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+
+def _zarr_store(path: str):
+    _ensure_zarr_available()
+    return _zarr_store_impl(path)
 
 
 def _zarr_compression_kwargs(cname: str, clevel: int, shuffle: bool) -> dict:
-    # Prefer v3 codecs when available; otherwise fall back to numcodecs (v2).
     _ensure_zarr_available()
-    try:
-        import zarr.codecs as zc  # type: ignore
-
-        if hasattr(zc, "BloscCodec") and hasattr(zc, "BloscShuffle"):
-            shuf = zc.BloscShuffle.bitshuffle if shuffle else None
-            return {"compressors": [zc.BloscCodec(cname=cname, clevel=clevel, shuffle=shuf)]}
-    except Exception:
-        pass
-
-    try:
-        from numcodecs import Blosc  # type: ignore
-
-        return {
-            "compressor": Blosc(
-                cname=cname,
-                clevel=int(clevel),
-                shuffle=Blosc.BITSHUFFLE if shuffle else Blosc.NOSHUFFLE,
-            )
-        }
-    except Exception:
-        return {}
+    return _zarr_compression_kwargs_base({"cname": cname, "clevel": clevel, "shuffle": shuffle})
 
 
 def _string_array_write(group, name: str, value: str, *, compression_kwargs: dict) -> None:
-    """
-    Store a scalar string in a Zarr group, working for both Zarr v2 and v3.
-    """
-    # v3
-    if hasattr(group, "create_array"):
-        try:
-            import zarr.codecs as zc  # type: ignore
-            from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
-
-            arr = group.create_array(
-                name,
-                shape=(),
-                dtype=VariableLengthUTF8(),
-                serializer=zc.VLenUTF8Codec(),
-                **compression_kwargs,
-            )
-            arr[()] = value
-            return
-        except Exception:
-            # Fall through to v2-style storage if v3 string dtype isn't available.
-            pass
-
-    # v2 fallback
-    try:
-        from numcodecs import VLenUTF8  # type: ignore
-
-        group.array(name, np.array(value, dtype=object), dtype=object, object_codec=VLenUTF8(), **compression_kwargs)
-    except Exception:
-        # Last resort: store as bytes-ish object
-        group.array(name, np.array(value, dtype=object), dtype=object)
+    """Store a scalar string in a Zarr group, working for both Zarr v2 and v3."""
+    _zc_write_string_scalar(group, name, value, compression_kw=compression_kwargs)
 
 
 def header_to_serializable_dict(header) -> dict:
@@ -337,7 +297,7 @@ def run_shard(
 
     os.makedirs(os.path.dirname(os.path.abspath(str(output))), exist_ok=True)
     store = _zarr_store(str(output))
-    root = zarr.group(store=store, overwrite=True, zarr_format=3) if hasattr(zarr, "group") else zarr.open_group(store=store, mode="w")  # type: ignore
+    root = _zc_create_root_group(store, overwrite=True)
 
     compression_kwargs = _zarr_compression_kwargs(compressor, compression_level, shuffle)
     spectra_group = root.create_group("spectra") if hasattr(root, "create_group") else root.require_group("spectra")  # type: ignore
@@ -371,14 +331,9 @@ def run_shard(
             chunks = (cs,)
 
             # Store numeric arrays
-            if hasattr(dset_group, "create_array"):
-                dset_group.create_array("wavelength", data=wave, chunks=chunks, **compression_kwargs)
-                dset_group.create_array("flux", data=flux, chunks=chunks, **compression_kwargs)
-                dset_group.create_array("error", data=err, chunks=chunks, **compression_kwargs)
-            else:
-                dset_group.array("wavelength", wave, chunks=chunks, **compression_kwargs)
-                dset_group.array("flux", flux, chunks=chunks, **compression_kwargs)
-                dset_group.array("error", err, chunks=chunks, **compression_kwargs)
+            _zc_create_array(dset_group, "wavelength", data=wave, chunks=chunks, **compression_kwargs)
+            _zc_create_array(dset_group, "flux", data=flux, chunks=chunks, **compression_kwargs)
+            _zc_create_array(dset_group, "error", data=err, chunks=chunks, **compression_kwargs)
 
             # Store headers as per-file JSON (fast; avoids giant attrs updates)
             _string_array_write(dset_group, "hdr0_json", hdr0_json, compression_kwargs=compression_kwargs)

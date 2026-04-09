@@ -61,7 +61,7 @@ from provenance_contract import (  # noqa: E402
     file_sha256,
     is_meaningful_provenance_value,
 )
-from synthesis_validation import SUCCESS_STATUSES, validate_synthesis_results
+from synthesis_validation import SUCCESS_STATUSES, FailFastTracker, validate_synthesis_results
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
 
 
@@ -197,44 +197,30 @@ def _configure_logging(log_level: str, log_file: str | None) -> logging.Logger:
     return logger
 
 
-def _zarr_store(path: str):
-    if hasattr(zarr, "DirectoryStore"):
-        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
-    from zarr import storage as zstorage  # type: ignore
-
-    if hasattr(zstorage, "DirectoryStore"):
-        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
-    if hasattr(zstorage, "LocalStore"):
-        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
-    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+try:
+    from zarr_compat import (
+        zarr_store as _zarr_store,
+        compression_kwargs as _zarr_compression_kwargs_base,
+        create_root_group as _open_root_group,
+        create_array as _create_array_compat,
+        write_string_scalar as _zc_write_string_scalar,
+        write_fixed_string_scalar as _zc_write_fixed_string_scalar,
+        write_string_array as _zc_write_string_array,
+    )
+except ImportError:
+    from .zarr_compat import (
+        zarr_store as _zarr_store,
+        compression_kwargs as _zarr_compression_kwargs_base,
+        create_root_group as _open_root_group,
+        create_array as _create_array_compat,
+        write_string_scalar as _zc_write_string_scalar,
+        write_fixed_string_scalar as _zc_write_fixed_string_scalar,
+        write_string_array as _zc_write_string_array,
+    )
 
 
 def _zarr_compression_kwargs(zarr_compressor_cfg: Mapping):
-    if not zarr_compressor_cfg:
-        return {}
-
-    cname = zarr_compressor_cfg.get("cname", "zstd")
-    clevel = int(zarr_compressor_cfg.get("clevel", 5))
-    shuffle_enabled = bool(zarr_compressor_cfg.get("shuffle", True))
-
-    try:
-        import zarr.codecs as zc  # type: ignore
-
-        if hasattr(zc, "BloscCodec") and hasattr(zc, "BloscShuffle"):
-            shuffle = zc.BloscShuffle.bitshuffle if shuffle_enabled else None
-            return {"compressors": [zc.BloscCodec(cname=cname, clevel=clevel, shuffle=shuffle)]}
-    except Exception:
-        pass
-
-    from numcodecs import Blosc  # type: ignore
-
-    return {
-        "compressor": Blosc(
-            cname=cname,
-            clevel=clevel,
-            shuffle=Blosc.BITSHUFFLE if shuffle_enabled else Blosc.NOSHUFFLE,
-        )
-    }
+    return _zarr_compression_kwargs_base(zarr_compressor_cfg)
 
 
 def _to_float32(values: np.ndarray) -> np.ndarray:
@@ -426,76 +412,11 @@ def _compute_physics_hash(config: TurbospectrumConfig, column_data: Mapping[str,
 
 
 def _write_string_scalar(root, name: str, value: str, compression_kwargs: Mapping[str, Any]) -> None:
-    if hasattr(root, "create_array"):
-        import zarr.codecs as zc  # type: ignore
-        from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
-
-        try:
-            arr = root.create_array(
-                name,
-                shape=(),
-                dtype=VariableLengthUTF8(),
-                serializer=zc.VLenUTF8Codec(),
-                **compression_kwargs,
-            )
-            arr[...] = str(value)
-            return
-        except Exception:
-            arr = root.create_array(
-                name,
-                shape=(1,),
-                dtype=VariableLengthUTF8(),
-                serializer=zc.VLenUTF8Codec(),
-                chunks=1,
-                **compression_kwargs,
-            )
-            arr[0] = str(value)
-            return
-
-    from numcodecs import VLenUTF8  # type: ignore
-
-    root.array(
-        name,
-        np.array(str(value), dtype=object),
-        dtype=object,
-        object_codec=VLenUTF8(),
-        **compression_kwargs,
-    )
-
-
-def _create_array_compat(group, name: str, *, data=None, shape=None, dtype=None, chunks=None, **kwargs):
-    if hasattr(group, "create_array"):
-        create_kwargs: Dict[str, Any] = {"name": name, **kwargs}
-        if data is not None:
-            create_kwargs["data"] = data
-        if shape is not None:
-            create_kwargs["shape"] = shape
-        if dtype is not None:
-            create_kwargs["dtype"] = dtype
-        if chunks is not None:
-            create_kwargs["chunks"] = chunks
-        return group.create_array(**create_kwargs)
-
-    if data is not None:
-        return group.create_dataset(name, data=data, shape=shape, dtype=dtype, chunks=chunks, **kwargs)
-    return group.create_dataset(name, shape=shape, dtype=dtype, chunks=chunks, **kwargs)
-
-
-def _open_root_group(store):
-    try:
-        return zarr.group(store=store, overwrite=True, zarr_format=3)
-    except TypeError:
-        return zarr.group(store=store, overwrite=True)
+    _zc_write_string_scalar(root, name, value, compression_kw=compression_kwargs)
 
 
 def _write_fixed_string_scalar(root, name: str, value: str, min_width: int, compression_kwargs: Mapping[str, Any]) -> None:
-    sval = str(value)
-    width = max(int(min_width), len(sval), 1)
-    try:
-        arr = _create_array_compat(root, name, shape=(), dtype=f"<U{width}", **compression_kwargs)
-        arr[...] = sval
-    except Exception:
-        _write_string_scalar(root, name, sval, compression_kwargs=compression_kwargs)
+    _zc_write_fixed_string_scalar(root, name, value, min_width=min_width, compression_kw=compression_kwargs)
 
 
 def _write_parameter_columns(
@@ -1067,6 +988,15 @@ def main() -> None:
         help="Maximum number of failed rows to tolerate before aborting the write (default: 0 = abort on any failure).",
     )
     parser.add_argument(
+        "--fail-fast-after",
+        type=int,
+        default=10,
+        help=(
+            "Exit the processing loop early after this many consecutive failures "
+            "(default: 10). Set to 0 to disable early exit."
+        ),
+    )
+    parser.add_argument(
         "--allow-incomplete-provenance",
         action="store_true",
         help="Allow writing datasets even when required provenance contract fields are missing.",
@@ -1126,6 +1056,9 @@ def main() -> None:
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid compressor JSON: {exc}") from exc
 
+    tracker = FailFastTracker(threshold=args.fail_fast_after)
+    early_exit = False
+
     with ProcessPoolExecutor(max_workers=worker_count, initializer=_init_worker, initargs=(config,)) as executor:
         futures = {executor.submit(_synthesis_task, task): task[0] for task in tasks}
         for future in as_completed(futures):
@@ -1136,6 +1069,17 @@ def main() -> None:
                 statuses[idx] = "exception"
                 messages[idx] = str(exc)
                 logger.exception("Task %d crashed: %s", idx, exc)
+                tracker.record_failure(str(exc))
+                if tracker.should_exit:
+                    logger.error(
+                        "Early exit after %d consecutive failures — cancelling remaining tasks. %s",
+                        tracker.consecutive_failures,
+                        tracker.summary(),
+                    )
+                    early_exit = True
+                    for f in futures:
+                        f.cancel()
+                    break
                 continue
 
             statuses[idx] = result["status"]
@@ -1152,6 +1096,10 @@ def main() -> None:
                 fluxes[idx] = result["spectrum"][0]
                 continua[idx] = result["spectrum"][1]
             status_text = str(result["status"]).upper()
+            if str(result["status"]).lower() in _SUCCESS_STATUSES:
+                tracker.record_success()
+            else:
+                tracker.record_failure(result["message"])
             log_method = logger.info if str(result["status"]).lower() in _SUCCESS_STATUSES else logger.error
             log_method(
                 "[%d/%d] %s %s (%.2fs) - %s",
@@ -1162,6 +1110,26 @@ def main() -> None:
                 result["duration"],
                 result["message"],
             )
+
+            if tracker.should_exit:
+                logger.error(
+                    "Early exit after %d consecutive failures — cancelling remaining tasks. %s",
+                    tracker.consecutive_failures,
+                    tracker.summary(),
+                )
+                early_exit = True
+                for f in futures:
+                    f.cancel()
+                break
+
+    if early_exit:
+        logger.warning(
+            "Processing stopped early: %d/%d tasks completed (%d failures). "
+            "Partial results will still be written.",
+            tracker.total_done,
+            row_count,
+            tracker.total_failures,
+        )
 
     final_path = os.path.abspath(args.output_zarr)
     write_path = os.path.abspath(args.output_tmp) if args.output_tmp else final_path

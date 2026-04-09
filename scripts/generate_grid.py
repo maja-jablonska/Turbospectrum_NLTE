@@ -293,8 +293,8 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
     output_mode = str(synthesis_cfg.get("output_mode", "Flux"))
 
     grid_version = str(config.get("grid_version", "ml-sample"))
-    mode = str(config.get("mode", "1D"))
-    calculation_mode = str(config.get("calculation_mode", "LTE"))
+    mode = str(synthesis_cfg.get("mode", config.get("mode", "1D")))
+    calculation_mode = str(synthesis_cfg.get("calculation_mode", config.get("calculation_mode", "LTE")))
 
     out: Dict[str, np.ndarray] = {
         "grid_version": np.full(sample_count, grid_version, dtype=object),
@@ -374,82 +374,27 @@ def _write_csv_outputs(columns: Mapping[str, np.ndarray], output_path: str, comp
 
 def _write_zarr_from_columns(columns: Mapping[str, np.ndarray], zarr_path: str, chunks: int, compressor_cfg: Mapping[str, Any] | None) -> None:
     try:
-        import zarr  # type: ignore
-        from numcodecs import Blosc, VLenUTF8  # type: ignore
-    except Exception as exc:  # noqa: BLE001
-        raise ImportError(
-            "Writing Zarr output requires `zarr` + `numcodecs`. "
-            "Install with `pip install zarr numcodecs` (and optionally `zstandard`)."
-        ) from exc
-
-    def zarr_store(path: str):
-        if hasattr(zarr, "DirectoryStore"):
-            return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
-        from zarr import storage as zstorage  # type: ignore
-        if hasattr(zstorage, "DirectoryStore"):
-            return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
-        if hasattr(zstorage, "LocalStore"):
-            return zstorage.LocalStore(path)  # type: ignore[attr-defined]
-        raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
-
-    def compression_kwargs(cfg: Mapping[str, Any] | None) -> Dict[str, Any]:
-        if not cfg:
-            return {}
-        cname = str(cfg.get("cname", "zstd"))
-        clevel = int(cfg.get("clevel", 5))
-        shuffle_enabled = bool(cfg.get("shuffle", True))
-        # Prefer zarr v3 codecs when available.
-        try:
-            import zarr.codecs as zc  # type: ignore
-            if hasattr(zc, "BloscCodec") and hasattr(zc, "BloscShuffle"):
-                shuffle = zc.BloscShuffle.bitshuffle if shuffle_enabled else None
-                return {"compressors": [zc.BloscCodec(cname=cname, clevel=clevel, shuffle=shuffle)]}
-        except Exception:
-            pass
-        return {
-            "compressor": Blosc(
-                cname=cname,
-                clevel=clevel,
-                shuffle=Blosc.BITSHUFFLE if shuffle_enabled else Blosc.NOSHUFFLE,
-            )
-        }
+        from zarr_compat import (
+            zarr_store, create_root_group, compression_kwargs,
+            create_array as zc_create_array, write_string_array,
+        )
+    except ImportError:
+        from .zarr_compat import (
+            zarr_store, create_root_group, compression_kwargs,
+            create_array as zc_create_array, write_string_array,
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(zarr_path)), exist_ok=True)
     store = zarr_store(zarr_path)
-    kwargs = compression_kwargs(compressor_cfg)
-    strings_codec = VLenUTF8()
+    comp_kw = compression_kwargs(compressor_cfg)
 
-    root = zarr.group(store=store, overwrite=True, zarr_format=3) if hasattr(zarr, "group") else zarr.open_group(store=store, mode="w")  # type: ignore
+    root = create_root_group(store, overwrite=True)
     for name, values in columns.items():
         if values.dtype == object:
-            as_list = values.tolist()
-            if hasattr(root, "create_array"):
-                import zarr.codecs as zc  # type: ignore
-                from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
-
-                arr = root.create_array(
-                    name,
-                    shape=(len(as_list),),
-                    dtype=VariableLengthUTF8(),
-                    serializer=zc.VLenUTF8Codec(),
-                    chunks=int(chunks),
-                    **kwargs,
-                )
-                arr[:] = as_list
-            else:
-                root.array(
-                    name,
-                    as_list,
-                    dtype=object,
-                    object_codec=strings_codec,
-                    chunks=int(chunks),
-                    **kwargs,
-                )
+            write_string_array(root, name, values.tolist(),
+                               chunks=int(chunks), compression_kw=comp_kw)
         else:
-            if hasattr(root, "create_array"):
-                root.create_array(name, data=values, chunks=int(chunks), **kwargs)
-            else:
-                root.array(name, values, chunks=int(chunks), **kwargs)
+            zc_create_array(root, name, data=values, chunks=int(chunks), **comp_kw)
 
 
 def _default_index_parquet_path(*, grid_zarr_path: str | None, grid_csv_path: str | None) -> str:

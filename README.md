@@ -330,44 +330,83 @@ Manual split scripts are still present for backward compatibility:
 
 Use them only if you explicitly need manual phase-by-phase execution.
 
-## Pipeline Smoke Tests
+## Testing
 
-Use these small scripts to test pipeline validity in two stages:
+Run the full local test suite before submitting large jobs:
 
-### 1. Local smoke test
+```bash
+python3 -m pytest tests/ -v
+```
+
+All tests are self-contained, use temporary directories, and require no external data downloads. Dependencies: `pytest`, `numpy`, `zarr`.
+
+### Test coverage by capability
+
+| Capability                       | Test file(s)                                                 |
+|----------------------------------|--------------------------------------------------------------|
+| Grid generation (regular + LHS)  | `test_grid_generation.py`                                    |
+| ML sampling & abundance bounds   | `test_grid_generation.py`, `test_nlte_ascii_departures.py`   |
+| Spectrum output parsing          | `test_spectrum_output.py`, `test_spectrum_reconstruction.py`  |
+| Continuum reconstruction         | `test_spectrum_reconstruction.py`                            |
+| Flux/Intensity mode extraction   | `test_spectrum_reconstruction.py`                            |
+| Flux metadata inference          | `test_spectrum_reconstruction.py`                            |
+| NLTE departure handling (ASCII)  | `test_nlte_ascii_departures.py`                              |
+| Shard merging                    | `test_merge_spectra_shards.py`                               |
+| Dataset validation               | `test_validate_dataset.py`                                   |
+| Shard completeness checking      | `test_validate_dataset.py`                                   |
+| Provenance hashing & contract    | `test_provenance_contract.py`                                |
+| Lazy spectrum lookup (Zarr)      | `test_lazy_spectrum_loader.py`                               |
+| JAX dataloader (splits, stats)   | `test_jax_spectra_dataloader.py`                             |
+| Shard layout resolution          | `test_shard_layout.py`                                       |
+| Linelist expansion & validation  | `test_linelist_expansion.py`                                 |
+| Mu sampling (Intensity mode)     | `test_mu_sampling.py`                                        |
+| Fail-fast early abort            | `test_fail_fast_tracker.py`                                  |
+| Task identity & parameter hashes | `test_synthesis_task_identity.py`                            |
+| Config path normalization        | `test_turbospectrum_config_paths.py`                         |
+| Log excerpt extraction           | `test_turbospectrum_logging.py`                              |
+| Turbulence parameter persistence | `test_turbulence_parameter_persistence.py`                   |
+| Worker count & memory limits     | `test_worker_count.py`                                       |
+| Pipeline config & retry logic    | `test_pipeline_from_config.py`                               |
+| Regular grid array preparation   | `test_regular_grid_array_prepare.py`                         |
+| Regular grid validation          | `test_regular_grid_validation.py`                            |
+
+### Running specific test groups
+
+```bash
+# Grid and sampling only
+python3 -m pytest tests/test_grid_generation.py tests/test_nlte_ascii_departures.py -v
+
+# Output parsing and validation
+python3 -m pytest tests/test_spectrum_reconstruction.py tests/test_validate_dataset.py tests/test_provenance_contract.py -v
+
+# Data loading (lazy + JAX)
+python3 -m pytest tests/test_lazy_spectrum_loader.py tests/test_jax_spectra_dataloader.py -v
+
+# HPC layout and sharding
+python3 -m pytest tests/test_shard_layout.py tests/test_merge_spectra_shards.py -v
+```
+
+### Pipeline smoke tests
+
+For integration-level validation (config parsing, grid generation, optional single-shard synthesis):
 
 ```bash
 ./scripts/test_pipeline_local.sh \
   --config configs/pipeline/config_pipeline.json
-```
 
-This validates config JSON parsing, generates a small grid via `pipeline_from_config.py`, and verifies required grid columns.  
-To include one-shard synthesis + dataset validation:
-
-```bash
+# Include one-shard synthesis + dataset validation:
 ./scripts/test_pipeline_local.sh \
   --config configs/pipeline/config_pipeline.json \
-  --with-synthesis \
-  --keep
+  --with-synthesis --keep
 ```
 
-### 2. Gadi smoke test (PBS)
-
-Submit:
+On Gadi:
 
 ```bash
 qsub scripts/test_pipeline_gadi.pbs
-```
-
-Optional overrides at submit time:
-
-```bash
+# or with overrides:
 qsub -v PROJECT=mk27,MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json scripts/test_pipeline_gadi.pbs
 ```
-
-The Gadi job wraps the local smoke script and keeps outputs under:
-
-`/scratch/<PROJECT>/<USER>/turbospec_smoke/<PBS_JOBID>/`
 
 ## Main Gadi Synthesis (PBS)
 

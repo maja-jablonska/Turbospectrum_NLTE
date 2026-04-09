@@ -1,5 +1,6 @@
-# Mac specific
+#Mac specific
 .DS_Store
+.claude/*
 
 # Prerequisites
 *.d
@@ -76,3 +77,19 @@ input_files/*
 !turbospectrum_regular_grid_nlte_tiny_gadi.pbs
 !turbospectrum_regular_grid_nlte_tiny_array_gadi.pbs
 !turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
+
+# Cache / build
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Runtime / output dirs (adjust if some should be tracked)
+runs/
+input_files/
+Users/
+
+# Claude
+.claude/

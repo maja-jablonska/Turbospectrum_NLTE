@@ -47,7 +47,7 @@ from provenance_contract import (  # noqa: E402
     is_meaningful_provenance_value,
 )
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
-from synthesis_validation import SUCCESS_STATUSES, validate_synthesis_results
+from synthesis_validation import SUCCESS_STATUSES, FailFastTracker, validate_synthesis_results
 
 
 def _read_mu_points(spec_path: str) -> np.ndarray:
@@ -143,26 +143,26 @@ def _choose_mu_indices(
 _WORKER_CONFIG = None
 
 
-def _zarr_store(path: str):
-    """Filesystem-backed Zarr store compatible with zarr v2/v3."""
-    if hasattr(zarr, "DirectoryStore"):
-        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
-    from zarr import storage as zstorage  # type: ignore
-    if hasattr(zstorage, "DirectoryStore"):
-        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
-    if hasattr(zstorage, "LocalStore"):
-        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
-    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+try:
+    from zarr_compat import (
+        zarr_store as _zarr_store,
+        create_root_group as _zc_create_root_group,
+        write_string_scalar as _zc_write_string_scalar_impl,
+        write_string_array as _zc_write_string_array,
+    )
+except ImportError:
+    from .zarr_compat import (
+        zarr_store as _zarr_store,
+        create_root_group as _zc_create_root_group,
+        write_string_scalar as _zc_write_string_scalar_impl,
+        write_string_array as _zc_write_string_array,
+    )
 
 
 def _open_root_for_write(path: str):
     """Create/overwrite a Zarr group (v2 or v3)."""
     store = _zarr_store(path)
-    if hasattr(zarr, "group"):
-        # zarr v3
-        return zarr.group(store=store, overwrite=True, zarr_format=3)
-    # zarr v2
-    return zarr.open_group(store=store, mode="w")  # type: ignore[arg-type]
+    return _zc_create_root_group(store, overwrite=True)
 
 
 def _normalize_chunks(shape: tuple[int, ...], chunks: int | tuple[int, ...] | None) -> tuple[int, ...] | None:
@@ -214,58 +214,11 @@ def _write_array(root, name: str, data: Any, *, chunks: int | tuple[int, ...] | 
 def _write_string_1d(root, name: str, values, chunks: int = 128):
     """Write 1D string array compatibly for zarr v2/v3."""
     vals = ["" if v is None else str(v) for v in values]
-    if hasattr(root, "create_array"):
-        import zarr.codecs as zc  # type: ignore
-        from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
-
-        arr = root.create_array(
-            name,
-            shape=(len(vals),),
-            dtype=VariableLengthUTF8(),
-            serializer=zc.VLenUTF8Codec(),
-            chunks=min(int(chunks), len(vals)) if len(vals) else 1,
-        )
-        arr[:] = vals
-        return
-
-    # zarr v2
-    try:
-        from numcodecs import VLenUTF8  # type: ignore
-
-        root.array(name, vals, dtype=object, object_codec=VLenUTF8(), chunks=min(int(chunks), len(vals)) if len(vals) else 1)
-    except Exception:
-        arr = np.asarray(vals, dtype="U256")
-        try:
-            root.create_dataset(name, data=arr)
-        except TypeError:
-            root.create_dataset(name, shape=arr.shape, dtype=arr.dtype, data=arr)
+    _zc_write_string_array(root, name, vals, chunks=min(int(chunks), len(vals)) if len(vals) else 1)
 
 
 def _write_string_scalar(root, name: str, value: str) -> None:
-    if hasattr(root, "create_array"):
-        import zarr.codecs as zc  # type: ignore
-        from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
-
-        try:
-            arr = root.create_array(
-                name,
-                shape=(),
-                dtype=VariableLengthUTF8(),
-                serializer=zc.VLenUTF8Codec(),
-            )
-            arr[...] = str(value)
-            return
-        except Exception:
-            arr = root.create_array(
-                name,
-                shape=(1,),
-                dtype=VariableLengthUTF8(),
-                serializer=zc.VLenUTF8Codec(),
-                chunks=1,
-            )
-            arr[0] = str(value)
-            return
-    _write_string_1d(root, name, [str(value)], chunks=1)
+    _zc_write_string_scalar_impl(root, name, value)
 
 
 def _existing_shard_is_usable(
@@ -724,6 +677,15 @@ def main():
         help="Maximum number of failed rows to tolerate before aborting the shard write (default: 0 = abort on any failure).",
     )
     parser.add_argument(
+        "--fail-fast-after",
+        type=int,
+        default=10,
+        help=(
+            "Exit the processing loop early after this many consecutive failures "
+            "(default: 10). Set to 0 to disable early exit."
+        ),
+    )
+    parser.add_argument(
         "--allow-incomplete-provenance",
         action="store_true",
         help="Allow writing shards even when required provenance contract fields are missing.",
@@ -1136,6 +1098,9 @@ def main():
 
     logger.info("Starting synthesis with %d workers", worker_count)
 
+    tracker = FailFastTracker(threshold=args.fail_fast_after)
+    early_exit = False
+
     with ProcessPoolExecutor(
         max_workers=worker_count,
         initializer=_init_worker,
@@ -1161,6 +1126,17 @@ def main():
                         continue
                     statuses[idx] = "exception"
                     messages[idx] = err_msg
+                tracker.record_failure(err_msg)
+                if tracker.should_exit:
+                    logger.error(
+                        "Early exit after %d consecutive failures — cancelling remaining tasks. %s",
+                        tracker.consecutive_failures,
+                        tracker.summary(),
+                    )
+                    early_exit = True
+                    for f in futures:
+                        f.cancel()
+                    break
                 continue
 
             for result in batch_results:
@@ -1185,6 +1161,7 @@ def main():
 
                 status_text = str(result["status"]).upper()
                 if str(result["status"]).lower() in SUCCESS_STATUSES:
+                    tracker.record_success()
                     logger.info(
                         "[%d/%d] global=%d %s (%.2fs)",
                         done,
@@ -1194,6 +1171,7 @@ def main():
                         result["duration"],
                     )
                 else:
+                    tracker.record_failure(result["message"])
                     logger.error(
                         "[%d/%d] global=%d %s (%.2fs) - %s",
                         done,
@@ -1203,6 +1181,27 @@ def main():
                         result["duration"],
                         result["message"],
                     )
+
+            # Check after processing the full batch.
+            if tracker.should_exit:
+                logger.error(
+                    "Early exit after %d consecutive failures — cancelling remaining tasks. %s",
+                    tracker.consecutive_failures,
+                    tracker.summary(),
+                )
+                early_exit = True
+                for f in futures:
+                    f.cancel()
+                break
+
+    if early_exit:
+        logger.warning(
+            "Processing stopped early: %d/%d tasks completed (%d failures). "
+            "Partial results will still be written.",
+            tracker.total_done,
+            len(indices),
+            tracker.total_failures,
+        )
 
     ############################################
     # Validate & write shard (always write to preserve HPC work)
@@ -1243,12 +1242,18 @@ def main():
             pass
 
     # Write per-row metadata columns for later merging/QA (best-effort).
+    _STRING_METADATA_COLS = {"turbvel", "t_value", "output_mode", "calculation_mode", "mode", "grid_version"}
     for name, values in columns.items():
         if name in {"lam_min", "lam_max", "lam_step"}:
             continue
         try:
-            _write_array(root, name, np.asarray(values), chunks=max(1, min(2048, len(values))))
+            arr = np.asarray(values)
+            if name in _STRING_METADATA_COLS or arr.dtype.kind in ("U", "O"):
+                _write_string_1d(root, name, values, chunks=max(1, min(2048, len(values))))
+            else:
+                _write_array(root, name, arr, chunks=max(1, min(2048, len(values))))
         except Exception:
+            logger.warning("Failed to write metadata column %r to shard", name, exc_info=True)
             pass
     for name in ("lam_min", "lam_max", "lam_step"):
         if name in columns:

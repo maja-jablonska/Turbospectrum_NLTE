@@ -11,6 +11,63 @@ logger = logging.getLogger(__name__)
 SUCCESS_STATUSES = {"success", "skipped"}
 
 
+class FailFastTracker:
+    """Track consecutive failures and trigger early exit when systematic.
+
+    Parameters
+    ----------
+    threshold:
+        Number of consecutive failures that triggers early exit.
+        Set to 0 to disable (``should_exit`` always returns ``False``).
+    """
+
+    def __init__(self, threshold: int = 10) -> None:
+        self.threshold = int(threshold)
+        self.consecutive_failures = 0
+        self.total_done = 0
+        self.total_failures = 0
+        self._last_error_msg = ""
+        self._repeated_error_msg: str | None = None
+        self._triggered = False
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        self.total_done += 1
+
+    def record_failure(self, error_msg: str = "") -> None:
+        self.total_done += 1
+        self.total_failures += 1
+        if self.consecutive_failures == 0:
+            self._repeated_error_msg = error_msg
+        elif self._repeated_error_msg is not None and error_msg != self._repeated_error_msg:
+            self._repeated_error_msg = None  # errors differ
+        self._last_error_msg = error_msg
+        self.consecutive_failures += 1
+
+    @property
+    def should_exit(self) -> bool:
+        if self.threshold <= 0:
+            return False
+        if self._triggered:
+            return True
+        if self.consecutive_failures >= self.threshold:
+            self._triggered = True
+        return self._triggered
+
+    def summary(self) -> str:
+        """Human-readable summary for log messages."""
+        parts = [
+            f"{self.consecutive_failures} consecutive failures",
+            f"({self.total_failures}/{self.total_done} total)",
+        ]
+        if self._repeated_error_msg is not None and self._repeated_error_msg:
+            msg = self._repeated_error_msg
+            if len(msg) > 200:
+                msg = msg[:197] + "..."
+            parts.append(f"repeated error: {msg}")
+        return "; ".join(parts)
+
+
 def _status_counts(statuses: Sequence[str]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for status in statuses:

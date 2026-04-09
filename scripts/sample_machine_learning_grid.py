@@ -78,55 +78,30 @@ def _progress(iterable, total: int | None, desc: str, enabled: bool):
         return iterable
 
 
-def _zarr_store(path: str):
-    """
-    Return a filesystem-backed Zarr store for both zarr v2 and v3 APIs.
-
-    - zarr v2: zarr.DirectoryStore
-    - zarr v3: zarr.storage.LocalStore (or DirectoryStore if present)
-    """
-    if hasattr(zarr, "DirectoryStore"):
-        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
-    from zarr import storage as zstorage  # type: ignore
-    if hasattr(zstorage, "DirectoryStore"):
-        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
-    if hasattr(zstorage, "LocalStore"):
-        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
-    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+try:
+    from zarr_compat import (
+        zarr_store as _zarr_store,
+        compression_kwargs as _zarr_compression_kwargs_base,
+        create_root_group as _zc_create_root_group,
+        create_array as _zc_create_array,
+        write_string_array as _zc_write_string_array,
+        write_string_scalar as _zc_write_string_scalar,
+        ZARR_V3 as _ZARR_V3,
+    )
+except ImportError:
+    from .zarr_compat import (
+        zarr_store as _zarr_store,
+        compression_kwargs as _zarr_compression_kwargs_base,
+        create_root_group as _zc_create_root_group,
+        create_array as _zc_create_array,
+        write_string_array as _zc_write_string_array,
+        write_string_scalar as _zc_write_string_scalar,
+        ZARR_V3 as _ZARR_V3,
+    )
 
 
 def _zarr_compression_kwargs(zarr_compressor_cfg: Dict):
-    """
-    Build compression kwargs for Zarr v2 and v3.
-
-    - Zarr v3 expects `compressors=[BytesBytesCodec, ...]` (e.g. zarr.codecs.BloscCodec)
-    - Zarr v2 expects `compressor=numcodecs.Codec` (e.g. numcodecs.Blosc)
-    """
-    if not zarr_compressor_cfg:
-        return {}
-
-    cname = zarr_compressor_cfg.get("cname", "zstd")
-    clevel = int(zarr_compressor_cfg.get("clevel", 5))
-    shuffle_enabled = bool(zarr_compressor_cfg.get("shuffle", True))
-
-    # Prefer v3 codecs when available.
-    try:
-        import zarr.codecs as zc  # type: ignore
-
-        if hasattr(zc, "BloscCodec") and hasattr(zc, "BloscShuffle"):
-            shuffle = zc.BloscShuffle.bitshuffle if shuffle_enabled else None
-            return {"compressors": [zc.BloscCodec(cname=cname, clevel=clevel, shuffle=shuffle)]}
-    except Exception:
-        pass
-
-    # Fallback: v2 numcodecs
-    return {
-        "compressor": Blosc(
-            cname=cname,
-            clevel=clevel,
-            shuffle=Blosc.BITSHUFFLE if shuffle_enabled else Blosc.NOSHUFFLE,
-        )
-    }
+    return _zarr_compression_kwargs_base(zarr_compressor_cfg)
 
 
 def _ensure_polars_zarr_available() -> None:
@@ -322,12 +297,12 @@ def _write_index_parquet(
                     existing_rows,
                 )
                 store = _zarr_store(zarr_path)
-                root = zarr.open_group(store=store, mode="r", zarr_format=3)
+                root = zarr.open_group(store=store, mode="r")
                 final_index_df = _index_df_from_zarr(root, df.columns)
         else:
             logger.warning("Index parquet not found during resume; rebuilding from Zarr.")
             store = _zarr_store(zarr_path)
-            root = zarr.open_group(store=store, mode="r", zarr_format=3)
+            root = zarr.open_group(store=store, mode="r")
             final_index_df = _index_df_from_zarr(root, df.columns)
 
     os.makedirs(os.path.dirname(os.path.abspath(index_parquet_path)), exist_ok=True)
@@ -456,8 +431,8 @@ def main() -> None:
     abundances = config.get("abundances", {})
 
     grid_version = config.get("grid_version", "ml-sample")
-    mode = config.get("mode", "1D")
-    calculation_mode = config.get("calculation_mode", "LTE")
+    mode = synthesis_cfg.get("mode", config.get("mode", "1D"))
+    calculation_mode = synthesis_cfg.get("calculation_mode", config.get("calculation_mode", "LTE"))
     turbvel_cfg = config.get("turbvel", "01")
     t_value_options = config.get("t_value_options", ["01"])
 
@@ -495,7 +470,7 @@ def main() -> None:
     if args.resume and os.path.exists(zarr_path):
         t_step = time.perf_counter()
         store = _zarr_store(zarr_path)
-        root = zarr.open_group(store=store, mode="a", zarr_format=3)
+        root = zarr.open_group(store=store, mode="a")
         array_keys = list(root.keys())
         if not array_keys:
             raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
@@ -578,7 +553,7 @@ def main() -> None:
 
     if args.resume and os.path.exists(zarr_path):
         t_step = time.perf_counter()
-        root = zarr.open_group(store=store, mode="a", zarr_format=3)
+        root = zarr.open_group(store=store, mode="a")
         array_keys = list(root.keys())
         if not array_keys:
             raise ValueError(f"Zarr path {zarr_path} exists but contains no arrays; remove it or disable --resume")
@@ -598,40 +573,15 @@ def main() -> None:
         logger.info("Zarr append finished in %.2fs", time.perf_counter() - t_step)
     else:
         t_step = time.perf_counter()
-        root = zarr.group(store=store, overwrite=True, zarr_format=3)
+        root = _zc_create_root_group(store, overwrite=True)
         for column in _progress(df.columns, total=len(df.columns), desc="Writing columns", enabled=not args.no_progress):
             series = df[column]
             if series.dtype == pl.Utf8:
-                values = series.to_list()
-                if hasattr(root, "create_array"):
-                    # Zarr v3: use variable-length UTF8 dtype + v3 serializer
-                    import zarr.codecs as zc  # type: ignore
-                    from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
-
-                    arr = root.create_array(
-                        column,
-                        shape=(len(values),),
-                        dtype=VariableLengthUTF8(),
-                        serializer=zc.VLenUTF8Codec(),
-                        chunks=zarr_chunks,
-                        **compression_kwargs,
-                    )
-                    arr[:] = values
-                else:
-                    # Zarr v2: object codec supported
-                    root.array(
-                        column,
-                        values,
-                        dtype=object,
-                        object_codec=strings_codec,
-                        chunks=zarr_chunks,
-                        **compression_kwargs,
-                    )
+                _zc_write_string_array(root, column, series.to_list(),
+                                       chunks=zarr_chunks, compression_kw=compression_kwargs)
             else:
-                if hasattr(root, "create_array"):
-                    root.create_array(column, data=series.to_numpy(), chunks=zarr_chunks, **compression_kwargs)
-                else:
-                    root.array(column, series.to_numpy(), chunks=zarr_chunks, **compression_kwargs)
+                _zc_create_array(root, column, data=series.to_numpy(),
+                                 chunks=zarr_chunks, **compression_kwargs)
         logger.info("Wrote Zarr store to %s (chunk size %s)", zarr_path, zarr_chunks)
         logger.info("Zarr write finished in %.2fs", time.perf_counter() - t_step)
 

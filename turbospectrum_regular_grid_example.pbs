@@ -237,7 +237,6 @@ LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
-TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
 PENDING_SHARDS_FILE="${PENDING_SHARDS_FILE:-${RUN_ROOT}/pending_shards.txt}"
 MISSING_FILE="${MISSING_FILE:-${RUN_ROOT}/missing_shards.txt}"
 NEXT_WORK_ITEM="${NEXT_WORK_ITEM:-${RUN_ROOT}/next_work_item.txt}"
@@ -269,7 +268,7 @@ fi
 mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${MERGED_ZARR}")" \
          "$(dirname "${NEXT_WORK_ITEM}")" "$(dirname "${LOCK_FILE}")" \
          "$(dirname "${PENDING_SHARDS_FILE}")" "$(dirname "${MISSING_FILE}")" \
-         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" "${SYNTH_SCRATCH}" \
+         "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${SYNTH_SCRATCH}" \
          "$(dirname "${CONSECUTIVE_FAILURE_COUNT_FILE}")" "$(dirname "${SUCCESS_COUNT_FILE}")" \
          "$(dirname "${EARLY_STOP_MARKER}")"
 
@@ -823,9 +822,8 @@ run_shard_attempts () {
     local sleep_base="$5"
     local worker_count="$6"
 
-    local shard_out tmp_out
+    local shard_out
     shard_out="$(render_shard_path "${shard}")"
-    tmp_out="${TMP_OUTPUT_DIR}/spectra_shard_${shard}.a$$.tmp.zarr"
 
     for ((attempt=1; attempt<=max_attempts; attempt++)); do
         local start end attempt_scratch
@@ -841,7 +839,6 @@ run_shard_attempts () {
             --grid-zarr "${GRID_ZARR}" \
             --config "${SYNTH_CONFIG_PATH}" \
             --output-zarr "${shard_out}" \
-            --output-tmp "${tmp_out}" \
             --shard-index "${shard}" \
             --shard-count "${SHARD_COUNT}" \
             --workers "${worker_count}" \
@@ -862,7 +859,7 @@ run_shard_attempts () {
             printf '[regular-grid] shard=%s attempt=%s/%s failed_rc=%s failed_at=%s workers=%s\n' \
                 "${shard}" "${attempt}" "${max_attempts}" "${rc}" "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${worker_count}"
         } >> "${log_file}"
-        rm -rf "${tmp_out}"
+        rm -rf "${shard_out}"
         sleep $(( (RANDOM % 10) + attempt * sleep_base ))
     done
 
@@ -940,7 +937,7 @@ worker() {
 }
 
 export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE LOG_DIR REPO PYTHON \
-       GRID_ZARR SYNTH_CONFIG_PATH TMP_OUTPUT_DIR ROW_COUNT SHARD_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE \
+       GRID_ZARR SYNTH_CONFIG_PATH ROW_COUNT SHARD_COUNT SYNTH_LOG_LEVEL SHARD_TEMPLATE \
        SINGLE_JOB_SHARD_WORKERS_EFFECTIVE CONSECUTIVE_FAILURE_ABORT_THRESHOLD \
        CONSECUTIVE_FAILURE_COUNT_FILE SUCCESS_COUNT_FILE EARLY_STOP_MARKER
 

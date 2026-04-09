@@ -57,44 +57,30 @@ PROVENANCE_FILENAMES: Tuple[str, ...] = (
 )
 
 
-def _zarr_store(path: str):
-    if hasattr(zarr, "DirectoryStore"):
-        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
-    from zarr import storage as zstorage  # type: ignore
-
-    if hasattr(zstorage, "DirectoryStore"):
-        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
-    if hasattr(zstorage, "LocalStore"):
-        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
-    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+try:
+    from zarr_compat import (
+        zarr_store as _zarr_store,
+        compression_kwargs as _zarr_compression_kwargs_impl,
+        create_root_group as _create_root_group,
+        create_array as _zc_create_array,
+        write_string_scalar as _zc_write_string_scalar,
+        write_fixed_string_scalar as _zc_write_fixed_string_scalar,
+        write_string_array as _zc_write_string_array,
+    )
+except ImportError:
+    from .zarr_compat import (
+        zarr_store as _zarr_store,
+        compression_kwargs as _zarr_compression_kwargs_impl,
+        create_root_group as _create_root_group,
+        create_array as _zc_create_array,
+        write_string_scalar as _zc_write_string_scalar,
+        write_fixed_string_scalar as _zc_write_fixed_string_scalar,
+        write_string_array as _zc_write_string_array,
+    )
 
 
 def _zarr_compression_kwargs(zarr_compressor_cfg: Mapping[str, Any]):
-    if not zarr_compressor_cfg:
-        return {}
-
-    cname = zarr_compressor_cfg.get("cname", "zstd")
-    clevel = int(zarr_compressor_cfg.get("clevel", 5))
-    shuffle_enabled = bool(zarr_compressor_cfg.get("shuffle", True))
-
-    try:
-        import zarr.codecs as zc  # type: ignore
-
-        if hasattr(zc, "BloscCodec") and hasattr(zc, "BloscShuffle"):
-            shuffle = zc.BloscShuffle.bitshuffle if shuffle_enabled else None
-            return {"compressors": [zc.BloscCodec(cname=cname, clevel=clevel, shuffle=shuffle)]}
-    except Exception:
-        pass
-
-    from numcodecs import Blosc  # type: ignore
-
-    return {
-        "compressor": Blosc(
-            cname=cname,
-            clevel=clevel,
-            shuffle=Blosc.BITSHUFFLE if shuffle_enabled else Blosc.NOSHUFFLE,
-        )
-    }
+    return _zarr_compression_kwargs_impl(zarr_compressor_cfg)
 
 
 def _list_shards(shard_paths: Sequence[str] | None, shard_dir: str | None) -> List[str]:
@@ -258,43 +244,11 @@ def _filter_invalid_shards(
 
 
 def _write_string_scalar(root, name: str, value: str, compression_kwargs: Mapping[str, Any]) -> None:
-    import zarr.codecs as zc  # type: ignore
-    from zarr.core.dtype.npy.string import VariableLengthUTF8  # type: ignore
-
-    try:
-        arr = root.create_array(
-            name,
-            shape=(),
-            dtype=VariableLengthUTF8(),
-            serializer=zc.VLenUTF8Codec(),
-            **compression_kwargs,
-        )
-        arr[...] = str(value)
-    except Exception:
-        arr = root.create_array(
-            name,
-            shape=(1,),
-            dtype=VariableLengthUTF8(),
-            serializer=zc.VLenUTF8Codec(),
-            chunks=1,
-            **compression_kwargs,
-        )
-        arr[0] = str(value)
+    _zc_write_string_scalar(root, name, value, compression_kw=compression_kwargs)
 
 
 def _write_fixed_string_scalar(root, name: str, value: str, min_width: int, compression_kwargs: Mapping[str, Any]) -> None:
-    sval = str(value)
-    width = max(int(min_width), len(sval), 1)
-    try:
-        arr = root.create_array(
-            name,
-            shape=(),
-            dtype=f"<U{width}",
-            **compression_kwargs,
-        )
-        arr[...] = sval
-    except Exception:
-        _write_string_scalar(root, name, sval, compression_kwargs=compression_kwargs)
+    _zc_write_fixed_string_scalar(root, name, value, min_width=min_width, compression_kw=compression_kwargs)
 
 
 def _to_u32_param_names(values: Sequence[str]) -> np.ndarray:
@@ -964,20 +918,20 @@ def main() -> None:
 
     # Create output store and base datasets.
     store = _zarr_store(out_path)
-    root_out = zarr.group(store=store, overwrite=True, zarr_format=3)
+    root_out = _create_root_group(store, overwrite=True)
     chunk_shape = (min(int(args.chunk_rows), out_row_count), wl_count)
-    root_out.create_array("wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
-    root_out.create_array(
-        "global_index",
+    _zc_create_array(root_out, "wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
+    _zc_create_array(
+        root_out, "global_index",
         data=selected_global_indices.astype(np.int64, copy=False),
         chunks=(min(int(args.chunk_rows), out_row_count),),
         **compression_kwargs,
     )
-    flux_out = root_out.create_array("flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
-    continuum_out = root_out.create_array("continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
+    flux_out = _zc_create_array(root_out, "flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
+    continuum_out = _zc_create_array(root_out, "continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
     mu_chunk = (min(int(args.chunk_rows), out_row_count) if out_row_count else 1,)
-    mu_selected_out = root_out.create_array("mu_selected", shape=(out_row_count,), dtype=np.float32, chunks=mu_chunk, **compression_kwargs)
-    mu_selected_index_out = root_out.create_array("mu_selected_index", shape=(out_row_count,), dtype=np.int16, chunks=mu_chunk, **compression_kwargs)
+    mu_selected_out = _zc_create_array(root_out, "mu_selected", shape=(out_row_count,), dtype=np.float32, chunks=mu_chunk, **compression_kwargs)
+    mu_selected_index_out = _zc_create_array(root_out, "mu_selected_index", shape=(out_row_count,), dtype=np.int16, chunks=mu_chunk, **compression_kwargs)
 
     # Initialize to NaNs for missing rows.
     flux_out[:] = np.nan
@@ -1231,20 +1185,20 @@ def main() -> None:
     created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     param_names_u32 = _to_u32_param_names(param_name_list)
-    root_out.create_array(
-        "param_names",
+    _zc_create_array(
+        root_out, "param_names",
         data=param_names_u32,
         chunks=(min(max(1, params.shape[1]), len(param_names_u32)) if len(param_names_u32) else 1,),
         **compression_kwargs,
     )
-    root_out.create_array(
-        "params",
+    _zc_create_array(
+        root_out, "params",
         data=params.astype(np.float32, copy=False),
         chunks=(min(int(args.chunk_rows), out_row_count), params.shape[1]),
         **compression_kwargs,
     )
-    root_out.create_array(
-        "model_id",
+    _zc_create_array(
+        root_out, "model_id",
         data=model_id.astype(np.uint64, copy=False),
         chunks=(min(int(args.chunk_rows), len(model_id)) if len(model_id) else 1,),
         **compression_kwargs,
@@ -1272,7 +1226,7 @@ def main() -> None:
         shard_provenance=shard_provenance_candidates,
         git_commit=git_commit,
     )
-    prov = root_out.create_group("provenance")
+    prov = root_out.create_group("provenance") if hasattr(root_out, "create_group") else root_out.require_group("provenance")
     for name in PROVENANCE_FILENAMES:
         _write_string_scalar(
             prov,

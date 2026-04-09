@@ -4,6 +4,7 @@ import subprocess
 import multiprocessing
 import time
 import glob
+import logging
 import re
 import hashlib
 import dataclasses

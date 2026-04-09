@@ -48,17 +48,19 @@ except Exception as exc:  # noqa: BLE001
 MIN_STD = 1.0e-6
 
 
-def _zarr_store(path: str):
-    """Return a filesystem-backed Zarr store for v2/v3 APIs."""
-    if hasattr(zarr, "DirectoryStore"):
-        return zarr.DirectoryStore(path)  # type: ignore[attr-defined]
-    from zarr import storage as zstorage  # type: ignore
-
-    if hasattr(zstorage, "DirectoryStore"):
-        return zstorage.DirectoryStore(path)  # type: ignore[attr-defined]
-    if hasattr(zstorage, "LocalStore"):
-        return zstorage.LocalStore(path)  # type: ignore[attr-defined]
-    raise AttributeError("Unsupported Zarr version: cannot find DirectoryStore/LocalStore")
+try:
+    from zarr_compat import zarr_store as _zarr_store
+except ImportError:
+    try:
+        from .zarr_compat import zarr_store as _zarr_store
+    except ImportError:
+        def _zarr_store(path: str):
+            if hasattr(zarr, "DirectoryStore"):
+                return zarr.DirectoryStore(path)
+            from zarr import storage as zstorage
+            if hasattr(zstorage, "LocalStore"):
+                return zstorage.LocalStore(path)
+            return zstorage.DirectoryStore(path)
 
 
 def _as_1d_int64(values: Sequence[int] | np.ndarray) -> np.ndarray:
