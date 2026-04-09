@@ -1067,8 +1067,10 @@ def main():
     if "turbvel" not in optional_cols and "t_value" not in optional_cols:
         raise KeyError("Grid Zarr must include either 'turbvel' or 't_value' for synthesis")
 
+    # Exclude the grid's target "mu" from passthrough — mu_selected
+    # (the angle actually used for extraction) is written separately.
     passthrough_cols = sorted(
-        name for name in grid.keys() if name not in set(required_cols + optional_cols)
+        name for name in grid.keys() if name not in set(required_cols + optional_cols) and name != "mu"
     )
     columns = {k: np.asarray(grid[k][indices]) for k in required_cols + optional_cols + passthrough_cols}
 

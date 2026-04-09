@@ -597,20 +597,52 @@ PY
 ############################################
 
 generate_grid_if_needed() {
-    if [[ ! -d "${GRID_ZARR}" ]]; then
-        echo "[regular-grid] Grid not found; generating regular grid."
-        GRID_CMD=(
-            "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
-            --config-json "${CONFIG_PATH}"
-            --skip-synthesis
-        )
-        if [[ -n "${WORKERS_OVERRIDE}" ]]; then
-            GRID_CMD+=(--workers "${WORKERS_OVERRIDE}")
+    # Hash the config fields that determine the grid content so we can
+    # detect when the grid Zarr is stale (e.g. teff range changed).
+    local config_hash
+    config_hash="$("${PYTHON}" -c "
+import hashlib, json, sys
+rt = json.loads(sys.stdin.read())
+# Fields that define the grid — if any change, regenerate.
+keys = sorted(k for k in rt if k not in {
+    'run_root', 'scratch', 'output_tmp', 'workers', 'shard_count',
+    'rows_per_shard', 'chunk_rows', 'log_level', 'log_file',
+    'skip_synthesis', 'synthesis_config_path', 'spectra_zarr',
+    'spectra_shard_template', 'spectra_shards_dir',
+})
+blob = json.dumps({k: rt[k] for k in keys}, sort_keys=True)
+print(hashlib.sha256(blob.encode()).hexdigest()[:16])
+" <<< "${REGULAR_RUNTIME_JSON}" 2>/dev/null || echo "unknown")"
+
+    local hash_file="${GRID_ZARR}/.grid_config_hash"
+
+    if [[ -d "${GRID_ZARR}" ]]; then
+        local stored_hash=""
+        if [[ -f "${hash_file}" ]]; then
+            stored_hash="$(cat "${hash_file}" 2>/dev/null || true)"
         fi
-        "${GRID_CMD[@]}"
+        if [[ "${stored_hash}" == "${config_hash}" ]]; then
+            echo "[regular-grid] Using existing grid (config unchanged): ${GRID_ZARR}"
+            return 0
+        fi
+        echo "[regular-grid] Grid config changed (${stored_hash:-<none>} -> ${config_hash}); regenerating."
+        rm -rf "${GRID_ZARR}"
     else
-        echo "[regular-grid] Using existing grid: ${GRID_ZARR}"
+        echo "[regular-grid] Grid not found; generating regular grid."
     fi
+
+    GRID_CMD=(
+        "${PYTHON}" "${REPO}/scripts/synthesize_regular_grid.py"
+        --config-json "${CONFIG_PATH}"
+        --skip-synthesis
+    )
+    if [[ -n "${WORKERS_OVERRIDE}" ]]; then
+        GRID_CMD+=(--workers "${WORKERS_OVERRIDE}")
+    fi
+    "${GRID_CMD[@]}"
+
+    # Store the config hash for future staleness detection.
+    echo "${config_hash}" > "${hash_file}" 2>/dev/null || true
 }
 
 clear_restart_outputs() {
