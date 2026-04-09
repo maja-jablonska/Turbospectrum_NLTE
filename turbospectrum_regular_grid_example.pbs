@@ -691,6 +691,38 @@ if [[ ! -f "${LAYOUT_HELPER}" ]]; then
     exit 1
 fi
 
+# When FINALIZE_ONLY and no explicit shard layout, read saved layout or infer
+# from existing shard files so prune_incompatible_shards doesn't delete them.
+SHARD_LAYOUT_FILE="${SHARDS_DIR}/.shard_layout"
+if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" && -z "${SHARD_COUNT_OVERRIDE}" && -z "${ROWS_PER_SHARD_RAW}" && -z "${CFG_SHARD_COUNT}" ]]; then
+    if [[ -f "${SHARD_LAYOUT_FILE}" ]]; then
+        read _saved_sc _saved_rps < "${SHARD_LAYOUT_FILE}" 2>/dev/null || true
+        if [[ "${_saved_sc}" =~ ^[0-9]+$ && "${_saved_rps}" =~ ^[0-9]+$ ]]; then
+            SHARD_COUNT_OVERRIDE="${_saved_sc}"
+            ROWS_PER_SHARD_RAW="${_saved_rps}"
+            echo "[regular-grid] FINALIZE_ONLY: restored shard layout from ${SHARD_LAYOUT_FILE}: SHARD_COUNT=${_saved_sc} ROWS_PER_SHARD=${_saved_rps}"
+        fi
+    fi
+    # Fallback: infer shard count from existing shard files.
+    if [[ -z "${SHARD_COUNT_OVERRIDE}" ]]; then
+        _inferred_sc="$("${PYTHON}" -c "
+import re, sys
+from pathlib import Path
+shard_dir = Path(sys.argv[1])
+indices = sorted(
+    int(m.group(1))
+    for p in shard_dir.glob('spectra_shard_*.zarr')
+    if (m := re.match(r'spectra_shard_(\d+)\.zarr', p.name))
+)
+print(max(indices) + 1 if indices else '')
+" "${SHARDS_DIR}" 2>/dev/null || echo "")"
+        if [[ -n "${_inferred_sc}" && "${_inferred_sc}" =~ ^[0-9]+$ ]] && (( _inferred_sc > 0 )); then
+            SHARD_COUNT_OVERRIDE="${_inferred_sc}"
+            echo "[regular-grid] FINALIZE_ONLY: inferred SHARD_COUNT=${_inferred_sc} from existing shard files."
+        fi
+    fi
+fi
+
 SHARD_COUNT_RAW="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
 LAYOUT_CMD=(
     "${PYTHON}" "${LAYOUT_HELPER}"
@@ -713,6 +745,11 @@ while IFS='=' read -r key value; do
         ARRAY_RANGE) ARRAY_RANGE="${value}" ;;
     esac
 done <<< "${LAYOUT_OUTPUT}"
+
+# Persist layout so FINALIZE_ONLY can read it back without recomputation.
+if [[ "${FINALIZE_ONLY_EFFECTIVE}" != "1" ]]; then
+    echo "${SHARD_COUNT} ${ROWS_PER_SHARD}" > "${SHARD_LAYOUT_FILE}" 2>/dev/null || true
+fi
 
 EST_ROWS_PER_SHARD="${ROWS_PER_SHARD}"
 MAX_FAILURES=$(( (ROWS_PER_SHARD * 15 + 99) / 100 ))
