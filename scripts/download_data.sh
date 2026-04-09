@@ -33,8 +33,14 @@ else
     exit 1
 fi
 
-# The base URL for the data repository mentioned in the documentation
-BASE_URL="https://keeper.mpdl.mpg.de/d/6eaecbf95b88448f98a4/files/?p="
+# Keeper / Seafile shared-link identifiers.
+# The "files/?p=" URL serves HTML; append "&dl=1" for direct download.
+# The API endpoint lists directory contents as JSON.
+SHARE_TOKEN="6eaecbf95b88448f98a4"
+KEEPER_DL="https://keeper.mpdl.mpg.de/d/${SHARE_TOKEN}/files/"
+KEEPER_API="https://keeper.mpdl.mpg.de/api/v2.1/share-links/${SHARE_TOKEN}/dirents/"
+# Legacy alias kept for any external references.
+BASE_URL="${KEEPER_DL}?p="
 
 # Define paths for NLTE data, as they are not in env.sh
 NLTE_BASE_PATH="${NLTE_BASE_PATH:-${PROJECT_ROOT}/input_files/nlte_data}"
@@ -98,43 +104,83 @@ mark_download_complete() {
     touch "$target_dir/.download_complete"
 }
 
-download_with_resume() {
-    local url="$1"
+# Download a directory tree from the Keeper Seafile share via its REST API.
+# Handles recursive subdirectories. Skips files that already exist locally.
+#
+# Usage: download_keeper_dir <remote_path> <target_dir> <label> [accept_glob] [_depth]
+#   remote_path  — path on the share, e.g. /linelist/
+#   target_dir   — local destination
+#   label        — human-readable label for progress messages
+#   accept_glob  — optional comma-separated fnmatch patterns (e.g. "atom.*")
+#   _depth       — internal recursion counter (do not set manually)
+download_keeper_dir() {
+    local remote_path="$1"
     local target_dir="$2"
-    local cut_dirs="$3"
-    local label="$4"
-    local accept="$5"
+    local label="$3"
+    local accept="${4:-}"
+    local _depth="${5:-0}"
+
+    if [ "$_depth" -eq 0 ]; then
+        if should_skip_download "$target_dir" "$label"; then
+            return 0
+        fi
+        echo "Downloading $label from Keeper share..."
+    fi
 
     mkdir -p "$target_dir"
-    mkdir -p "$TMP_PATH"
 
-    if should_skip_download "$target_dir" "$label"; then
-        return 0
-    fi
+    local listing
+    listing=$(curl -sL "${KEEPER_API}?path=${remote_path}" 2>/dev/null)
 
-    echo "Syncing $label from $url to $target_dir..."
-    local wget_args=(
-        -q --show-progress -r -np -nH
-        --cut-dirs="$cut_dirs"
-        --no-check-certificate
-        --continue
-        --timestamping
-        -P "$target_dir"
-        -R "index.html*"
-    )
-
-    if [ -n "$accept" ]; then
-        wget_args+=(--accept="$accept")
-    fi
-
-    if wget "${wget_args[@]}" "$url"; then
-        mark_download_complete "$target_dir"
-        echo "$label download complete."
-        return 0
-    else
-        echo "Warning: $label download encountered errors. You can re-run the script to resume."
+    if [ -z "$listing" ] || ! python3 -c "import json,sys; json.load(sys.stdin)" <<< "$listing" >/dev/null 2>&1; then
+        echo "Error: could not list ${remote_path} on Keeper share."
         return 1
     fi
+
+    # Emit tab-separated entries: "F\tpath\tname" for files, "D\tpath\tname" for dirs.
+    local entries
+    entries=$(python3 -c "
+import json, sys, fnmatch
+data = json.loads(sys.stdin.read())
+accept = '''${accept}'''
+for item in data.get('dirent_list', []):
+    if item.get('is_dir'):
+        print('D\t' + item['folder_path'] + '\t' + item['folder_name'])
+    else:
+        name = item['file_name']
+        if accept and not any(fnmatch.fnmatch(name, p.strip()) for p in accept.split(',')):
+            continue
+        print('F\t' + item['file_path'] + '\t' + name)
+" <<< "$listing" 2>/dev/null)
+
+    local failed=0
+    while IFS=$'\t' read -r kind path name; do
+        [ -z "$kind" ] && continue
+        if [ "$kind" = "D" ]; then
+            download_keeper_dir "$path" "$target_dir/$name" "$label" "$accept" $((_depth + 1)) || failed=$((failed + 1))
+        elif [ "$kind" = "F" ]; then
+            local dest="$target_dir/$name"
+            if [ -f "$dest" ] && [ "$FORCE_DOWNLOAD" = false ]; then
+                continue
+            fi
+            echo "  $name"
+            if ! wget -q --show-progress --continue -O "$dest" "${KEEPER_DL}?p=${path}&dl=1"; then
+                echo "  Warning: failed to download $name"
+                rm -f "$dest"
+                failed=$((failed + 1))
+            fi
+        fi
+    done <<< "$entries"
+
+    if [ "$_depth" -eq 0 ]; then
+        if [ "$failed" -eq 0 ]; then
+            mark_download_complete "$target_dir"
+            echo "$label download complete."
+        else
+            echo "Warning: $label had $failed failure(s). Re-run to retry."
+        fi
+    fi
+    return "$failed"
 }
 
 
@@ -213,23 +259,52 @@ download_marcs() {
     echo "MARCS atmospheres extraction complete."
 }
 
-# Download STAGGER model atmospheres
+# Download STAGGER model atmospheres (ZIP on Keeper)
 download_stagger() {
-    download_with_resume "${BASE_URL}/STAGGER_grid/" "$STAGGER_PATH" 4 "STAGGER atmospheres"
+    local target_dir="$STAGGER_PATH"
+    local zip_url="${KEEPER_DL}?p=/atmospheres/average_stagger_grid_forTSv20.zip&dl=1"
+    local zip_file="$TMP_PATH/average_stagger_grid_forTSv20.zip"
+
+    if should_skip_download "$target_dir" "STAGGER atmospheres"; then
+        return 0
+    fi
+
+    mkdir -p "$target_dir" "$TMP_PATH"
+
+    if [ ! -f "$zip_file" ]; then
+        echo "Downloading STAGGER atmospheres..."
+        if ! wget -q --show-progress --continue -O "$zip_file" "$zip_url"; then
+            echo "Error: failed to download STAGGER ZIP."
+            rm -f "$zip_file"
+            return 1
+        fi
+    fi
+
+    echo "Unzipping STAGGER models to $target_dir..."
+    if ! unzip -o "$zip_file" -d "$target_dir"; then
+        echo "Error: failed to unzip STAGGER models."
+        return 1
+    fi
+
+    rm -f "$zip_file"
+    mark_download_complete "$target_dir"
+    echo "STAGGER atmospheres extraction complete."
 }
 
-# Download NLTE data (model atoms and departure coefficient grids)
+# Download NLTE data (model atoms + departure grids from /dep-grids/)
 download_nlte() {
     echo "Downloading NLTE data..."
     echo "Model atoms will be saved to: $NLTE_ATOM_PATH"
     echo "Departure coefficient grids will be saved to: $NLTE_GRID_PATH"
 
     local status=0
-    download_with_resume "${BASE_URL}/NLTE_data/" "$NLTE_ATOM_PATH" 5 "NLTE model atoms" "atom.*" || status=1
-    download_with_resume "${BASE_URL}/NLTE_data/" "$NLTE_GRID_PATH" 5 "NLTE departure coefficient grids" "NLTEgrid*,auxData*" || status=1
+    # Model atoms (atom.*) and departure grids (NLTEgrid*, auxData*) are
+    # colocated under per-element subdirectories on the share.
+    download_keeper_dir "/dep-grids/" "$NLTE_ATOM_PATH" "NLTE model atoms" "atom.*" || status=1
+    download_keeper_dir "/dep-grids/" "$NLTE_GRID_PATH" "NLTE departure grids" "NLTEgrid*,auxData*" || status=1
 
     if [ $status -eq 0 ]; then
-        echo "NLTE data download complete (resume-safe)."
+        echo "NLTE data download complete."
     else
         echo "NLTE data download completed with warnings; re-run to fetch any missing files."
     fi
@@ -237,14 +312,23 @@ download_nlte() {
     return $status
 }
 
-# Download recommended line lists
+# Download recommended line lists (from /linelist/ on Keeper)
 download_linelists() {
-    download_with_resume "${BASE_URL}/Linelists/" "$LINELIST_PATH" 4 "Line lists"
+    download_keeper_dir "/linelist/" "$LINELIST_PATH" "Line lists"
 }
 
-# Download gold sample dataset (path configurable via GOLD_SAMPLE_URL)
+# Download gold sample dataset.
+# Note: use download_gold_sample.py for ESO archive spectra;
+# this option is for pre-packaged gold sample bundles if hosted on Keeper.
 download_gold_sample() {
-    download_with_resume "$GOLD_SAMPLE_URL" "$GOLD_SAMPLE_PATH" 4 "Gold sample"
+    if [ -d "$GOLD_SAMPLE_PATH" ] && [ "$(ls -A "$GOLD_SAMPLE_PATH" 2>/dev/null)" ]; then
+        if should_skip_download "$GOLD_SAMPLE_PATH" "Gold sample"; then
+            return 0
+        fi
+    fi
+    echo "Gold sample: use download_gold_sample.py for ESO archive spectra."
+    echo "  python download_gold_sample.py --output $GOLD_SAMPLE_PATH"
+    return 0
 }
 
 
