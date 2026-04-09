@@ -203,7 +203,7 @@ for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
     --output-zarr "${TMP_OUT}" \
     --shard-index "${SHARD_INDEX}" \
     --shard-count "${SHARD_COUNT}" \
-    --workers "${PBS_NP:-32}" \
+    --workers "${PBS_NCPUS:-32}" \
     --scratch "${SCRATCH}" \
     --max-failures "${MAX_FAILURES}" \
     --log-level INFO \

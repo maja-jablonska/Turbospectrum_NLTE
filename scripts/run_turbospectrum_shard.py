@@ -49,6 +49,11 @@ from provenance_contract import (  # noqa: E402
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
 from synthesis_validation import SUCCESS_STATUSES, FailFastTracker, validate_synthesis_results
 
+# Number of spectra rows per Zarr chunk for flux/continuum arrays in shard
+# output.  Higher values drastically reduce inode count on parallel
+# filesystems (1 → ~2N files per shard; 64 → ~2*ceil(N/64) files).
+_SHARD_ROW_CHUNK = 64
+
 
 def _read_mu_points(spec_path: str) -> np.ndarray:
     """Parse '# mu-points ...' header from an Intensity .spec file (best-effort)."""
@@ -994,13 +999,13 @@ def main():
             root,
             "flux",
             np.full((0, wavelengths.size), np.nan, np.float32),
-            chunks=(1, min(65536, max(1, wavelengths.size))),
+            chunks=(_SHARD_ROW_CHUNK, min(65536, max(1, wavelengths.size))),
         )
         _write_array(
             root,
             "continuum",
             np.full((0, wavelengths.size), np.nan, np.float32),
-            chunks=(1, min(65536, max(1, wavelengths.size))),
+            chunks=(_SHARD_ROW_CHUNK, min(65536, max(1, wavelengths.size))),
         )
         _write_array(root, "mu_selected", np.asarray([], dtype=np.float32), chunks=1)
         _write_array(root, "mu_selected_index", np.asarray([], dtype=np.int16), chunks=1)
@@ -1228,8 +1233,8 @@ def main():
 
     _write_array(root, "wavelength", wavelengths, chunks=min(65536, max(1, wavelengths.size)))
     _write_array(root, "global_index", indices.astype(np.int64), chunks=max(1, min(2048, len(indices))))
-    _write_array(root, "flux", fluxes, chunks=(1, min(65536, max(1, wavelengths.size))))
-    _write_array(root, "continuum", continua, chunks=(1, min(65536, max(1, wavelengths.size))))
+    _write_array(root, "flux", fluxes, chunks=(min(_SHARD_ROW_CHUNK, max(1, len(indices))), min(65536, max(1, wavelengths.size))))
+    _write_array(root, "continuum", continua, chunks=(min(_SHARD_ROW_CHUNK, max(1, len(indices))), min(65536, max(1, wavelengths.size))))
     _write_array(root, "mu_selected", mu_selected, chunks=max(1, min(2048, len(mu_selected))))
     _write_array(root, "mu_selected_index", mu_selected_index, chunks=max(1, min(2048, len(mu_selected_index))))
     _write_string_1d(root, "status", statuses, chunks=max(1, min(256, len(statuses))))

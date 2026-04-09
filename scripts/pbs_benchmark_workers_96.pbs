@@ -23,6 +23,14 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 
+# On multi-socket nodes, prefer local memory allocation to avoid cross-NUMA
+# penalties.  Set NUMA_PREFIX="" to disable.
+if command -v numactl >/dev/null 2>&1; then
+    NUMA_PREFIX="${NUMA_PREFIX:-numactl --localalloc}"
+else
+    NUMA_PREFIX=""
+fi
+
 # Prevent mixed-prefix Python startup failures on HPC nodes.
 unset PYTHONHOME || true
 unset PYTHONPATH || true
@@ -372,7 +380,7 @@ worker_loop() {
             rm -rf "${attempt_scratch}" "${tmp_out_path}"
             mkdir -p "${attempt_scratch}"
 
-            "${PYTHON}" "${REPO}/scripts/run_turbospectrum_shard.py" \
+            ${NUMA_PREFIX} "${PYTHON}" "${REPO}/scripts/run_turbospectrum_shard.py" \
                 --grid-zarr "${GRID_ZARR}" \
                 --config "${TS_CONFIG}" \
                 --output-zarr "${out_path}" \

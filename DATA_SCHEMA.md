@@ -49,7 +49,7 @@ Continuum-normalized flux unless explicitly overridden in attrs.
 
 **Chunking (VERY IMPORTANT)**
 
-Recommended:
+Recommended for final/published datasets:
 
 ```
 (256–1024 models, full wavelength)
@@ -59,8 +59,24 @@ Example:
 
 ```
 chunks = (512, N_lambda)
+```
+
+### Pipeline chunk flow
+
+The pipeline uses stage-specific chunking that progressively coarsens toward ML access patterns:
 
 ```
+Shard output  →  Merged output  →  Rechunked (ML-ready)
+(64, ≤65536)     (128, L)          (128, 8192)
+```
+
+| Stage | Source | Row chunk | Wavelength chunk | Rationale |
+|-------|--------|-----------|------------------|-----------|
+| Shard synthesis | `_SHARD_ROW_CHUNK` in `run_turbospectrum_shard.py` | 64 | min(65536, L) | Balance write granularity vs inode count |
+| Merge | `--chunk-rows` in `merge_spectra_shards.py` (default 128) | 128 | full L | Row-major reads; matches PBS `MERGE_CHUNK_ROWS` |
+| Rechunk | `ROW_CHUNK`, `LAMBDA_CHUNK` in `rechunk_worker.py` | 128 | 8192 | Cache-friendly mini-batch I/O for GPU streaming |
+
+Metadata is consolidated at merge time via `zarr.consolidate_metadata()`.
 
 ### Why this chunking?
 
@@ -77,8 +93,11 @@ This optimizes for:
 * ML batching
 * GPU streaming
 * fewer object reads
+* minimal inode pressure on parallel filesystems
 
 Avoid tiny wavelength chunks — they destroy performance.
+
+Avoid row-chunk = 1 — it creates one file per spectrum and exhausts inodes at scale.
 
 ## wavelength
 
@@ -449,6 +468,15 @@ Recommended:
 
 ```
 chunks = (1024–4096 samples, full_lambda)
+```
+
+The current rechunk step (`rechunk_worker.py` via `rechunk_array_example.pbs`) uses:
+
+```
+ROW_CHUNK    = 128    # rows per chunk
+LAMBDA_CHUNK = 8192   # wavelength points per chunk
+PARAM_CHUNK  = 512    # param matrix row chunk
+ONE_D_CHUNK  = 1024   # 1D auxiliary array chunk
 ```
 
 Why?

@@ -1,10 +1,12 @@
 #!/bin/bash
 #PBS -N ts-synth
-#PBS -l select=1:ncpus=32:mem=64gb
+#PBS -l ncpus=32
+#PBS -l mem=64GB
 #PBS -l walltime=12:00:00
+#PBS -j oe
 #
-# Array size: set BOTH the -J range and N_SHARDS below to match.
-# Example: for 100 shards -> #PBS -J 0-99 and N_SHARDS=100
+# Array size: override via qsub -J and -v N_SHARDS=...
+# Default: 100 shards.  Example: qsub -J 0-199 -v N_SHARDS=200 ...
 #PBS -J 0-99
 #
 #PBS -o logs/pbs/ts-synth.${PBS_JOBID}.out
@@ -15,7 +17,7 @@ set -euo pipefail
 cd "${PBS_O_WORKDIR}"
 
 # ---- user settings ----
-N_SHARDS=100
+N_SHARDS="${N_SHARDS:-100}"
 RUN_ROOT="${RUN_ROOT:-runs/local-dev}"
 GRID_ZARR="${RUN_ROOT}/outputs/grids/parameter_grid.zarr"          # input parameter grid
 TS_CONFIG="configs/synthesis/config_sample_comprehensive.json"      # Turbospectrum runtime config
@@ -78,6 +80,10 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 fi
 
 SHARD_INDEX="${PBS_ARRAY_INDEX:-0}"
+if (( SHARD_INDEX >= N_SHARDS )); then
+    echo "[pbs-synth] INFO: array task ${SHARD_INDEX} >= N_SHARDS=${N_SHARDS}; exiting cleanly."
+    exit 0
+fi
 SHARD_OUT="${OUT_DIR}/spectra_shard_${SHARD_INDEX}.zarr"
 SCRATCH="${SCRATCH_BASE}/shard_${SHARD_INDEX}"
 mkdir -p "${SCRATCH}"
@@ -87,7 +93,7 @@ echo "Grid: ${GRID_ZARR}"
 echo "Config: ${TS_CONFIG}"
 echo "Output: ${SHARD_OUT}"
 echo "Scratch: ${SCRATCH}"
-echo "CPUs: ${PBS_NP:-unknown}"
+echo "CPUs: ${PBS_NCPUS:-unknown}"
 echo "Python: ${PYTHON_BIN}"
 echo "Mamba env: ${MAMBA_ENV_NAME}"
 echo "Conda prefix: ${CONDA_PREFIX:-<unset>}"
@@ -114,7 +120,12 @@ echo "Row count: ${ROW_COUNT}  Rows/shard: ~${ROWS_PER_SHARD}  Max failures: ${M
   --output-zarr "${SHARD_OUT}" \
   --shard-index "${SHARD_INDEX}" \
   --shard-count "${N_SHARDS}" \
-  --workers "${PBS_NP:-32}" \
+  --workers "${PBS_NCPUS:-32}" \
   --scratch "${SCRATCH}" \
   --max-failures "${MAX_FAILURES}" \
   --log-level INFO
+
+# Scratch cleanup
+if [[ -d "${SCRATCH}" ]]; then
+    rm -rf "${SCRATCH}"
+fi

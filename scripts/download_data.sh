@@ -115,39 +115,64 @@ download_with_resume() {
 # Download MARCS model atmospheres
 download_marcs() {
     local target_dir="$MODEL_PATH"
-    local zip_url="https://keeper.mpdl.mpg.de/d/6eaecbf95b88448f98a4/files/?p=/atmospheres/marcs_standard_comp.zip"
+    # The &dl=1 parameter triggers a direct download (302 → seafhttp blob)
+    # instead of the HTML file-browser page.
+    local zip_url="https://keeper.mpdl.mpg.de/d/6eaecbf95b88448f98a4/files/?p=/atmospheres/marcs_standard_comp.zip&dl=1"
     local zip_file="$TMP_PATH/marcs_standard_comp.zip"
+    local max_retries=3
 
     if should_skip_download "$target_dir" "MARCS atmospheres"; then
         return 0
     fi
 
+    mkdir -p "$target_dir"
+    mkdir -p "$TMP_PATH"
+
     if [ ! -f "$zip_file" ]; then
-        echo ""
-        echo "===================================================================================="
-        echo "  MARCS model atmosphere zip file not found: $zip_file"
-        echo "  Please manually download the zip file from the following URL:"
-        echo "  $zip_url"
-        echo "  And save it to: $zip_file"
-        echo "  After downloading, run this script again."
-        echo "===================================================================================="
-        echo ""
+        echo "Downloading MARCS atmospheres (~135 MB)..."
+        local attempt
+        for attempt in $(seq 1 "$max_retries"); do
+            if wget -q --show-progress \
+                    --continue \
+                    --content-disposition \
+                    -O "$zip_file" \
+                    "$zip_url"; then
+                break
+            fi
+            echo "Warning: MARCS download attempt $attempt/$max_retries failed."
+            if [ "$attempt" -eq "$max_retries" ]; then
+                echo "Error: could not download MARCS ZIP after $max_retries attempts."
+                echo "You can download manually from:"
+                echo "  $zip_url"
+                echo "Save to: $zip_file"
+                echo "Then re-run this script."
+                rm -f "$zip_file"
+                return 1
+            fi
+            sleep $(( attempt * 5 ))
+        done
+    fi
+
+    # Verify the ZIP is not truncated (content-length is ~141 MB).
+    local min_size=100000000  # 100 MB sanity floor
+    local actual_size
+    actual_size="$(wc -c < "$zip_file" 2>/dev/null || echo 0)"
+    if [ "$actual_size" -lt "$min_size" ]; then
+        echo "Error: MARCS ZIP looks truncated (${actual_size} bytes < ${min_size})."
+        echo "Deleting and re-run to retry."
+        rm -f "$zip_file"
         return 1
     fi
 
     echo "Unzipping models to $target_dir..."
-    mkdir -p "$target_dir"
-    mkdir -p "$TMP_PATH"
-
-    unzip -o "$zip_file" -d "$target_dir"
-    if [ $? -ne 0 ]; then
+    if ! unzip -o "$zip_file" -d "$target_dir"; then
         echo "Error: Failed to unzip MARCS models. The zip file might be corrupted."
         echo "Please delete '$zip_file' and try downloading it manually again."
         return 1
     fi
 
     # Clean up the downloaded zip file
-    rm "$zip_file"
+    rm -f "$zip_file"
 
     # Remove the model_list file if it exists, as it's no longer needed
     local model_list_file="$target_dir/model_list"

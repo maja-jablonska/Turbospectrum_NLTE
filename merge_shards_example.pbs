@@ -220,3 +220,20 @@ fi
 echo "[merge] Running shard merge..."
 "${MERGE_CMD[@]}"
 echo "[merge] Merge complete: ${MERGED_ZARR}"
+
+############################################
+# Post-merge cleanup
+############################################
+
+CLEANUP_SHARDS="${CLEANUP_SHARDS:-1}"
+CLEANUP_TMP="${CLEANUP_TMP:-1}"
+
+if [[ "${CLEANUP_SHARDS}" == "1" ]]; then
+    echo "[merge] Cleaning up shard directory to reclaim inodes: ${SHARDS_DIR}"
+    rm -rf "${SHARDS_DIR}"
+fi
+
+if [[ "${CLEANUP_TMP}" == "1" && -d "${TMP_SYSTEM_DIR}" ]]; then
+    echo "[merge] Cleaning up tmp directory: ${TMP_SYSTEM_DIR}"
+    rm -rf "${TMP_SYSTEM_DIR}"
+fi

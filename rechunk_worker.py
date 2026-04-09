@@ -13,10 +13,14 @@ START = int(sys.argv[3])
 END = int(sys.argv[4])
 JOB_ID = int(sys.argv[5])
 
-ROW_CHUNK = 128
-LAMBDA_CHUNK = 8192
-PARAM_CHUNK = 512
-ONE_D_CHUNK = 1024
+# Chunk sizes tuned for ML training access patterns (batch reads).
+# Shard synthesis uses _SHARD_ROW_CHUNK=64 in run_turbospectrum_shard.py;
+# merge uses --chunk-rows (default 128) with full-wavelength chunks;
+# rechunking re-tiles into the layout below for efficient random-batch I/O.
+ROW_CHUNK = 128          # rows per chunk  (aligned with merge default)
+LAMBDA_CHUNK = 8192      # wavelength points per chunk (splits long ranges)
+PARAM_CHUNK = 512        # param matrix row chunk
+ONE_D_CHUNK = 1024       # 1D auxiliary array chunk
 
 COMPRESSORS = [zarr.codecs.Blosc(cname="zstd", clevel=3)]
 

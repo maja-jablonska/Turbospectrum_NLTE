@@ -669,7 +669,7 @@ def main() -> None:
     parser.add_argument("--shard", action="append", default=None, help="Shard Zarr path (repeatable)")
     parser.add_argument("--shard-dir", default=None, help="Directory containing shard *.zarr outputs")
 
-    parser.add_argument("--chunk-rows", type=int, default=32, help="Chunking along the sample dimension")
+    parser.add_argument("--chunk-rows", type=int, default=128, help="Chunking along the sample dimension (matches PBS MERGE_CHUNK_ROWS default)")
     parser.add_argument("--compressor", default=None, help="JSON string describing compressor options (cname, clevel, shuffle)")
     parser.add_argument(
         "--tmp-dir",
@@ -1368,6 +1368,12 @@ def main() -> None:
     }
     attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
     root_out.attrs.update(attrs_payload)
+
+    try:
+        zarr.consolidate_metadata(store)
+        print(f"Consolidated Zarr metadata: {out_path}")
+    except Exception as exc:
+        print(f"WARN: zarr.consolidate_metadata failed (non-fatal): {exc}")
 
     print(f"Wrote merged spectra Zarr: {out_path}")
 

@@ -18,7 +18,7 @@ class WorkerCountTests(unittest.TestCase):
                     nlte=False,
                 )
 
-            with mock.patch.dict(os.environ, {"PBS_NP": "96", "PBS_RESOURCE_LIST_MEM": "192GB"}, clear=False):
+            with mock.patch.dict(os.environ, {"PBS_NCPUS": "96", "PBS_RESOURCE_LIST_MEM": "192GB"}, clear=False):
                 with mock.patch("scripts.run_turbospectrum.multiprocessing.cpu_count", return_value=128):
                     with mock.patch("scripts.run_turbospectrum.os.sched_getaffinity", return_value=set(range(96)), create=True):
                         with contextlib.redirect_stdout(io.StringIO()):

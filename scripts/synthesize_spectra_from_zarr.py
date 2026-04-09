@@ -970,7 +970,7 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=None, help="Override worker process count")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     parser.add_argument("--log-file", default=None, help="Optional log file path")
-    parser.add_argument("--chunk-rows", type=int, default=32, help="Zarr chunking along the sample dimension")
+    parser.add_argument("--chunk-rows", type=int, default=128, help="Zarr chunking along the sample dimension")
     parser.add_argument("--compressor", default=None, help="JSON string describing compressor options (cname, clevel, shuffle)")
     parser.add_argument("--schema-version", default="1.0.0", help="DATA_SCHEMA.md schema version")
     parser.add_argument("--physics-hash", default=None, help="Optional override for physics hash")

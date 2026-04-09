@@ -208,6 +208,21 @@ Set defaults like:
 
 Unless intentionally using threaded libs.
 
+### PBS Variable Reference (NCI Gadi)
+
+Use `PBS_NCPUS` (not `PBS_NP`) for the CPU count on Gadi PBS Pro. The auto-detection in `run_turbospectrum.py` checks `PBS_NCPUS` first, with `PBS_NP` as a legacy fallback.
+
+Resource directives should use the flat format:
+
+```
+#PBS -l ncpus=32
+#PBS -l mem=64GB
+```
+
+Avoid the `select=1:ncpus=32:mem=64gb` form — it allocates a full node even when packing would suffice.
+
+For multi-socket nodes (e.g. 96-CPU benchmark), `numactl --localalloc` is applied automatically when available (see `pbs_benchmark_workers_96.pbs`).
+
 ## Temp & Scratch Policy
 
 ### Required
@@ -227,6 +242,22 @@ Check free space. Abort early if below threshold.
 Clean temp aggressively.
 
 Temp survival across runs is considered a bug.
+
+### Post-Merge Cleanup (Inode Reclamation)
+
+After a successful merge, the shard directory should be removed to reclaim inodes. The PBS merge scripts (`merge_shards_example.pbs`, `turbospectrum_regular_grid_example.pbs`) do this automatically unless disabled:
+
+```bash
+CLEANUP_SHARDS=0 qsub merge_shards_example.pbs   # keep shards after merge
+```
+
+Default behavior: shards are deleted after merge; scratch tmp is cleaned after synthesis.
+
+### Chunk Layout Reference
+
+See ARCHITECTURE.md § "Chunk Constants" for the authoritative table of chunk sizes at each pipeline stage (`_SHARD_ROW_CHUNK`, `--chunk-rows`, `ROW_CHUNK`/`LAMBDA_CHUNK`).
+
+All PBS scripts default `MERGE_CHUNK_ROWS=128`, aligned with the Python argparse default in `merge_spectra_shards.py`. JSON configs may override this (e.g. `runtime.chunk_rows`). Tiny test configs intentionally use smaller values.
 
 ## Monitoring
 
@@ -364,6 +395,18 @@ For large runs on shared HPC:
 * scale up only after stability confirmed
 * prefer fewer workers doing more shards each (reduces scheduler overhead)
 * avoid nested multiprocessing inside shard code
+
+### Inode Budget
+
+At production scale, inode exhaustion is a real risk on parallel filesystems. Current per-shard footprint:
+
+```
+files_per_shard ≈ 2 * ceil(rows / 64) + ~50
+```
+
+For a 100-shard run with 1000 rows/shard: ~3,200 chunk files total. After merge + cleanup: ~2,500 files in the final Zarr.
+
+If file count grows faster than shard count, investigate chunk sizes. The authoritative chunk constants are in ARCHITECTURE.md.
 
 ## Safety Switches (Strongly Recommended)
 

@@ -272,7 +272,7 @@ def main() -> None:
 
     scratch = args.scratch or runtime.get("scratch")
     workers = args.workers or runtime.get("workers")
-    chunk_rows = int(runtime.get("chunk_rows", 32))
+    chunk_rows = int(runtime.get("chunk_rows", 128))
 
     grid_zarr = _abs_from(cfg_dir, outputs.get("grid_zarr"))
     if not grid_zarr:

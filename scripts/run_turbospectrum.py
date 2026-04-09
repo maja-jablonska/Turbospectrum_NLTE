@@ -761,6 +761,7 @@ def determine_worker_count(config: TurbospectrumConfig, requested_workers: Optio
     scheduler_env_vars = [
         "SLURM_CPUS_PER_TASK",
         "SLURM_CPUS_ON_NODE",
+        "PBS_NCPUS",
         "PBS_NP",
         "NSLOTS",
         "OMP_NUM_THREADS",

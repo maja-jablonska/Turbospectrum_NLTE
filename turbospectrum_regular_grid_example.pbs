@@ -191,7 +191,7 @@ CFG_OUTPUT_TMP="${_runtime_lines[7]:-}"
 CFG_WORKERS="${_runtime_lines[8]:-}"
 CFG_SHARD_COUNT="${_runtime_lines[9]:-}"
 CFG_ROWS_PER_SHARD="${_runtime_lines[10]:-}"
-CFG_CHUNK_ROWS="${_runtime_lines[11]:-32}"
+CFG_CHUNK_ROWS="${_runtime_lines[11]:-128}"
 CFG_LOG_LEVEL="${_runtime_lines[12]:-INFO}"
 CFG_LOG_FILE="${_runtime_lines[13]:-}"
 CFG_SKIP_SYNTHESIS="${_runtime_lines[14]:-False}"
@@ -1116,3 +1116,18 @@ fi
 echo "[regular-grid] Merging shard outputs..."
 "${MERGE_CMD[@]}"
 echo "[regular-grid] Merge complete: ${MERGED_ZARR}"
+
+############################################
+# Post-merge cleanup (inodes + scratch)
+############################################
+
+CLEANUP_SHARDS="${CLEANUP_SHARDS:-1}"
+if [[ "$(to_bool01 "${CLEANUP_SHARDS}")" == "1" ]]; then
+    echo "[regular-grid] Cleaning up shard directory to reclaim inodes: ${SHARDS_DIR}"
+    rm -rf "${SHARDS_DIR}"
+fi
+
+if [[ -d "${SCRATCH_TMP_ROOT}" ]]; then
+    echo "[regular-grid] Cleaning up scratch tmp: ${SCRATCH_TMP_ROOT}"
+    rm -rf "${SCRATCH_TMP_ROOT}"
+fi

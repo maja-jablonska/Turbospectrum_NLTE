@@ -162,6 +162,32 @@ Preferred formats:
 
 Avoid raw FITS explosions unless bundled.
 
+### Chunk Constants (Authoritative Reference)
+
+The pipeline uses different chunk layouts at each stage, tuned for that stage's access pattern:
+
+| Stage | File | Constant / Default | Row chunk | Wavelength chunk |
+|-------|------|--------------------|-----------|------------------|
+| Shard synthesis | `run_turbospectrum_shard.py` | `_SHARD_ROW_CHUNK = 64` | 64 | min(65536, L) |
+| Merge | `merge_spectra_shards.py` | `--chunk-rows` (default 128) | 128 | full L |
+| Rechunk (ML) | `rechunk_worker.py` | `ROW_CHUNK = 128`, `LAMBDA_CHUNK = 8192` | 128 | 8192 |
+
+**Why they differ:**
+
+* **Shard synthesis** chunks at 64 rows to balance write granularity against inode count. Each worker may flush partial results; small-ish chunks keep memory low while avoiding one-file-per-spectrum.
+* **Merge** uses 128-row chunks with full-wavelength extent because downstream reads are row-major (load N spectra, all wavelengths). This matches the PBS `MERGE_CHUNK_ROWS` default.
+* **Rechunk** splits wavelengths into 8192-point tiles for ML streaming where mini-batch reads benefit from smaller, cache-friendly chunks.
+
+**Inode budget rule of thumb:**
+
+```
+files_per_shard ≈ 2 * ceil(rows / _SHARD_ROW_CHUNK) + ~50 overhead
+```
+
+For 100 shards x 1000 rows: ~3,200 chunk files (at row-chunk 64) vs ~200,000 with the old row-chunk of 1.
+
+All chunk defaults must stay aligned. If you change one, grep for `_SHARD_ROW_CHUNK`, `ROW_CHUNK`, `MERGE_CHUNK_ROWS`, and `chunk_rows` across the codebase.
+
 ### Temporary Storage
 
 All temp files must use node-local scratch when available.

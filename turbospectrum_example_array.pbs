@@ -264,3 +264,11 @@ echo "[turbospec-array] Workers: ${WORKERS}"
     --workers "${WORKERS}" \
     --scratch "${SCRATCH}" \
     --output "${TMP_OUT}"
+
+############################################
+# Scratch cleanup
+############################################
+
+if [[ -d "${SCRATCH}" ]]; then
+    rm -rf "${SCRATCH}"
+fi
