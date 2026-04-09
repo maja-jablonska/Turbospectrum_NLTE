@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from typing import Sequence
 
 import zarr
@@ -78,9 +79,15 @@ def main() -> None:
     elif rows_per_shard is not None and shard_count is not None:
         coverage = shard_count * rows_per_shard
         if coverage < row_count:
-            raise ValueError(
-                f"shard_count={shard_count} and rows_per_shard={rows_per_shard} only cover "
-                f"{coverage} rows, but row_count={row_count}"
+            # shard_count is the harder constraint (e.g. PBS array size);
+            # auto-adjust rows_per_shard upward so all rows are covered.
+            old_rps = rows_per_shard
+            rows_per_shard = (row_count + shard_count - 1) // shard_count
+            print(
+                f"WARN: shard_count={shard_count} and rows_per_shard={old_rps} only cover "
+                f"{coverage} rows, but row_count={row_count}. "
+                f"Auto-adjusting rows_per_shard to {rows_per_shard}.",
+                file=sys.stderr,
             )
     elif default_rows_per_shard is not None:
         rows_per_shard = default_rows_per_shard
