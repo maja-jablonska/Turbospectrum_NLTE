@@ -81,7 +81,8 @@ for k in ["flux", "continuum", "params"]:
     concat(k)
 
 for k in ["global_index", "model_id", "mu_selected", "mu_selected_index"]:
-    concat(k)
+    if k in arrays[0]:
+        concat(k)
 
 # ---------- parameter_columns ----------
 if "parameter_columns" in arrays[0]:

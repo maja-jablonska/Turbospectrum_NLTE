@@ -116,6 +116,8 @@ for i in range(START, END, PARAM_CHUNK):
 
 # ---------- 1D ----------
 for name in ["global_index", "model_id", "mu_selected", "mu_selected_index"]:
+    if name not in src:
+        continue
     arr = src[name]
 
     out = dst.create_array(

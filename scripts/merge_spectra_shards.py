@@ -1210,6 +1210,14 @@ def main() -> None:
     model_id = _compute_model_ids(params)
     param_name_list = [str(x) for x in param_names.tolist()]
 
+    # When mu is already a column in the params matrix, the standalone
+    # mu_selected / mu_selected_index arrays are redundant — remove them
+    # to avoid duplicating the information.
+    if "mu" in param_name_list:
+        for _mu_key in ("mu_selected", "mu_selected_index"):
+            if _mu_key in root_out:
+                del root_out[_mu_key]
+
     if grid_root is not None and "output_mode" in grid_root:
         output_mode_data = np.asarray(grid_root["output_mode"][:])
         if effective_allow_missing:
@@ -1412,8 +1420,9 @@ def main() -> None:
         "output_mode_values": output_mode_values,
         "calculation_mode_values": calculation_mode_values,
         "mu_sampling_values": sorted(mu_sampling_values),
-        "mu_selected_present": bool(saw_mu_selected),
-        "mu_selected_index_present": bool(saw_mu_selected_index),
+        "mu_in_params": "mu" in param_name_list,
+        "mu_selected_present": bool(saw_mu_selected) and "mu" not in param_name_list,
+        "mu_selected_index_present": bool(saw_mu_selected_index) and "mu" not in param_name_list,
         "allow_missing": bool(effective_allow_missing),
         "allow_missing_requested": bool(args.allow_missing),
         "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),

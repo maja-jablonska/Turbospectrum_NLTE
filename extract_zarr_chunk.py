@@ -131,6 +131,8 @@ def main():
 
     # ---------------- SAMPLE ARRAYS ----------------
     for name in SAMPLE_ARRAYS:
+        if name not in src:
+            continue
         arr = src[name]
         out = copy_sample_array(arr, dst, name, start, end)
         print(f"Copied {name} -> {out.shape}")
