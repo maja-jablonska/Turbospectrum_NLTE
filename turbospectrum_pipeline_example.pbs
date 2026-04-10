@@ -889,6 +889,10 @@ if [[ "$(to_bool01 "${SKIP_BAD_SHARDS}")" == "1" ]]; then
     MERGE_CMD+=(--skip-invalid-shards)
 fi
 
+if [[ "$(to_bool01 "${DROP_FAILED_ROWS:-0}")" == "1" ]]; then
+    MERGE_CMD+=(--drop-failed-rows)
+fi
+
 if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
     MERGE_CMD+=(--allow-incomplete-provenance)
 fi

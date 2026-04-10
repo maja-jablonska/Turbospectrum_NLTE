@@ -99,20 +99,34 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
         # Stream rows safely
         ########################################
 
+        nan_count = 0
+        inf_count = 0
+        empty_count = 0
         for i in range(flux.shape[0]):
 
             row = flux[i]
 
             if not np.isfinite(row).all():
                 if np.isnan(row).any():
-                    info["nan"] = True
+                    nan_count += 1
                 if np.isinf(row).any():
-                    info["inf"] = True
-                return False, info
+                    inf_count += 1
+                continue
 
             if np.allclose(row, 0):
-                info["empty"] = True
-                return False, info
+                empty_count += 1
+
+        if nan_count:
+            info["nan"] = True
+            info["nan_rows"] = nan_count
+        if inf_count:
+            info["inf"] = True
+            info["inf_rows"] = inf_count
+        if empty_count:
+            info["empty"] = True
+            info["empty_rows"] = empty_count
+        if nan_count or inf_count or empty_count:
+            return False, info
 
         ########################################
         # Wavelength consistency

@@ -118,7 +118,7 @@ def _require_arrays(root, names: Sequence[str]) -> None:
         raise KeyError(f"Shard {getattr(root.store, 'path', '?')} missing arrays: {missing}")
 
 
-def _validate_shard_structure(path: str) -> np.ndarray:
+def _validate_shard_structure(path: str, *, drop_failed_rows: bool = False) -> np.ndarray:
     root = _open_shard(path)
     _require_arrays(root, ["wavelength", "global_index", "flux", "status", "message"])
     wavelengths = np.asarray(root["wavelength"][:], dtype=np.float32)
@@ -141,24 +141,43 @@ def _validate_shard_structure(path: str) -> np.ndarray:
         raise ValueError(f"Shard {path} status shape {status.shape} does not match rows={global_index.size}")
     if message.ndim != 1 or message.shape[0] != global_index.size:
         raise ValueError(f"Shard {path} message shape {message.shape} does not match rows={global_index.size}")
-    if global_index.size and not np.all(np.isfinite(flux)):
-        raise ValueError(f"Shard {path} contains non-finite flux values")
 
     statuses = []
     for item in status.tolist():
         if isinstance(item, (bytes, bytearray)):
             item = item.decode("utf-8", errors="ignore")
         statuses.append(str(item).strip().lower())
-    invalid_statuses = sorted({item for item in statuses if item not in SUCCESS_STATUSES})
-    if invalid_statuses:
-        raise ValueError(f"Shard {path} contains non-success statuses: {invalid_statuses}")
+
+    if drop_failed_rows:
+        # Only check finite flux for rows with success status.
+        success_mask = np.array([s in SUCCESS_STATUSES for s in statuses], dtype=bool)
+        if success_mask.any() and not np.all(np.isfinite(flux[success_mask])):
+            raise ValueError(f"Shard {path} contains non-finite flux in success rows")
+        n_dropped = int((~success_mask).sum())
+        if n_dropped:
+            print(
+                f"  [drop-failed-rows] shard {os.path.basename(path)}: "
+                f"dropping {n_dropped}/{global_index.size} failed rows",
+                file=sys.stderr,
+            )
+    else:
+        if global_index.size and not np.all(np.isfinite(flux)):
+            raise ValueError(f"Shard {path} contains non-finite flux values")
+        invalid_statuses = sorted({item for item in statuses if item not in SUCCESS_STATUSES})
+        if invalid_statuses:
+            raise ValueError(f"Shard {path} contains non-success statuses: {invalid_statuses}")
 
     if "continuum" in root:
         continuum = np.asarray(root["continuum"][:], dtype=np.float32)
         if continuum.shape != flux.shape:
             raise ValueError(f"Shard {path} continuum shape {continuum.shape} does not match flux {flux.shape}")
-        if global_index.size and not np.all(np.any(np.isfinite(continuum), axis=1)):
-            raise ValueError(f"Shard {path} contains rows without finite continuum")
+        if drop_failed_rows:
+            success_cont = continuum[success_mask] if success_mask.any() else continuum
+            if success_cont.size and not np.all(np.any(np.isfinite(success_cont), axis=1)):
+                raise ValueError(f"Shard {path} contains success rows without finite continuum")
+        else:
+            if global_index.size and not np.all(np.any(np.isfinite(continuum), axis=1)):
+                raise ValueError(f"Shard {path} contains rows without finite continuum")
     return wavelengths
 
 
@@ -207,7 +226,7 @@ def _filter_nonexistent_shards(shards: Sequence[str], *, skip_nonexistent: bool)
 
 
 def _filter_invalid_shards(
-    shards: Sequence[str], *, skip_invalid: bool
+    shards: Sequence[str], *, skip_invalid: bool, drop_failed_rows: bool = False,
 ) -> tuple[List[str], List[str], Optional[np.ndarray], Optional[str]]:
     if not skip_invalid:
         return list(shards), [], None, None
@@ -219,7 +238,7 @@ def _filter_invalid_shards(
 
     for path in shards:
         try:
-            wavelengths = _validate_shard_structure(path)
+            wavelengths = _validate_shard_structure(path, drop_failed_rows=drop_failed_rows)
             if reference_wavelengths is None:
                 reference_wavelengths = wavelengths
                 reference_path = path
@@ -758,6 +777,15 @@ def main() -> None:
             "(for example missing required arrays or mismatched wavelength grids)."
         ),
     )
+    parser.add_argument(
+        "--drop-failed-rows",
+        action="store_true",
+        help=(
+            "Keep shards that contain non-success rows (e.g. failed NLTE departures) "
+            "but drop those rows from the merged output instead of rejecting the "
+            "entire shard. Implies --allow-missing."
+        ),
+    )
     args = parser.parse_args()
 
     if args.tmp_dir:
@@ -768,11 +796,14 @@ def main() -> None:
         os.environ["TEMP"] = tmp_dir
         tempfile.tempdir = tmp_dir
 
+    drop_failed_rows = bool(args.drop_failed_rows)
     partial_merge_requested = bool(
         args.allow_missing or args.skip_nonexistent_shards or args.skip_invalid_shards
+        or drop_failed_rows
     )
     effective_skip_invalid_shards = bool(
         args.skip_invalid_shards or args.allow_missing or args.skip_nonexistent_shards
+        or drop_failed_rows
     )
 
     shards = _list_shards(args.shard, args.shard_dir)
@@ -783,6 +814,7 @@ def main() -> None:
     shards, skipped_invalid_shards, validated_wavelengths, _validated_wavelength_path = _filter_invalid_shards(
         shards,
         skip_invalid=effective_skip_invalid_shards,
+        drop_failed_rows=drop_failed_rows,
     )
     if not shards:
         raise FileNotFoundError(
@@ -906,6 +938,20 @@ def main() -> None:
             raise ValueError(f"Shard {p} global_index must be 1D, got shape={gidx.shape}")
         if gidx.size == 0:
             continue
+
+        # When --drop-failed-rows, only register success rows in the preflight.
+        if drop_failed_rows:
+            shard_status = np.asarray(shard["status"][:])
+            _statuses = []
+            for _item in shard_status.tolist():
+                if isinstance(_item, (bytes, bytearray)):
+                    _item = _item.decode("utf-8", errors="ignore")
+                _statuses.append(str(_item).strip().lower())
+            success_mask = np.array([s in SUCCESS_STATUSES for s in _statuses], dtype=bool)
+            gidx = gidx[success_mask]
+            if gidx.size == 0:
+                continue
+
         if np.any(gidx < 0):
             bad = gidx[gidx < 0][:10].tolist()
             raise ValueError(f"Shard {p} contains negative global_index values: {bad}")
@@ -1053,13 +1099,30 @@ def main() -> None:
                 print(f"WARNING: skipping shard during write: {p}: {exc}", file=sys.stderr)
                 continue
             raise
-        gidx = np.asarray(shard["global_index"][:], dtype=np.int64)
+        gidx_all = np.asarray(shard["global_index"][:], dtype=np.int64)
+        if gidx_all.size == 0:
+            continue
+
+        # When --drop-failed-rows, keep only success rows from this shard.
+        if drop_failed_rows:
+            _shard_status_raw = np.asarray(shard["status"][:])
+            _shard_statuses = []
+            for _item in _shard_status_raw.tolist():
+                if isinstance(_item, (bytes, bytearray)):
+                    _item = _item.decode("utf-8", errors="ignore")
+                _shard_statuses.append(str(_item).strip().lower())
+            _success_mask = np.array([s in SUCCESS_STATUSES for s in _shard_statuses], dtype=bool)
+        else:
+            _success_mask = np.ones(gidx_all.size, dtype=bool)
+
+        gidx = gidx_all[_success_mask]
         if gidx.size == 0:
             continue
 
-        flux = np.asarray(shard["flux"][:], dtype=np.float32)
-        if flux.shape != (gidx.size, wl_count):
-            raise ValueError(f"Shard {p} has unexpected flux shape: {flux.shape}")
+        flux_raw = np.asarray(shard["flux"][:], dtype=np.float32)
+        if flux_raw.shape != (gidx_all.size, wl_count):
+            raise ValueError(f"Shard {p} has unexpected flux shape: {flux_raw.shape}")
+        flux = flux_raw[_success_mask]
 
         local_idx = global_to_out[gidx]
         if np.any(local_idx < 0):
@@ -1075,9 +1138,10 @@ def main() -> None:
                 flux_out[int(li), :] = flux[i]
 
         if "continuum" in shard:
-            continuum = np.asarray(shard["continuum"][:], dtype=np.float32)
-            if continuum.shape != (gidx.size, wl_count):
-                raise ValueError(f"Shard {p} has unexpected continuum shape: {continuum.shape}")
+            continuum_raw = np.asarray(shard["continuum"][:], dtype=np.float32)
+            if continuum_raw.shape != (gidx_all.size, wl_count):
+                raise ValueError(f"Shard {p} has unexpected continuum shape: {continuum_raw.shape}")
+            continuum = continuum_raw[_success_mask]
             try:
                 continuum_out.oindex[local_idx, :] = continuum  # type: ignore[attr-defined]
             except Exception:
@@ -1085,8 +1149,10 @@ def main() -> None:
                     continuum_out[int(li), :] = continuum[i]
             saw_continuum = True
 
-        shard_status = [str(x) for x in np.asarray(shard["status"][:]).tolist()]
-        shard_msg = [str(x) for x in np.asarray(shard["message"][:]).tolist()]
+        shard_status_raw = np.asarray(shard["status"][:])
+        shard_msg_raw = np.asarray(shard["message"][:])
+        shard_status = [str(x) for x in shard_status_raw[_success_mask].tolist()]
+        shard_msg = [str(x) for x in shard_msg_raw[_success_mask].tolist()]
         if len(shard_status) != gidx.size or len(shard_msg) != gidx.size:
             raise ValueError(
                 f"Shard {p} has inconsistent status/message lengths: "
@@ -1097,7 +1163,8 @@ def main() -> None:
             messages[int(li)] = shard_msg[i]
 
         if "mu_selected" in shard:
-            shard_mu = np.asarray(shard["mu_selected"][:], dtype=np.float32)
+            shard_mu_raw = np.asarray(shard["mu_selected"][:], dtype=np.float32)
+            shard_mu = shard_mu_raw[_success_mask]
             if shard_mu.ndim != 1 or shard_mu.shape[0] != gidx.size:
                 raise ValueError(
                     f"Shard {p} mu_selected shape mismatch: expected ({gidx.size},), got {shard_mu.shape}"
@@ -1110,7 +1177,8 @@ def main() -> None:
             saw_mu_selected = True
 
         if "mu_selected_index" in shard:
-            shard_mu_idx = np.asarray(shard["mu_selected_index"][:], dtype=np.int16)
+            shard_mu_idx_raw = np.asarray(shard["mu_selected_index"][:], dtype=np.int16)
+            shard_mu_idx = shard_mu_idx_raw[_success_mask]
             if shard_mu_idx.ndim != 1 or shard_mu_idx.shape[0] != gidx.size:
                 raise ValueError(
                     f"Shard {p} mu_selected_index shape mismatch: expected ({gidx.size},), got {shard_mu_idx.shape}"
@@ -1126,7 +1194,8 @@ def main() -> None:
         for name in param_candidate_cols:
             if name not in shard:
                 continue
-            arr = np.asarray(shard[name][:])
+            arr_raw = np.asarray(shard[name][:])
+            arr = arr_raw[_success_mask]
             if arr.ndim != 1 or arr.shape[0] != gidx.size:
                 raise ValueError(
                     f"Shard {p} metadata column '{name}' shape mismatch: "
@@ -1428,6 +1497,7 @@ def main() -> None:
         "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
         "skip_invalid_shards": bool(args.skip_invalid_shards),
         "skip_invalid_shards_effective": bool(effective_skip_invalid_shards),
+        "drop_failed_rows": bool(drop_failed_rows),
         "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
         "skipped_invalid_shards": int(len(skipped_invalid_shards)),
         "expected_models": int(row_count),
