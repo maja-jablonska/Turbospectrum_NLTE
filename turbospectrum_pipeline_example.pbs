@@ -304,22 +304,101 @@ export TMP="${TMP_SYSTEM_DIR}"
 export TEMP="${TMP_SYSTEM_DIR}"
 
 ############################################
-# Grid – create if missing
+# Grid – create if missing (with lock for
+# array-task safety)
 ############################################
 
-if [[ ! -d "${GRID_ZARR}" ]]; then
-    if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
-        echo "[${TAG}] ERROR: grid zarr not found: ${GRID_ZARR}" >&2
-        exit 1
-    fi
+JOB_ID_BASE="${PBS_JOBID:-manual}"
+JOB_ID_BASE="${JOB_ID_BASE%%[*}"
+GRID_PREP_LOCK_DIR="${RUN_ROOT}/.grid_prepare_${JOB_ID_BASE}.lock"
+GRID_PREP_MARKER="${RUN_ROOT}/.grid_prepare_${JOB_ID_BASE}.done"
+GRID_PREP_FAILURE="${RUN_ROOT}/.grid_prepare_${JOB_ID_BASE}.failed"
+GRID_PREP_TIMEOUT="${GRID_PREP_TIMEOUT:-3600}"
+
+is_valid_grid_zarr() {
+    [[ -d "$1" ]] && "${PYTHON}" -c "
+import zarr, sys
+try:
+    root = zarr.open_group(r'$1', mode='r')
+    assert 'teff' in root or 'params' in root or 'global_index' in root
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+generate_grid_locked() {
     echo "[${TAG}] Grid not found; generating grid (num_samples=${CFG_NUM_SAMPLES:-?})."
     "${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
         --config "${CONFIG_PATH}" \
         --skip-synthesis
+}
+
+if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
+    # Finalize mode: grid must already exist.
+    if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+        echo "[${TAG}] ERROR: grid zarr not found: ${GRID_ZARR}" >&2
+        exit 1
+    fi
+elif (( ARRAY_TASK_MODE == 1 )); then
+    # Array mode: exactly one task generates the grid, others wait.
+    _grid_ready=0
+    if [[ -f "${GRID_PREP_MARKER}" ]] && is_valid_grid_zarr "${GRID_ZARR}"; then
+        _grid_ready=1
+    fi
+
+    if (( _grid_ready == 0 )); then
+        if [[ -f "${GRID_PREP_FAILURE}" ]]; then
+            echo "[${TAG}] ERROR: grid preparation previously failed; see ${GRID_PREP_FAILURE}." >&2
+            exit 1
+        fi
+
+        if mkdir "${GRID_PREP_LOCK_DIR}" 2>/dev/null; then
+            # We won the lock — generate the grid.
+            echo "[${TAG}] Array task ${PBS_ARRAY_INDEX:-?} acquired grid-preparation lock."
+            rm -f "${GRID_PREP_FAILURE}"
+            _prep_rc=0
+            if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+                generate_grid_locked || _prep_rc=$?
+            fi
+            if (( _prep_rc == 0 )) && is_valid_grid_zarr "${GRID_ZARR}"; then
+                date '+%Y-%m-%dT%H:%M:%S%z' > "${GRID_PREP_MARKER}"
+                rmdir "${GRID_PREP_LOCK_DIR}" 2>/dev/null || true
+            else
+                echo "prepare_failed_at=$(date '+%Y-%m-%dT%H:%M:%S%z')" > "${GRID_PREP_FAILURE}"
+                rmdir "${GRID_PREP_LOCK_DIR}" 2>/dev/null || true
+                echo "[${TAG}] ERROR: grid preparation failed." >&2
+                exit 1
+            fi
+        else
+            # Another task holds the lock — wait for it.
+            echo "[${TAG}] Array task ${PBS_ARRAY_INDEX:-?} waiting for grid preparation..."
+            _waited=0
+            while (( _waited < GRID_PREP_TIMEOUT )); do
+                if [[ -f "${GRID_PREP_MARKER}" ]] && is_valid_grid_zarr "${GRID_ZARR}"; then
+                    break
+                fi
+                if [[ -f "${GRID_PREP_FAILURE}" ]]; then
+                    echo "[${TAG}] ERROR: grid preparation failed in another task." >&2
+                    exit 1
+                fi
+                sleep 5
+                _waited=$((_waited + 5))
+            done
+            if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+                echo "[${TAG}] ERROR: timed out waiting for grid preparation (${GRID_PREP_TIMEOUT}s)." >&2
+                exit 1
+            fi
+        fi
+    fi
+else
+    # Single-job mode: generate directly.
+    if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+        generate_grid_locked
+    fi
 fi
 
-if [[ ! -d "${GRID_ZARR}" ]]; then
-    echo "[${TAG}] ERROR: grid zarr still not found after generation: ${GRID_ZARR}" >&2
+if ! is_valid_grid_zarr "${GRID_ZARR}"; then
+    echo "[${TAG}] ERROR: grid zarr not found or invalid after generation: ${GRID_ZARR}" >&2
     exit 1
 fi
 
