@@ -46,6 +46,17 @@ from provenance_contract import (
 )
 from spectrum_output import infer_flux_metadata
 from synthesis_validation import SUCCESS_STATUSES
+try:
+    from nlte_ascii_departures import NLTE_ASCII_CONTROL_KEYS
+except ImportError:
+    NLTE_ASCII_CONTROL_KEYS = (
+        "nlte_ascii_departure_dir",
+        "nlte_ascii_departure_species",
+        "nlte_ascii_abundance_column",
+        "nlte_ascii_abundance_scale",
+        "nlte_ascii_solar_abundance",
+        "nlte_ascii_match",
+    )
 
 PROVENANCE_FILENAMES: Tuple[str, ...] = (
     "canonical_config.yaml",
@@ -1053,31 +1064,17 @@ def main() -> None:
         "calculation_mode",
     ]
     if grid_root is not None:
+        _extra_skip = {
+            "teff", "logg", "feh", "turb", "turbvel", "t_value",
+            "a", "c", "n", "o", "r", "s",
+            "mu", "lam_min", "lam_max", "lam_step",
+            "output_mode", "mode", "calculation_mode", "grid_version",
+            *NLTE_ASCII_CONTROL_KEYS,
+        }
         extra_grid_cols = sorted(
             name
             for name in grid_root.keys()
-            if name not in {
-                "teff",
-                "logg",
-                "feh",
-                "turb",
-                "turbvel",
-                "t_value",
-                "a",
-                "c",
-                "n",
-                "o",
-                "r",
-                "s",
-                "mu",
-                "lam_min",
-                "lam_max",
-                "lam_step",
-                "output_mode",
-                "mode",
-                "calculation_mode",
-                "grid_version",
-            }
+            if name not in _extra_skip
         )
         param_candidate_cols.extend(extra_grid_cols)
     merged_meta: Dict[str, np.ndarray] = {}
@@ -1231,7 +1228,11 @@ def main() -> None:
     # Build params matrix from original grid when available; otherwise fall back to merged shard metadata.
     # Exclude the grid's target "mu" column — use mu_selected (the actual
     # value used for calculations) instead.
-    _GRID_SKIP = {"lam_min", "lam_max", "lam_step", "output_mode", "mode", "calculation_mode", "grid_version", "mu"}
+    _GRID_SKIP = {
+        "lam_min", "lam_max", "lam_step", "output_mode", "mode",
+        "calculation_mode", "grid_version", "mu",
+        *NLTE_ASCII_CONTROL_KEYS,
+    }
     if grid_root is not None:
         grid_cols: Dict[str, np.ndarray] = {}
         for name in grid_root.keys():
