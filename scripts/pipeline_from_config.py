@@ -32,6 +32,23 @@ def _abs_from(base_dir: str, maybe_relative: str | None) -> str | None:
     return maybe_relative if os.path.isabs(maybe_relative) else os.path.abspath(os.path.join(base_dir, maybe_relative))
 
 
+def _abs_output_from(run_root: str, cfg_dir: str, maybe_relative: str | None) -> str | None:
+    """Resolve an output path.
+
+    Absolute paths are returned as-is.  Dot-relative paths (../../...) resolve
+    from *cfg_dir* (the directory that contains the config file).  Bare relative
+    paths (outputs/...) resolve from *run_root* so that configs can use short
+    names like ``outputs/grids/grid.zarr`` and have them land under the run root.
+    """
+    if not maybe_relative:
+        return None
+    if os.path.isabs(maybe_relative):
+        return maybe_relative
+    if not maybe_relative.startswith((".", "..")):
+        return os.path.abspath(os.path.join(run_root, maybe_relative)) if run_root else os.path.abspath(os.path.join(cfg_dir, maybe_relative))
+    return os.path.abspath(os.path.join(cfg_dir, maybe_relative))
+
+
 def _load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -100,9 +117,10 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
         grid_synthesis["mu_sampling"] = dict(ts_mu_sampling)
         grid_cfg["synthesis"] = grid_synthesis
 
-    grid_csv = _abs_from(config_dir, outputs.get("grid_csv"))
-    grid_zarr = _abs_from(config_dir, outputs.get("grid_zarr"))
-    grid_index_parquet = _abs_from(config_dir, outputs.get("grid_index_parquet"))
+    run_root = _abs_from(config_dir, outputs.get("run_root")) or ""
+    grid_csv = _abs_output_from(run_root, config_dir, outputs.get("grid_csv"))
+    grid_zarr = _abs_output_from(run_root, config_dir, outputs.get("grid_zarr"))
+    grid_index_parquet = _abs_output_from(run_root, config_dir, outputs.get("grid_index_parquet"))
     if not grid_zarr:
         raise ValueError("outputs.grid_zarr is required")
 
@@ -127,7 +145,7 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
     columns = gg._resolve_ml_sampling(grid_cfg, rng=rng)  # type: ignore[attr-defined]
 
     if grid_csv:
-        csv_abs = _abs_from(config_dir, outputs.get("grid_csv"))  # recompute to be safe
+        csv_abs = _abs_output_from(run_root, config_dir, outputs.get("grid_csv"))  # recompute to be safe
         written = gg._write_csv_outputs(  # type: ignore[attr-defined]
             columns,
             csv_abs,
@@ -274,7 +292,8 @@ def main() -> None:
     workers = args.workers or runtime.get("workers")
     chunk_rows = int(runtime.get("chunk_rows", 128))
 
-    grid_zarr = _abs_from(cfg_dir, outputs.get("grid_zarr"))
+    run_root = _abs_from(cfg_dir, outputs.get("run_root")) or ""
+    grid_zarr = _abs_output_from(run_root, cfg_dir, outputs.get("grid_zarr"))
     if not grid_zarr:
         raise ValueError("outputs.grid_zarr is required")
 
@@ -290,7 +309,7 @@ def main() -> None:
     ts_cfg_path = _write_temp_turbospectrum_config(pipeline_cfg, config_dir=cfg_dir, scratch=scratch)
 
     if args.synthesis_mode == "full":
-        out_zarr = _abs_from(cfg_dir, outputs.get("spectra_zarr"))
+        out_zarr = _abs_output_from(run_root, cfg_dir, outputs.get("spectra_zarr"))
         if not out_zarr:
             raise ValueError("outputs.spectra_zarr is required for synthesis-mode=full")
         _ensure_parent(out_zarr)
@@ -326,7 +345,7 @@ def main() -> None:
     template = outputs.get("spectra_shard_template")
     if not template:
         raise ValueError("outputs.spectra_shard_template is required for synthesis-mode=sharded")
-    out_zarr = _abs_from(cfg_dir, str(template).format(shard_index=shard_index))
+    out_zarr = _abs_output_from(run_root, cfg_dir, str(template).format(shard_index=shard_index))
     _ensure_parent(out_zarr)
 
     # Use the existing shard runner (available on HPC deployments).

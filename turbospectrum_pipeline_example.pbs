@@ -185,6 +185,17 @@ def _abs(p):
         return ""
     return p if os.path.isabs(p) else os.path.abspath(os.path.join(cfg_dir, p))
 
+def _abs_output(p, rr):
+    """Resolve an output path: absolute paths stay, dot-relative (../../)
+    resolves from cfg_dir, bare relative (outputs/...) resolves from run_root."""
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return p
+    if not p.startswith((".", "..")):
+        return os.path.abspath(os.path.join(rr, p)) if rr else os.path.abspath(os.path.join(cfg_dir, p))
+    return os.path.abspath(os.path.join(cfg_dir, p))
+
 def _infer_run_root(*paths):
     for path in paths:
         if not path:
@@ -199,9 +210,9 @@ run_root = _abs(outs.get("run_root")) or _infer_run_root(
     outs.get("spectra_zarr") and _abs(outs.get("spectra_zarr")),
     outs.get("grid_zarr") and _abs(outs.get("grid_zarr")),
 )
-grid = _abs(outs.get("grid_zarr"))
-merged = _abs(outs.get("spectra_zarr"))
-shard_tmpl = _abs(outs.get("spectra_shard_template"))
+grid = _abs_output(outs.get("grid_zarr"), run_root)
+merged = _abs_output(outs.get("spectra_zarr"), run_root)
+shard_tmpl = _abs_output(outs.get("spectra_shard_template"), run_root)
 shards_dir = os.path.dirname(shard_tmpl) if shard_tmpl else ""
 
 def _int_or_empty(val):
