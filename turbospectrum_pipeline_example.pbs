@@ -319,6 +319,21 @@ fi
 ROWS_PER_SHARD_RAW="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
 SHARD_COUNT_RAW="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
 
+# For array jobs: infer SHARD_COUNT from the PBS array range when not
+# explicitly set.  PBS Pro on Gadi exposes PBS_ARRAY_INDEX per task but
+# not the total range, so we parse it from PBS_JOBID (e.g. "12345[0-99].gadi-pbs").
+if (( ARRAY_TASK_MODE == 1 )) && [[ -z "${SHARD_COUNT_RAW}" ]]; then
+    _array_max="$("${PYTHON}" -c "
+import re, sys
+m = re.search(r'\[(\d+)-(\d+)\]', sys.argv[1])
+print(int(m.group(2)) + 1 if m else '')
+" "${PBS_JOBID:-}" 2>/dev/null || echo "")"
+    if [[ -n "${_array_max}" && "${_array_max}" =~ ^[0-9]+$ ]] && (( _array_max > 0 )); then
+        SHARD_COUNT_RAW="${_array_max}"
+        echo "[${TAG}] Inferred SHARD_COUNT=${_array_max} from PBS array range in PBS_JOBID."
+    fi
+fi
+
 # When FINALIZE_ONLY and no explicit layout, infer from saved layout or
 # existing shard directories.
 SHARD_LAYOUT_FILE="${SHARDS_DIR}/.shard_layout"
@@ -350,11 +365,14 @@ print(max(indices) + 1 if indices else '')
     fi
 fi
 
+DEFAULT_ROWS_PER_SHARD="${DEFAULT_ROWS_PER_SHARD:-128}"
+
 if [[ -f "${LAYOUT_HELPER}" ]]; then
     LAYOUT_CMD=(
         "${PYTHON}" "${LAYOUT_HELPER}"
         --zarr-path "${GRID_ZARR}"
         --row-keys "teff,params,global_index"
+        --default-rows-per-shard "${DEFAULT_ROWS_PER_SHARD}"
     )
     if [[ -n "${ROWS_PER_SHARD_RAW}" ]]; then
         LAYOUT_CMD+=(--rows-per-shard "${ROWS_PER_SHARD_RAW}")
@@ -391,7 +409,8 @@ else:
     elif [[ -n "${ROWS_PER_SHARD}" ]]; then
         SHARD_COUNT=$(( (ROW_COUNT + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
     else
-        SHARD_COUNT="${ROW_COUNT}"
+        ROWS_PER_SHARD="${DEFAULT_ROWS_PER_SHARD}"
+        SHARD_COUNT=$(( (ROW_COUNT + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
     fi
     if [[ -z "${ROWS_PER_SHARD:-}" ]]; then
         ROWS_PER_SHARD=$(( (ROW_COUNT + SHARD_COUNT - 1) / SHARD_COUNT ))
