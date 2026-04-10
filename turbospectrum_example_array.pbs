@@ -13,6 +13,10 @@
 #PBS -l storage=scratch/mk27+scratch/y89
 #PBS -J 0-99
 
+# Usage examples:
+#   qsub -J 0-99 -v CONFIG_PATH=configs/pipeline/config_pipeline.json turbospectrum_example_array.pbs
+#   qsub -v CONFIG_PATH=configs/pipeline/config_pipeline.json,FINALIZE_ONLY=1 turbospectrum_example_array.pbs
+
 set -euo pipefail
 cd "${PBS_O_WORKDIR}"
 
@@ -92,6 +96,24 @@ CONFIG_PATH="${CONFIG_PATH:-configs/pipeline/config_pipeline.json}"
 WORKERS="${WORKERS:-${PBS_NCPUS:-32}}"
 SHARD_COUNT_OVERRIDE="${SHARD_COUNT:-}"
 ROWS_PER_SHARD_OVERRIDE="${ROWS_PER_SHARD:-}"
+FINALIZE_ONLY="${FINALIZE_ONLY:-0}"
+ALLOW_PARTIAL_MERGE="${ALLOW_PARTIAL_MERGE:-1}"
+ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
+SKIP_BAD_SHARDS="${SKIP_BAD_SHARDS:-1}"
+CLEANUP_SHARDS="${CLEANUP_SHARDS:-1}"
+MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-128}"
+VALIDATE_WORKERS="${VALIDATE_WORKERS:-${WORKERS}}"
+
+to_bool01() {
+    local val
+    val="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "${val}" in
+        1|true|yes|on) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+
+FINALIZE_ONLY_EFFECTIVE="$(to_bool01 "${FINALIZE_ONLY}")"
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
@@ -139,6 +161,7 @@ run_root = _abs(outs.get("run_root")) or _infer_run_root(
     outs.get("grid_zarr") and _abs(outs.get("grid_zarr")),
 )
 grid = _abs(outs.get("grid_zarr"))
+merged = _abs(outs.get("spectra_zarr"))
 shard_tmpl = _abs(outs.get("spectra_shard_template"))
 shards_dir = os.path.dirname(shard_tmpl) if shard_tmpl else ""
 shard_count = runtime.get("shard_count")
@@ -146,6 +169,7 @@ rows_per_shard = runtime.get("rows_per_shard")
 
 print(run_root)
 print(grid)
+print(merged)
 print(shard_tmpl)
 print(shards_dir)
 print("" if shard_count in (None, "") else int(shard_count))
@@ -156,16 +180,18 @@ PY
 mapfile -t _cfg_lines <<< "${CONFIG_OUTPUTS}"
 CFG_RUN_ROOT="${_cfg_lines[0]:-}"
 CFG_GRID_ZARR="${_cfg_lines[1]:-}"
-CFG_SHARD_TEMPLATE="${_cfg_lines[2]:-}"
-CFG_SHARDS_DIR="${_cfg_lines[3]:-}"
-CFG_SHARD_COUNT="${_cfg_lines[4]:-}"
-CFG_ROWS_PER_SHARD="${_cfg_lines[5]:-}"
+CFG_MERGED_ZARR="${_cfg_lines[2]:-}"
+CFG_SHARD_TEMPLATE="${_cfg_lines[3]:-}"
+CFG_SHARDS_DIR="${_cfg_lines[4]:-}"
+CFG_SHARD_COUNT="${_cfg_lines[5]:-}"
+CFG_ROWS_PER_SHARD="${_cfg_lines[6]:-}"
 
 if [[ -z "${USER_RUN_ROOT}" && -n "${CFG_RUN_ROOT}" ]]; then
     RUN_ROOT="${CFG_RUN_ROOT}"
 fi
 
 GRID_ZARR="${GRID_ZARR:-${CFG_GRID_ZARR:-${RUN_ROOT}/outputs/grids/parameter_grid.zarr}}"
+MERGED_ZARR="${MERGED_ZARR:-${CFG_MERGED_ZARR:-${RUN_ROOT}/outputs/zarr/synthesized_spectra.zarr}}"
 SHARD_TEMPLATE="${SHARD_TEMPLATE:-${CFG_SHARD_TEMPLATE}}"
 SHARDS_DIR="${SHARDS_DIR:-${CFG_SHARDS_DIR:-${RUN_ROOT}/outputs/shards}}"
 
@@ -187,6 +213,39 @@ fi
 
 ROWS_PER_SHARD_RAW="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
 SHARD_COUNT_RAW="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
+
+# When FINALIZE_ONLY and no explicit layout, infer from saved layout file or
+# existing shard directories (same logic as the regular-grid PBS).
+SHARD_LAYOUT_FILE="${SHARDS_DIR}/.shard_layout"
+if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" && -z "${SHARD_COUNT_OVERRIDE}" && -z "${ROWS_PER_SHARD_RAW}" && -z "${CFG_SHARD_COUNT}" ]]; then
+    if [[ -f "${SHARD_LAYOUT_FILE}" ]]; then
+        read _saved_sc _saved_rps < "${SHARD_LAYOUT_FILE}" 2>/dev/null || true
+        if [[ "${_saved_sc}" =~ ^[0-9]+$ && "${_saved_rps}" =~ ^[0-9]+$ ]]; then
+            SHARD_COUNT_RAW="${_saved_sc}"
+            ROWS_PER_SHARD_RAW="${_saved_rps}"
+            echo "[turbospec-array] FINALIZE_ONLY: restored shard layout from ${SHARD_LAYOUT_FILE}: SHARD_COUNT=${_saved_sc} ROWS_PER_SHARD=${_saved_rps}"
+        fi
+    fi
+    # Fallback: infer shard count from existing shard directories.
+    if [[ -z "${SHARD_COUNT_RAW}" ]]; then
+        _inferred_sc="$("${PYTHON}" -c "
+import re, sys
+from pathlib import Path
+shard_dir = Path(sys.argv[1])
+indices = sorted(
+    int(m.group(1))
+    for p in shard_dir.glob('spectra_shard_*.zarr')
+    if (m := re.match(r'spectra_shard_(\d+)\.zarr', p.name))
+)
+print(max(indices) + 1 if indices else '')
+" "${SHARDS_DIR}" 2>/dev/null || echo "")"
+        if [[ -n "${_inferred_sc}" && "${_inferred_sc}" =~ ^[0-9]+$ ]] && (( _inferred_sc > 0 )); then
+            SHARD_COUNT_RAW="${_inferred_sc}"
+            echo "[turbospec-array] FINALIZE_ONLY: inferred SHARD_COUNT=${_inferred_sc} from existing shard files."
+        fi
+    fi
+fi
+
 if [[ -z "${ROWS_PER_SHARD_RAW}" && -z "${SHARD_COUNT_RAW}" ]]; then
     echo "[turbospec-array] ERROR: SHARD_COUNT is not set and runtime.shard_count is missing in the config." >&2
     echo "[turbospec-array] ERROR: provide SHARD_COUNT=N or ROWS_PER_SHARD=N (or set runtime.shard_count / runtime.rows_per_shard in the config)." >&2
@@ -215,26 +274,13 @@ while IFS='=' read -r key value; do
     esac
 done <<< "${LAYOUT_OUTPUT}"
 
-SHARD_INDEX="${PBS_ARRAY_INDEX:-0}"
-if ! [[ "${SHARD_INDEX}" =~ ^[0-9]+$ ]] || (( SHARD_INDEX < 0 )); then
-    echo "[turbospec-array] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${SHARD_INDEX}'." >&2
-    exit 1
-fi
-if (( SHARD_INDEX >= SHARD_COUNT )); then
-    echo "[turbospec-array] INFO: array task ${SHARD_INDEX} is outside SHARD_COUNT=${SHARD_COUNT}; exiting cleanly."
-    exit 0
-fi
-
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs/pbs}"
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
 TMP_OUTPUT_DIR="${TMP_OUTPUT_DIR:-${SCRATCH_TMP_ROOT}/outputs}"
-SCRATCH="${TMP_WORK_DIR}/shard_${SHARD_INDEX}"
-TMP_OUT="${TMP_OUTPUT_DIR}/spectra_shard_${SHARD_INDEX}.tmp.zarr"
-SHARD_OUT="${SHARD_TEMPLATE//\{shard_index\}/${SHARD_INDEX}}"
 
-mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}" "${SCRATCH}"
+mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "${TMP_SYSTEM_DIR}" "${TMP_WORK_DIR}" "${TMP_OUTPUT_DIR}"
 
 export TMPDIR="${TMP_SYSTEM_DIR}"
 export TMP="${TMP_SYSTEM_DIR}"
@@ -245,15 +291,50 @@ echo "[turbospec-array] Config: ${CONFIG_PATH}"
 echo "[turbospec-array] Run root: ${RUN_ROOT}"
 echo "[turbospec-array] Log dir: ${LOG_DIR}"
 echo "[turbospec-array] Grid: ${GRID_ZARR}"
+echo "[turbospec-array] Merged: ${MERGED_ZARR}"
 echo "[turbospec-array] Shards: ${SHARDS_DIR}"
 echo "[turbospec-array] Grid rows: ${ROW_COUNT}"
 echo "[turbospec-array] Rows per shard: ${ROWS_PER_SHARD}"
 echo "[turbospec-array] Shard count: ${SHARD_COUNT}"
 echo "[turbospec-array] Array range: ${ARRAY_RANGE}"
+echo "[turbospec-array] Finalize only: ${FINALIZE_ONLY_EFFECTIVE}"
+echo "[turbospec-array] Workers: ${WORKERS}"
+
+############################################
+# FINALIZE_ONLY guard
+############################################
+
+if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]] && [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
+    echo "[turbospec-array] ERROR: FINALIZE_ONLY=1 should be submitted as a normal job, not as a PBS array task." >&2
+    exit 1
+fi
+
+if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
+    echo "[turbospec-array] FINALIZE_ONLY=1: skipping shard synthesis and moving directly to validation/merge."
+else
+
+############################################
+# Per-shard synthesis (array task)
+############################################
+
+SHARD_INDEX="${PBS_ARRAY_INDEX:-0}"
+if ! [[ "${SHARD_INDEX}" =~ ^[0-9]+$ ]] || (( SHARD_INDEX < 0 )); then
+    echo "[turbospec-array] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${SHARD_INDEX}'." >&2
+    exit 1
+fi
+if (( SHARD_INDEX >= SHARD_COUNT )); then
+    echo "[turbospec-array] INFO: array task ${SHARD_INDEX} is outside SHARD_COUNT=${SHARD_COUNT}; exiting cleanly."
+    exit 0
+fi
+
+SCRATCH="${TMP_WORK_DIR}/shard_${SHARD_INDEX}"
+TMP_OUT="${TMP_OUTPUT_DIR}/spectra_shard_${SHARD_INDEX}.tmp.zarr"
+SHARD_OUT="${SHARD_TEMPLATE//\{shard_index\}/${SHARD_INDEX}}"
+mkdir -p "${SCRATCH}"
+
 echo "[turbospec-array] Shard index: ${SHARD_INDEX}"
 echo "[turbospec-array] Output: ${SHARD_OUT}"
 echo "[turbospec-array] Scratch: ${SCRATCH}"
-echo "[turbospec-array] Workers: ${WORKERS}"
 
 "${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
     --config "${CONFIG_PATH}" \
@@ -265,10 +346,90 @@ echo "[turbospec-array] Workers: ${WORKERS}"
     --scratch "${SCRATCH}" \
     --output "${TMP_OUT}"
 
-############################################
-# Scratch cleanup
-############################################
-
 if [[ -d "${SCRATCH}" ]]; then
     rm -rf "${SCRATCH}"
+fi
+
+# Array tasks exit here — only finalize jobs continue to validation/merge.
+exit 0
+fi
+
+############################################
+# Validation
+############################################
+
+echo "[turbospec-array] Validating shard outputs..."
+
+DEFAULT_VALIDATE_WORKERS="${WORKERS}"
+if (( DEFAULT_VALIDATE_WORKERS > 32 )); then
+    DEFAULT_VALIDATE_WORKERS=32
+fi
+VALIDATE_WORKERS="${VALIDATE_WORKERS:-${DEFAULT_VALIDATE_WORKERS}}"
+
+VALIDATE_CMD=(
+    "${PYTHON}" "${REPO}/scripts/validate_dataset.py"
+    --shard-dir "${SHARDS_DIR}"
+    --expected-shards "${SHARD_COUNT}"
+    --workers "${VALIDATE_WORKERS}"
+)
+if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
+    VALIDATE_CMD+=(--allow-incomplete-provenance)
+fi
+set +e
+"${VALIDATE_CMD[@]}"
+VALIDATE_RC=$?
+set -e
+if (( VALIDATE_RC != 0 )); then
+    echo "[turbospec-array] WARN: validation exited with code ${VALIDATE_RC}; continuing with merge policy."
+fi
+
+############################################
+# Merge
+############################################
+
+SHARD_STORE_COUNT=$(find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' | wc -l | tr -d '[:space:]')
+if (( SHARD_STORE_COUNT == 0 )); then
+    echo "[turbospec-array] ERROR: no shard stores were produced in ${SHARDS_DIR}; skipping merge." >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "${MERGED_ZARR}")"
+
+MERGE_CMD=(
+    "${PYTHON}" "${REPO}/scripts/merge_spectra_shards.py"
+    --shard-dir "${SHARDS_DIR}"
+    --grid-zarr "${GRID_ZARR}"
+    --output-zarr "${MERGED_ZARR}"
+    --chunk-rows "${MERGE_CHUNK_ROWS}"
+    --tmp-dir "${TMP_SYSTEM_DIR}"
+)
+
+if [[ "$(to_bool01 "${SKIP_BAD_SHARDS}")" == "1" ]]; then
+    MERGE_CMD+=(--skip-invalid-shards)
+fi
+
+if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
+    MERGE_CMD+=(--allow-incomplete-provenance)
+fi
+
+if [[ "$(to_bool01 "${ALLOW_PARTIAL_MERGE}")" == "1" ]]; then
+    MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
+fi
+
+echo "[turbospec-array] Merging shard outputs..."
+"${MERGE_CMD[@]}"
+echo "[turbospec-array] Merge complete: ${MERGED_ZARR}"
+
+############################################
+# Post-merge cleanup
+############################################
+
+if [[ "$(to_bool01 "${CLEANUP_SHARDS}")" == "1" ]]; then
+    echo "[turbospec-array] Cleaning up shard directory to reclaim inodes: ${SHARDS_DIR}"
+    rm -rf "${SHARDS_DIR}"
+fi
+
+if [[ -d "${SCRATCH_TMP_ROOT}" ]]; then
+    echo "[turbospec-array] Cleaning up scratch tmp: ${SCRATCH_TMP_ROOT}"
+    rm -rf "${SCRATCH_TMP_ROOT}"
 fi
