@@ -121,6 +121,12 @@ def _choose_mu_indices(
     if mu_points.size == 0:
         return np.asarray([], dtype=np.int64), float("nan")
 
+    # When no explicit mu_sampling mode is configured but a target_mu is
+    # available from the grid, default to "nearest" so the correct mu column
+    # is selected and mu_selected is populated (instead of NaN).
+    if mode == "none" and target_mu is not None:
+        mode = "nearest"
+
     count = int(ms.get("count", 1) or 1)
     candidates = _mu_candidates(mu_points, cfg)
     if mode in {"nearest", "target"} and target_mu is not None:
@@ -141,6 +147,29 @@ def _choose_mu_indices(
     mu_sel = mu_points[chosen]
     mu_summary = float(mu_sel[0]) if mu_sel.size == 1 else float(np.mean(mu_sel))
     return chosen, mu_summary
+
+
+def _estimate_mu_from_index(
+    chosen_idx: np.ndarray,
+    n_mu: int,
+    ms_cfg: Mapping[str, Any],
+    target_mu: float | None,
+) -> float:
+    """Estimate the mu value when the spectrum header is missing.
+
+    Uses *target_mu* when available (nearest/target mode).  Otherwise
+    linearly interpolates from the column index across [mu_min, mu_max].
+    """
+    if target_mu is not None:
+        return float(target_mu)
+    if chosen_idx.size == 0 or n_mu <= 0:
+        return float("nan")
+    mu_min = float(ms_cfg.get("min", 0.0))
+    mu_max = float(ms_cfg.get("max", 1.0))
+    idx = int(chosen_idx[0])
+    if n_mu == 1:
+        return float((mu_min + mu_max) / 2.0)
+    return float(mu_min + (mu_max - mu_min) * idx / (n_mu - 1))
 
 
 DEFAULT_CONFIG_PATH = os.path.abspath(
@@ -575,14 +604,14 @@ def _synthesis_task(args) -> Dict:
     cfg.output_mode = output_mode
     cfg.nlte = calculation_mode.lower() == "nlte"
     is_intensity = output_mode.lower() == "intensity"
+    target_mu_raw = row_values.get("mu")
+    target_mu = None if target_mu_raw in (None, "") else float(target_mu_raw)
     mu_sampling = getattr(cfg, "mu_sampling", {}) or {}
     if not isinstance(mu_sampling, dict):
         mu_sampling = {}
     if is_intensity and str(mu_sampling.get("mode", "none")).strip().lower() in {"", "none"}:
-        mu_sampling["mode"] = "random"
+        mu_sampling["mode"] = "nearest" if target_mu is not None else "random"
     cfg.mu_sampling = mu_sampling
-    target_mu_raw = row_values.get("mu")
-    target_mu = None if target_mu_raw in (None, "") else float(target_mu_raw)
 
     abundance_values = {
         key: value
@@ -648,41 +677,41 @@ def _synthesis_task(args) -> Dict:
 
             if is_intensity:
                 mu_points = _read_mu_points(spec_path)
-                mu_mode = str(getattr(cfg, "mu_sampling", {}).get("mode", "none")).lower()
+                ms_cfg: Mapping[str, Any] = getattr(cfg, "mu_sampling", {}) or {}
+                mu_mode = str(ms_cfg.get("mode", "none")).lower()
                 chosen_idx, mu_selected = _choose_mu_indices(
                     mu_points,
                     row_index=int(index),
                     cfg=cfg,
                     target_mu=target_mu,
                 )
-                reduce_mode = str(getattr(cfg, "mu_sampling", {}).get("reduce", "first")).lower()
-                if chosen_idx.size == 0 and mu_mode == "random":
+                reduce_mode = str(ms_cfg.get("reduce", "first")).lower()
+
+                # Fallback when mu-points header is missing / unparseable.
+                if chosen_idx.size == 0:
                     n_mu = max(0, int((data.shape[1] - 3) // 2))
                     if n_mu > 0:
-                        seed = getattr(cfg, "mu_sampling", {}).get("seed")
-                        base_seed = 0 if seed in (None, "") else int(seed)
-                        rng = np.random.default_rng((base_seed + int(index)) % (2**32))
-                        count = int(getattr(cfg, "mu_sampling", {}).get("count", 1) or 1)
-                        replace = bool(count > n_mu)
-                        chosen_idx = np.asarray(rng.choice(np.arange(n_mu), size=count, replace=replace), dtype=np.int64)
-                        mu_selected = float("nan")
-                elif chosen_idx.size == 0 and target_mu is not None and mu_mode in {"nearest", "target"}:
-                    n_mu = max(0, int((data.shape[1] - 3) // 2))
-                    if n_mu > 0:
-                        mu_min = float(getattr(cfg, "mu_sampling", {}).get("min", 0.0))
-                        mu_max = float(getattr(cfg, "mu_sampling", {}).get("max", 1.0))
-                        denom = mu_max - mu_min
-                        frac = 0.0 if denom <= 0 else float(np.clip((target_mu - mu_min) / denom, 0.0, 1.0))
-                        ranked = np.argsort(np.abs(np.arange(n_mu, dtype=np.float64) - frac * max(0, n_mu - 1)))
-                        count = int(getattr(cfg, "mu_sampling", {}).get("count", 1) or 1)
-                        chosen_idx = ranked[:count] if count <= ranked.size else np.resize(ranked, count)
-                        chosen_idx = np.asarray(chosen_idx, dtype=np.int64)
+                        mu_min = float(ms_cfg.get("min", 0.0))
+                        mu_max = float(ms_cfg.get("max", 1.0))
+                        count = int(ms_cfg.get("count", 1) or 1)
+                        if mu_mode in {"nearest", "target"} and target_mu is not None:
+                            denom = mu_max - mu_min
+                            frac = 0.0 if denom <= 0 else float(np.clip((target_mu - mu_min) / denom, 0.0, 1.0))
+                            ranked = np.argsort(np.abs(np.arange(n_mu, dtype=np.float64) - frac * max(0, n_mu - 1)))
+                            chosen_idx = np.asarray(ranked[:count] if count <= ranked.size else np.resize(ranked, count), dtype=np.int64)
+                        else:
+                            seed = ms_cfg.get("seed")
+                            base_seed = 0 if seed in (None, "") else int(seed)
+                            rng = np.random.default_rng((base_seed + int(index)) % (2**32))
+                            replace = bool(count > n_mu)
+                            chosen_idx = np.asarray(rng.choice(np.arange(n_mu), size=count, replace=replace), dtype=np.int64)
+                        # Estimate mu from column position when header is absent.
+                        mu_selected = _estimate_mu_from_index(chosen_idx, n_mu, ms_cfg, target_mu)
                         logging.getLogger("zarr_synthesis").warning(
-                            "mu-points header missing from %s; using target_mu=%.6g as mu_selected estimate",
+                            "mu-points header missing from %s; estimated mu_selected=%.6g",
                             spec_path,
-                            target_mu,
+                            mu_selected,
                         )
-                        mu_selected = float(target_mu)
 
                 if chosen_idx.size > 0:
                     mu_selected_index = int(chosen_idx[0])
