@@ -501,11 +501,13 @@ import zarr
 shard_dir = Path(r"${SHARDS_DIR}")
 expected_shards = int(r"${SHARD_COUNT}")
 row_count = int(r"${ROW_COUNT}")
+drop_failed = r"${DROP_FAILED_ROWS:-0}" in ("1", "true", "True", "yes")
 out_path = Path(r"${MISSING_FILE}")
 out_path.parent.mkdir(parents=True, exist_ok=True)
 
 pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
 seen: set[int] = set()
+success_statuses = {"success", "skipped"}
 
 for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
     match = pattern.match(shard_path.name)
@@ -524,19 +526,30 @@ for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
         if gidx.shape != expected_indices.shape or not np.array_equal(gidx, expected_indices):
             continue
         statuses = [str(x).strip().lower() for x in np.asarray(root["status"][:]).tolist()]
-        if len(statuses) != expected_indices.size or any(status not in {"success", "skipped"} for status in statuses):
+        if len(statuses) != expected_indices.size:
             continue
         flux = np.asarray(root["flux"][:], dtype=np.float32)
         if flux.shape[0] != expected_indices.size:
             continue
-        if flux.size and not np.all(np.isfinite(flux)):
-            continue
+        if drop_failed:
+            success_mask = np.array([s in success_statuses for s in statuses], dtype=bool)
+            if success_mask.any() and not np.all(np.isfinite(flux[success_mask])):
+                continue
+        else:
+            if any(s not in success_statuses for s in statuses):
+                continue
+            if flux.size and not np.all(np.isfinite(flux)):
+                continue
         if "continuum" in root:
             continuum = np.asarray(root["continuum"][:], dtype=np.float32)
             if continuum.shape != flux.shape:
                 continue
-            if continuum.size and not np.all(np.isfinite(continuum)):
-                continue
+            if drop_failed:
+                if success_mask.any() and not np.all(np.isfinite(continuum[success_mask])):
+                    continue
+            else:
+                if continuum.size and not np.all(np.isfinite(continuum)):
+                    continue
         seen.add(shard_idx)
     except Exception:
         continue

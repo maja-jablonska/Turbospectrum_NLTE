@@ -498,6 +498,91 @@ fi
 # SINGLE-JOB MODE – worker pool
 ############################################
 
+########################################
+# Missing-shards helper (defined before
+# FINALIZE_ONLY branch so finalize can
+# use it)
+########################################
+
+write_missing_shards_file() {
+    "${PYTHON}" - <<PY
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import zarr
+
+shard_dir = Path(r"${SHARDS_DIR}")
+expected_shards = int(r"${SHARD_COUNT}")
+row_count = int(r"${ROW_COUNT}")
+drop_failed = r"${DROP_FAILED_ROWS:-0}" in ("1", "true", "True", "yes")
+out_path = Path(r"${MISSING_FILE}")
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
+seen: set[int] = set()
+for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
+    match = pattern.match(shard_path.name)
+    if match is None:
+        continue
+    shard_idx = int(match.group(1))
+    if shard_idx < 0 or shard_idx >= expected_shards:
+        continue
+    try:
+        root = zarr.open_group(str(shard_path), mode="r")
+    except Exception:
+        continue
+    for key in ("global_index", "flux", "status", "message"):
+        if key not in root:
+            root = None
+            break
+    if root is None:
+        continue
+    try:
+        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
+        flux = np.asarray(root["flux"][:], dtype=np.float32)
+        status = np.asarray(root["status"][:])
+    except Exception:
+        continue
+    if gidx.ndim != 1 or gidx.size == 0:
+        continue
+    if flux.ndim != 2 or flux.shape[0] != gidx.size:
+        continue
+    if status.ndim != 1 or status.shape[0] != gidx.size:
+        continue
+    if np.any(gidx < 0) or np.any(gidx >= row_count):
+        continue
+    if np.unique(gidx).size != gidx.size:
+        continue
+    # When drop_failed is active, only require success rows to have finite flux.
+    statuses = []
+    for item in status.tolist():
+        if isinstance(item, (bytes, bytearray)):
+            item = item.decode("utf-8", errors="ignore")
+        statuses.append(str(item).strip().lower())
+    success_statuses = {"success", "skipped"}
+    if drop_failed:
+        success_mask = np.array([s in success_statuses for s in statuses], dtype=bool)
+        if success_mask.any() and not np.all(np.isfinite(flux[success_mask])):
+            continue
+    else:
+        if not np.all(np.isfinite(flux)):
+            continue
+        if any(s not in success_statuses for s in statuses):
+            continue
+    seen.add(shard_idx)
+
+missing = sorted(set(range(expected_shards)) - seen)
+text = "\n".join(str(x) for x in missing)
+out_path.write_text(f"{text}\n" if text else "", encoding="utf-8")
+print(
+    f"[missing-shards] expected={expected_shards} valid={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('spectra_shard_*.zarr')))}",
+    file=sys.stderr,
+)
+PY
+}
+
 if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
     echo "[${TAG}] FINALIZE_ONLY=1: skipping synthesis."
 else
@@ -623,81 +708,6 @@ else
             sleep $(( (RANDOM % 10) + attempt * sleep_base ))
         done
         return 1
-    }
-
-    ########################################
-    # Missing-shards helper
-    ########################################
-
-    write_missing_shards_file() {
-        "${PYTHON}" - <<PY
-import re
-import sys
-from pathlib import Path
-
-import numpy as np
-import zarr
-
-shard_dir = Path(r"${SHARDS_DIR}")
-expected_shards = int(r"${SHARD_COUNT}")
-row_count = int(r"${ROW_COUNT}")
-out_path = Path(r"${MISSING_FILE}")
-out_path.parent.mkdir(parents=True, exist_ok=True)
-
-pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
-seen: set[int] = set()
-for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
-    match = pattern.match(shard_path.name)
-    if match is None:
-        continue
-    shard_idx = int(match.group(1))
-    if shard_idx < 0 or shard_idx >= expected_shards:
-        continue
-    try:
-        root = zarr.open_group(str(shard_path), mode="r")
-    except Exception:
-        continue
-    for key in ("global_index", "flux", "status", "message"):
-        if key not in root:
-            root = None
-            break
-    if root is None:
-        continue
-    try:
-        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
-        flux = np.asarray(root["flux"][:], dtype=np.float32)
-        status = np.asarray(root["status"][:])
-    except Exception:
-        continue
-    if gidx.ndim != 1 or gidx.size == 0:
-        continue
-    if flux.ndim != 2 or flux.shape[0] != gidx.size:
-        continue
-    if status.ndim != 1 or status.shape[0] != gidx.size:
-        continue
-    if np.any(gidx < 0) or np.any(gidx >= row_count):
-        continue
-    if np.unique(gidx).size != gidx.size:
-        continue
-    if not np.all(np.isfinite(flux)):
-        continue
-    statuses = []
-    for item in status.tolist():
-        if isinstance(item, (bytes, bytearray)):
-            item = item.decode("utf-8", errors="ignore")
-        statuses.append(str(item).strip().lower())
-    if any(s not in {"success", "skipped"} for s in statuses):
-        continue
-    seen.add(shard_idx)
-
-missing = sorted(set(range(expected_shards)) - seen)
-text = "\n".join(str(x) for x in missing)
-out_path.write_text(f"{text}\n" if text else "", encoding="utf-8")
-print(
-    f"[missing-shards] expected={expected_shards} valid={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('spectra_shard_*.zarr')))}",
-    file=sys.stderr,
-)
-PY
     }
 
     ########################################
