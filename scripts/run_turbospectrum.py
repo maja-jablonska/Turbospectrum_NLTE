@@ -842,12 +842,23 @@ def determine_worker_count(config: TurbospectrumConfig, requested_workers: Optio
 def resolve_linelist_paths(linelist_path: str, linelist_files: Optional[List[str]]) -> List[str]:
     """Resolve linelist entries into absolute file paths.
 
-    Supports explicit files, glob patterns such as ``dir/*``, and bare
-    directories, which are expanded to all files in that directory.
+    Supports explicit files, glob patterns (including ``**`` recursive),
+    and bare directories which are expanded to all files recursively.
     """
     out: List[str] = []
     seen: set[str] = set()
     base_dir = str(linelist_path or "")
+
+    def _collect_dir_files(directory: str) -> List[str]:
+        """Recursively collect all non-hidden files in *directory*."""
+        result: List[str] = []
+        for root_dir, _dirs, files in os.walk(directory):
+            # Skip hidden directories
+            _dirs[:] = [d for d in _dirs if not d.startswith(".")]
+            for fname in sorted(files):
+                if not fname.startswith("."):
+                    result.append(os.path.abspath(os.path.join(root_dir, fname)))
+        return sorted(result)
 
     for item in (linelist_files or []):
         raw = str(item).strip()
@@ -857,17 +868,26 @@ def resolve_linelist_paths(linelist_path: str, linelist_files: Optional[List[str
         candidate = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(base_dir, raw))
 
         if glob.has_magic(candidate):
-            matches = sorted(os.path.abspath(path) for path in glob.glob(candidate))
-            paths = [path for path in matches if os.path.isfile(path)]
-            if not paths:
-                raise FileNotFoundError(f"linelist pattern {raw!r} matched no files")
-        elif os.path.isdir(candidate):
+            recursive = "**" in candidate
             matches = sorted(
-                os.path.abspath(os.path.join(candidate, name))
-                for name in os.listdir(candidate)
-                if not name.startswith(".")
+                os.path.abspath(path)
+                for path in glob.glob(candidate, recursive=recursive)
             )
             paths = [path for path in matches if os.path.isfile(path)]
+            if not paths:
+                # Check if the non-glob prefix is a valid directory for a
+                # better error message.
+                prefix = candidate
+                while glob.has_magic(prefix):
+                    prefix = os.path.dirname(prefix)
+                if prefix and not os.path.isdir(prefix):
+                    raise FileNotFoundError(
+                        f"linelist pattern {raw!r} matched no files "
+                        f"(resolved directory {prefix!r} does not exist)"
+                    )
+                raise FileNotFoundError(f"linelist pattern {raw!r} matched no files")
+        elif os.path.isdir(candidate):
+            paths = _collect_dir_files(candidate)
             if not paths:
                 raise FileNotFoundError(f"linelist directory {raw!r} contained no files")
         else:
