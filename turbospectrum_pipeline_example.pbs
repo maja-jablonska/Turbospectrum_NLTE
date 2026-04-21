@@ -10,7 +10,7 @@
 #PBS -j oe
 #PBS -M maja.jablonska@anu.edu.au
 #PBS -m bae
-#PBS -l storage=scratch/mk27+scratch/y89
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
 
 # Unified pipeline PBS script for ML-grid and custom-grid synthesis.
 # Supports three modes of operation:
@@ -302,6 +302,81 @@ mkdir -p "${LOG_DIR}" "${SHARDS_DIR}" "$(dirname "${MERGED_ZARR}")" \
 export TMPDIR="${TMP_SYSTEM_DIR}"
 export TMP="${TMP_SYSTEM_DIR}"
 export TEMP="${TMP_SYSTEM_DIR}"
+
+############################################
+# Normalize NLTE info-file paths
+############################################
+# BSYN concatenates the atom/departure directory with the entry filename
+# without inserting a separator, so every directory line in the NLTE info
+# file must end with '/'. Rewrite the referenced info file(s) in place when
+# needed — safe because these lines are documented as bare directories.
+
+NLTE_INFO_FILE_FROM_CFG="$(
+    "${PYTHON}" - <<PY
+import json, os
+cfg_path = os.path.abspath(r"${CONFIG_PATH}")
+with open(cfg_path, "r", encoding="utf-8") as handle:
+    cfg = json.load(handle)
+nlte = cfg.get("nlte") or {}
+info = str(nlte.get("nlte_info_file", "") or "").strip()
+if info:
+    if not os.path.isabs(info):
+        info = os.path.abspath(os.path.join(os.path.dirname(cfg_path), info))
+    print(info)
+PY
+)"
+
+NLTE_INFO_CANDIDATES=()
+if [[ -n "${NLTE_INFO_FILE_FROM_CFG}" ]]; then
+    NLTE_INFO_CANDIDATES+=("${NLTE_INFO_FILE_FROM_CFG}")
+fi
+NLTE_INFO_CANDIDATES+=("${REPO}/DATA/SPECIES_LTE_NLTE.dat")
+
+for _info_file in "${NLTE_INFO_CANDIDATES[@]}"; do
+    [[ -f "${_info_file}" ]] || continue
+    "${PYTHON}" - "${_info_file}" "${TAG}" <<'PY'
+import os
+import sys
+
+info_path = sys.argv[1]
+tag = sys.argv[2]
+
+with open(info_path, "r", encoding="utf-8") as handle:
+    lines = handle.readlines()
+
+HEADERS = ("# path for model atom files", "# path for departure files")
+modified_headers: list[str] = []
+idx = 0
+while idx < len(lines):
+    stripped = lines[idx].strip()
+    if any(stripped.startswith(h) for h in HEADERS):
+        header = stripped
+        j = idx + 1
+        while j < len(lines):
+            candidate = lines[j]
+            candidate_stripped = candidate.strip()
+            if candidate_stripped and not candidate_stripped.startswith("#"):
+                if not candidate_stripped.endswith(("/", os.sep)):
+                    trailing_nl = "\n" if candidate.endswith("\n") else ""
+                    lines[j] = f"{candidate_stripped}/{trailing_nl}"
+                    modified_headers.append(header)
+                break
+            j += 1
+        idx = j + 1
+        continue
+    idx += 1
+
+if modified_headers:
+    with open(info_path, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+    print(
+        f"[{tag}] Normalized NLTE info file (added trailing '/' to "
+        f"{len(modified_headers)} path line(s)): {info_path}",
+        file=sys.stderr,
+    )
+PY
+done
+unset _info_file
 
 ############################################
 # Grid – create if missing (with lock for
