@@ -684,6 +684,39 @@ def _build_task_batches(
     return tasks, global_to_local
 
 
+def _merge_resolved_turbulence_columns(
+    columns: Mapping[str, np.ndarray],
+    *,
+    resolved_t_values: Sequence[str],
+    resolved_turbvels: Sequence[str],
+) -> Dict[str, np.ndarray]:
+    """Overlay per-row resolved turbulence values onto the shard's metadata columns.
+
+    A worker that successfully resolved a row returns non-empty strings; rows
+    that failed before resolution leave empty strings and fall back to whatever
+    the grid originally recorded.
+    """
+    merged = dict(columns)
+    n = max(len(resolved_t_values), len(resolved_turbvels))
+    if n == 0:
+        return merged
+
+    def _overlay(name: str, resolved: Sequence[str]) -> None:
+        if not any(resolved):
+            return
+        original = np.asarray(
+            merged.get(name, np.asarray([""] * n, dtype=object))
+        )
+        merged[name] = np.asarray(
+            [resolved[i] or str(original[i]) for i in range(n)],
+            dtype=object,
+        )
+
+    _overlay("t_value", resolved_t_values)
+    _overlay("turbvel", resolved_turbvels)
+    return merged
+
+
 ############################################
 # Main
 ############################################
@@ -1303,21 +1336,11 @@ def main():
 
     # Overwrite turbvel / t_value with the values actually used at synthesis time
     # (nearest available atmosphere label matched to the row's vmicro).
-    columns = dict(columns)
-    if any(resolved_t_values):
-        original_t_values = np.asarray(columns.get("t_value", np.asarray([""] * len(indices), dtype=object)))
-        merged_t_values = np.asarray(
-            [resolved_t_values[i] or str(original_t_values[i]) for i in range(len(indices))],
-            dtype=object,
-        )
-        columns["t_value"] = merged_t_values
-    if any(resolved_turbvels):
-        original_turbvels = np.asarray(columns.get("turbvel", np.asarray([""] * len(indices), dtype=object)))
-        merged_turbvels = np.asarray(
-            [resolved_turbvels[i] or str(original_turbvels[i]) for i in range(len(indices))],
-            dtype=object,
-        )
-        columns["turbvel"] = merged_turbvels
+    columns = _merge_resolved_turbulence_columns(
+        columns,
+        resolved_t_values=resolved_t_values,
+        resolved_turbvels=resolved_turbvels,
+    )
 
     # Write per-row metadata columns for later merging/QA (best-effort).
     _STRING_METADATA_COLS = {"turbvel", "t_value", "output_mode", "calculation_mode", "mode", "grid_version"}
