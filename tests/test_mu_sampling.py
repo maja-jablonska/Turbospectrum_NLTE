@@ -70,6 +70,55 @@ class MuSamplingTests(unittest.TestCase):
         np.testing.assert_array_equal(chosen, np.asarray([2], dtype=np.int64))
         self.assertAlmostEqual(mu_summary, 0.55, places=6)
 
+    def test_choose_mu_indices_reduce_first_with_full_count(self) -> None:
+        # Regression: count >= len(mu_points) previously averaged all chosen
+        # points into mu_summary, making it identical for every target_mu even
+        # though reduce="first" uses only chosen[0]. mu_summary must reflect
+        # the mu actually used.
+        cfg = TurbospectrumConfig(
+            project_root="",
+            mu_sampling={
+                "mode": "nearest",
+                "count": 10,
+                "min": 0.1,
+                "max": 1.0,
+                "reduce": "first",
+            },
+        )
+        mu_points = np.asarray(
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0], dtype=np.float32
+        )
+
+        _, mu_low = _choose_mu_indices(
+            mu_points, row_index=0, cfg=cfg, target_mu=0.25, reduce_mode="first"
+        )
+        _, mu_high = _choose_mu_indices(
+            mu_points, row_index=1, cfg=cfg, target_mu=0.82, reduce_mode="first"
+        )
+
+        self.assertAlmostEqual(mu_low, 0.2, places=5)
+        self.assertAlmostEqual(mu_high, 0.8, places=5)
+        self.assertNotAlmostEqual(mu_low, mu_high, places=3)
+
+    def test_choose_mu_indices_reduce_mean_still_averages(self) -> None:
+        cfg = TurbospectrumConfig(
+            project_root="",
+            mu_sampling={
+                "mode": "nearest",
+                "count": 3,
+                "min": 0.0,
+                "max": 1.0,
+                "reduce": "mean",
+            },
+        )
+        mu_points = np.asarray([0.1, 0.3, 0.5, 0.7, 0.9], dtype=np.float32)
+
+        _, mu_mean = _choose_mu_indices(
+            mu_points, row_index=0, cfg=cfg, target_mu=0.45, reduce_mode="mean"
+        )
+        # Three nearest to 0.45: 0.5, 0.3, 0.7 → mean = 0.5.
+        self.assertAlmostEqual(mu_mean, 0.5, places=5)
+
 
     def test_synthesis_task_fallback_uses_target_mu_when_header_missing(self) -> None:
         """When _read_mu_points returns empty (no mu-points header), the fallback

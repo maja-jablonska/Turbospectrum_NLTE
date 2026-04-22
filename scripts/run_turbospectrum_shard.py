@@ -108,11 +108,13 @@ def _choose_mu_indices(
     global_index: int,
     cfg: TurbospectrumConfig,
     target_mu: float | None = None,
+    reduce_mode: str | None = None,
 ) -> tuple[np.ndarray, float]:
     """Choose mu indices for one spectrum row, deterministically if seeded.
 
-    Returns (indices, mu_summary) where mu_summary is the selected mu (count==1)
-    or mean(mu_selected) otherwise.
+    Returns (indices, mu_summary) where mu_summary is the mu actually used by
+    the flux reducer: chosen[0] for reduce="first" (default), mean(chosen) for
+    reduce="mean".
     """
     ms = getattr(cfg, "mu_sampling", {}) or {}
     mode = str(ms.get("mode", "none")).lower()
@@ -144,7 +146,13 @@ def _choose_mu_indices(
 
     chosen = np.asarray(chosen, dtype=np.int64)
     mu_sel = mu_points[chosen]
-    mu_summary = float(mu_sel[0]) if mu_sel.size == 1 else float(np.mean(mu_sel))
+    effective_reduce = str(reduce_mode if reduce_mode is not None else ms.get("reduce", "first")).lower()
+    if mu_sel.size == 1:
+        mu_summary = float(mu_sel[0])
+    elif effective_reduce == "mean":
+        mu_summary = float(np.mean(mu_sel))
+    else:
+        mu_summary = float(mu_sel[0])
     return chosen, mu_summary
 
 
@@ -541,13 +549,14 @@ def _synthesis_task(batch):
                     mu_points = _read_mu_points(spec_path)
                     ms_cfg = getattr(cfg, "mu_sampling", {}) or {}
                     mu_mode = str(ms_cfg.get("mode", "none")).lower()
+                    reduce_mode = str(ms_cfg.get("reduce", "first")).lower()
                     chosen_idx, mu_selected = _choose_mu_indices(
                         mu_points,
                         global_index=int(global_index),
                         cfg=cfg,
                         target_mu=target_mu,
+                        reduce_mode=reduce_mode,
                     )
-                    reduce_mode = str(ms_cfg.get("reduce", "first")).lower()
 
                     # Fallback when mu-points header is missing / unparseable.
                     if chosen_idx.size == 0:
