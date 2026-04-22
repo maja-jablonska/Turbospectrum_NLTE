@@ -408,6 +408,13 @@ generate_grid_locked() {
         --skip-synthesis
 }
 
+if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" && "${FINALIZE_ONLY_EFFECTIVE}" != "1" ]]; then
+    # FORCE_RESTART drops the grid readiness marker in every task so no one short-circuits
+    # on a stale grid. The actual grid zarr wipe happens in the lock-winner path (array
+    # mode) or the single-job path below, so only one task deletes the directory.
+    rm -f "${GRID_PREP_MARKER}" "${GRID_PREP_FAILURE}"
+fi
+
 if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
     # Finalize mode: grid must already exist.
     if ! is_valid_grid_zarr "${GRID_ZARR}"; then
@@ -431,6 +438,10 @@ elif (( ARRAY_TASK_MODE == 1 )); then
             # We won the lock — generate the grid.
             echo "[${TAG}] Array task ${PBS_ARRAY_INDEX:-?} acquired grid-preparation lock."
             rm -f "${GRID_PREP_FAILURE}"
+            if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
+                echo "[${TAG}] FORCE_RESTART: removing existing grid zarr to force regeneration."
+                rm -rf "${GRID_ZARR}"
+            fi
             _prep_rc=0
             if ! is_valid_grid_zarr "${GRID_ZARR}"; then
                 generate_grid_locked || _prep_rc=$?
@@ -467,6 +478,10 @@ elif (( ARRAY_TASK_MODE == 1 )); then
     fi
 else
     # Single-job mode: generate directly.
+    if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
+        echo "[${TAG}] FORCE_RESTART: removing existing grid zarr to force regeneration."
+        rm -rf "${GRID_ZARR}"
+    fi
     if ! is_valid_grid_zarr "${GRID_ZARR}"; then
         generate_grid_locked
     fi
@@ -874,7 +889,7 @@ else
     fi
 
     if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
-        echo "[${TAG}] Force restart requested; clearing previous shard outputs."
+        echo "[${TAG}] FORCE_RESTART: clearing previous shard outputs and merged zarr."
         find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
         rm -f "${MISSING_FILE}" "${PENDING_SHARDS_FILE}" "${NEXT_WORK_ITEM}"
         if [[ -d "${MERGED_ZARR}" ]]; then

@@ -74,7 +74,7 @@ python3 scripts/resolve_shard_layout.py --zarr-path ... --shard-count N
 
 ### PBS / Gadi
 
-Production synthesis uses `turbospectrum_pipeline_example.pbs` or `turbospectrum_regular_grid_example.pbs`. Common overrides via `qsub -v CONFIG_PATH=...,RUN_ROOT=...,WORKERS=32,ROWS_PER_SHARD=128,...`. `FORCE_RESTART=1` discards prior shard outputs; default behavior resumes missing shards. `FINALIZE_ONLY=1` skips synthesis and just validates/merges.
+Production synthesis uses `turbospectrum_pipeline_example.pbs` or `turbospectrum_regular_grid_example.pbs`. Common overrides via `qsub -v CONFIG_PATH=...,RUN_ROOT=...,WORKERS=32,ROWS_PER_SHARD=128,...`. `FORCE_RESTART=1` wipes the grid zarr and regenerates it, then also discards prior shard outputs and the merged zarr (grid is kept intact under `FINALIZE_ONLY=1`); default behavior resumes missing shards. `FINALIZE_ONLY=1` skips synthesis and just validates/merges.
 
 ## Repository Layout (Big Picture)
 
