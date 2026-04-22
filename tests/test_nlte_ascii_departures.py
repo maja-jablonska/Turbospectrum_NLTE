@@ -8,6 +8,7 @@ import numpy as np
 from scripts.generate_grid import _resolve_ml_sampling
 from scripts.nlte_ascii_departures import (
     build_nlte_ascii_selector_columns,
+    ensure_nlte_info_paths_slash_terminated,
     materialize_nlte_info_with_departure_override,
     normalize_nlte_ascii_selector,
     parse_nlte_info_file,
@@ -381,6 +382,69 @@ class NlteAsciiDepartureTests(unittest.TestCase):
             self.assertEqual(row_values["nlte_ascii_abundance_scale"], "relative")
             self.assertEqual(row_values["nlte_ascii_match"], "nearest")
             self.assertAlmostEqual(float(row_values["nlte_ascii_solar_abundance"]), 7.5, places=6)
+
+    def test_ensure_nlte_info_paths_slash_terminated_rewrites_unslashed_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = os.path.join(tmpdir, "SPECIES_LTE_NLTE.dat")
+            with open(base_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# comment\n"
+                    "# path for model atom files     ! don't change this line !\n"
+                    "/abs/DATA/ATOMS\n"
+                    "#\n"
+                    "# path for departure files      ! don't change this line !\n"
+                    "/abs/DATA/DEP\n"
+                    "#\n"
+                    "26\t'Fe'\t'nlte'\t'atom.fe607a'\t'NLTEgrid_Fe_Sun.ascii'\t'ascii'\n"
+                )
+
+            output_root = os.path.join(tmpdir, "tmp")
+            result = ensure_nlte_info_paths_slash_terminated(
+                base_info_path=base_path,
+                output_root=output_root,
+            )
+
+            self.assertNotEqual(result, base_path)
+            with open(result, "r", encoding="utf-8") as handle:
+                rewritten = handle.readlines()
+            model_idx = next(
+                i for i, line in enumerate(rewritten)
+                if line.strip().startswith("# path for model atom files")
+            )
+            depart_idx = next(
+                i for i, line in enumerate(rewritten)
+                if line.strip().startswith("# path for departure files")
+            )
+            self.assertEqual(rewritten[model_idx + 1].rstrip(), "/abs/DATA/ATOMS/")
+            self.assertEqual(rewritten[depart_idx + 1].rstrip(), "/abs/DATA/DEP/")
+            # Non-path content must survive.
+            self.assertTrue(any("atom.fe607a" in line for line in rewritten))
+
+            # Idempotent: second call reuses the cached rewrite.
+            again = ensure_nlte_info_paths_slash_terminated(
+                base_info_path=base_path,
+                output_root=output_root,
+            )
+            self.assertEqual(again, result)
+
+    def test_ensure_nlte_info_paths_slash_terminated_is_noop_when_already_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base_path = os.path.join(tmpdir, "SPECIES_LTE_NLTE.dat")
+            with open(base_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# path for model atom files     ! don't change this line !\n"
+                    "/abs/DATA/ATOMS/\n"
+                    "#\n"
+                    "# path for departure files      ! don't change this line !\n"
+                    "/abs/DATA/DEP/\n"
+                    "#\n"
+                )
+
+            result = ensure_nlte_info_paths_slash_terminated(
+                base_info_path=base_path,
+                output_root=os.path.join(tmpdir, "tmp"),
+            )
+            self.assertEqual(result, os.path.abspath(base_path))
 
     def test_build_abundance_controls_preserves_exact_numeric_strings(self) -> None:
         alpha, r_proc, s_proc, block = _build_abundance_controls(

@@ -8,7 +8,7 @@
 ! unit number to open, file name, 
 !
       implicit none
-      integer iel,iunit,at_number
+      integer iel,iunit,at_number,lp
       logical departbin,nlte_species
       character departurefile*256,nlteinfofile*256,bin_flag*16,
      &          oneline*512,pathmodel*256,pathdepart*256,
@@ -53,13 +53,25 @@
           endif
           modelatomfile=''
           if (at_file.ne.'') then
-            modelatomfile=
-     &       trim(adjustl(pathmodel))//trim(adjustl(at_file))
+            modelatomfile=trim(adjustl(pathmodel))
+            lp=len_trim(modelatomfile)
+            if (lp.gt.0) then
+              if (modelatomfile(lp:lp).ne.'/') then
+                modelatomfile=trim(modelatomfile)//'/'
+              endif
+            endif
+            modelatomfile=trim(modelatomfile)//trim(adjustl(at_file))
           endif
           departurefile=''
           if (dep_file.ne.'') then
-            departurefile=
-     &       trim(adjustl(pathdepart))//trim(adjustl(dep_file))
+            departurefile=trim(adjustl(pathdepart))
+            lp=len_trim(departurefile)
+            if (lp.gt.0) then
+              if (departurefile(lp:lp).ne.'/') then
+                departurefile=trim(departurefile)//'/'
+              endif
+            endif
+            departurefile=trim(departurefile)//trim(adjustl(dep_file))
           endif
           close(iunit)
           return

@@ -685,3 +685,71 @@ def materialize_nlte_info_with_departure_override(
     os.replace(temp_info_path, info_path)
 
     return info_path
+
+
+_NLTE_INFO_PATH_HEADERS = (
+    "# path for model atom files",
+    "# path for departure files",
+)
+
+
+def ensure_nlte_info_paths_slash_terminated(
+    *,
+    base_info_path: str,
+    output_root: str,
+) -> str:
+    """Return an NLTE info file whose `# path for …` lines end with `/`.
+
+    Fortran `read_nlteinfofile.f` concatenates the directory and filename
+    without a separator, so a missing trailing slash yields a broken path like
+    `ATOMSatom.fe607a`. If the source file is already slash-terminated, the
+    source path is returned unchanged. Otherwise a normalized copy is cached
+    under `output_root/nlte_info_normalized/<hash>/` and that path is returned.
+    """
+    resolved = _as_abspath(base_info_path)
+    with open(resolved, "r", encoding="utf-8") as handle:
+        lines = handle.readlines()
+
+    def _path_line_needs_slash(idx: int) -> bool:
+        if idx + 1 >= len(lines):
+            return False
+        value = lines[idx + 1].rstrip("\n\r").rstrip()
+        return bool(value) and not value.endswith("/")
+
+    header_indices: list[int] = []
+    needs_fix = False
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if any(stripped.startswith(h) for h in _NLTE_INFO_PATH_HEADERS):
+            header_indices.append(idx)
+            if _path_line_needs_slash(idx):
+                needs_fix = True
+
+    if not needs_fix:
+        return resolved
+
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+    target_root = os.path.join(_as_abspath(output_root), "nlte_info_normalized", digest)
+    target_path = os.path.join(target_root, os.path.basename(resolved) or "SPECIES_LTE_NLTE.dat")
+    if os.path.isfile(target_path):
+        return target_path
+
+    os.makedirs(target_root, exist_ok=True)
+    new_lines = list(lines)
+    for header_idx in header_indices:
+        path_line_idx = header_idx + 1
+        if path_line_idx >= len(new_lines):
+            continue
+        original = new_lines[path_line_idx]
+        value = original.rstrip("\n\r")
+        stripped_value = value.rstrip()
+        if not stripped_value or stripped_value.endswith("/"):
+            continue
+        trailing = original[len(value):]
+        new_lines[path_line_idx] = stripped_value + "/" + trailing
+
+    temp_path = f"{target_path}.tmp-{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        handle.writelines(new_lines)
+    os.replace(temp_path, target_path)
+    return target_path

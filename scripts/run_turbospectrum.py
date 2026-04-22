@@ -18,6 +18,7 @@ from datetime import datetime
 try:
     from .nlte_ascii_departures import (
         NLTE_ASCII_CONTROL_KEYS,
+        ensure_nlte_info_paths_slash_terminated,
         materialize_nlte_info_with_departure_override,
         read_departure_file_abundance,
         resolve_absolute_abundance,
@@ -27,6 +28,7 @@ try:
 except ImportError:
     from nlte_ascii_departures import (
         NLTE_ASCII_CONTROL_KEYS,
+        ensure_nlte_info_paths_slash_terminated,
         materialize_nlte_info_with_departure_override,
         read_departure_file_abundance,
         resolve_absolute_abundance,
@@ -1685,6 +1687,17 @@ def run_single_synthesis(args):
             nlte_info_file_for_run = str(nlte_ascii_info["nlte_info_file"])
             runtime_abundances[_normalize_abundance_key(nlte_ascii_info["species"])] = (
                 f"{nlte_ascii_info['departure_file_abundance']:+0.3f}"
+            )
+        elif nlte_info_file_for_run and os.path.isfile(nlte_info_file_for_run):
+            # Guard against the Fortran path-concat bug when ASCII materialization
+            # does not run: ensure the NLTE info file's path lines end with '/'.
+            nlte_info_file_for_run = ensure_nlte_info_paths_slash_terminated(
+                base_info_path=nlte_info_file_for_run,
+                output_root=os.path.abspath(
+                    str(config.tmp_dir)
+                    if config.tmp_dir
+                    else os.path.join(config.project_root, "tmp")
+                ),
             )
 
     alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(runtime_abundances)
