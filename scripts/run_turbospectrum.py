@@ -224,7 +224,19 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
             mu_sampling["mode"] = "random"
     flat["mu_sampling"] = mu_sampling
 
-    nlte_cfg = cfg_data.get("nlte", {}) or {}
+    top_nlte_cfg = cfg_data.get("nlte", {}) or {}
+    paths_nlte_cfg = paths.get("nlte", {}) or {}
+    top_has_content = bool(top_nlte_cfg.get("enabled")) or bool(
+        str(top_nlte_cfg.get("nlte_info_file", "")).strip()
+    )
+    if not top_has_content and paths_nlte_cfg:
+        logging.getLogger("turbospectrum").warning(
+            "Config places NLTE settings under 'paths.nlte'; prefer top-level "
+            "'turbospectrum.nlte'. Reading from 'paths.nlte' as a fallback."
+        )
+        nlte_cfg = paths_nlte_cfg
+    else:
+        nlte_cfg = top_nlte_cfg
     flat["nlte"] = nlte_cfg.get("enabled", False)
     flat["nlte_info_file"] = nlte_cfg.get("nlte_info_file", "")
 

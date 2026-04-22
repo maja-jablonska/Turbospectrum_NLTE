@@ -340,6 +340,12 @@ def _normalize_synthesis_overrides(overrides: Mapping[str, Any], cfg_dir: str) -
             value = paths.get(key)
             if isinstance(value, str) and value.strip():
                 paths[key] = _abs_from(cfg_dir, value)
+        paths_nlte = paths.get("nlte")
+        if isinstance(paths_nlte, dict):
+            for key in ("nlte_info_file", "model_atom_file", "departure_file"):
+                value = paths_nlte.get(key)
+                if isinstance(value, str) and value.strip():
+                    paths_nlte[key] = _abs_from(cfg_dir, value)
 
     nlte = normalized.get("nlte")
     if isinstance(nlte, dict):

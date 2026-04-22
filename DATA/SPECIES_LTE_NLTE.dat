@@ -7,7 +7,7 @@
 # atomic number / name / (n)lte / model atom / departure file / binary or ascii departure file
 #
 # path for model atom files     ! don't change this line !
-/g/data/y89/mj8805/DATA/ATOM
+/g/data/y89/mj8805/DATA/ATOMS
 #
 # path for departure files      ! don't change this line !
 /g/data/y89/mj8805/DATA/DEP
