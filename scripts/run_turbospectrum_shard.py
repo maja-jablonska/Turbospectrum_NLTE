@@ -28,6 +28,7 @@ from run_turbospectrum import (  # noqa: E402
     LinelistValidationError,
     TurbospectrumConfig,
     _normalize_config_dict,
+    _scan_available_turb_labels,
     _with_turbospectrum_log_context,
     create_linelist_file,
     determine_worker_count,
@@ -603,6 +604,8 @@ def _synthesis_task(batch):
                     "spectrum": None,
                     "mu_selected": float("nan"),
                     "mu_selected_index": -1,
+                    "t_value": str(result.get("t_value", "") or ""),
+                    "turbvel": str(result.get("turbvel", "") or ""),
                 })
                 continue
         else:
@@ -619,6 +622,8 @@ def _synthesis_task(batch):
                     ),
                     "duration": duration,
                     "spectrum": None,
+                    "t_value": str(result.get("t_value", "") or ""),
+                    "turbvel": str(result.get("turbvel", "") or ""),
                 })
                 continue
 
@@ -631,6 +636,8 @@ def _synthesis_task(batch):
             "spectrum": spectrum,
             "mu_selected": float(mu_selected),
             "mu_selected_index": int(mu_selected_index),
+            "t_value": str(result.get("t_value", "") or ""),
+            "turbvel": str(result.get("turbvel", "") or ""),
         })
 
     return results
@@ -646,6 +653,9 @@ def _build_task_batches(
     tasks: list[list[tuple[int, dict[str, Any]]]] = []
     global_to_local = {int(g): i for i, g in enumerate(indices.tolist())}
     output_name_counts: Dict[str, int] = {}
+    atmosphere_turb_labels = _scan_available_turb_labels(
+        str(getattr(config, "model_atmosphere_path", "") or "")
+    )
 
     for batch_indices in _build_batches(indices, batch_size):
         batch: list[tuple[int, dict[str, Any]]] = []
@@ -656,6 +666,7 @@ def _build_task_batches(
                 row_values,
                 default_output_mode=getattr(config, "output_mode", "Flux"),
                 default_calculation_mode="NLTE" if config.nlte else "LTE",
+                atmosphere_turb_labels=atmosphere_turb_labels,
             )
             output_name_counts[output_stem] = output_name_counts.get(output_stem, 0) + 1
             batch.append((int(global_i), row_values))
@@ -1097,10 +1108,8 @@ def main():
     if "turbvel" not in optional_cols and "t_value" not in optional_cols:
         raise KeyError("Grid Zarr must include either 'turbvel' or 't_value' for synthesis")
 
-    # Exclude the grid's target "mu" from passthrough — mu_selected
-    # (the angle actually used for extraction) is written separately.
     passthrough_cols = sorted(
-        name for name in grid.keys() if name not in set(required_cols + optional_cols) and name != "mu"
+        name for name in grid.keys() if name not in set(required_cols + optional_cols)
     )
     columns = {k: np.asarray(grid[k][indices]) for k in required_cols + optional_cols + passthrough_cols}
 
@@ -1142,6 +1151,8 @@ def main():
     mu_selected = np.full(len(indices), np.nan, dtype=np.float32)
     mu_selected_index = np.full(len(indices), -1, dtype=np.int16)
     base_names = [""] * len(indices)
+    resolved_t_values = [""] * len(indices)
+    resolved_turbvels = [""] * len(indices)
 
     logger.info("Starting synthesis with %d workers", worker_count)
 
@@ -1192,6 +1203,8 @@ def main():
                 statuses[idx] = result["status"]
                 messages[idx] = result["message"]
                 base_names[idx] = str(result.get("base_name", "") or "")
+                resolved_t_values[idx] = str(result.get("t_value", "") or "")
+                resolved_turbvels[idx] = str(result.get("turbvel", "") or "")
                 try:
                     mu_selected[idx] = float(result.get("mu_selected", np.nan))
                 except Exception:
@@ -1287,6 +1300,24 @@ def main():
             _write_string_1d(root, "base_name", base_names, chunks=max(1, min(256, len(base_names))))
         except Exception:
             pass
+
+    # Overwrite turbvel / t_value with the values actually used at synthesis time
+    # (nearest available atmosphere label matched to the row's vmicro).
+    columns = dict(columns)
+    if any(resolved_t_values):
+        original_t_values = np.asarray(columns.get("t_value", np.asarray([""] * len(indices), dtype=object)))
+        merged_t_values = np.asarray(
+            [resolved_t_values[i] or str(original_t_values[i]) for i in range(len(indices))],
+            dtype=object,
+        )
+        columns["t_value"] = merged_t_values
+    if any(resolved_turbvels):
+        original_turbvels = np.asarray(columns.get("turbvel", np.asarray([""] * len(indices), dtype=object)))
+        merged_turbvels = np.asarray(
+            [resolved_turbvels[i] or str(original_turbvels[i]) for i in range(len(indices))],
+            dtype=object,
+        )
+        columns["turbvel"] = merged_turbvels
 
     # Write per-row metadata columns for later merging/QA (best-effort).
     _STRING_METADATA_COLS = {"turbvel", "t_value", "output_mode", "calculation_mode", "mode", "grid_version"}

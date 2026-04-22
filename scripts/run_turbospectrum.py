@@ -8,6 +8,7 @@ import logging
 import re
 import hashlib
 import dataclasses
+import functools
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, List, Tuple, Optional, Dict, Iterator, Mapping, Sequence
@@ -1076,6 +1077,41 @@ def _format_control_abundance_value(raw_value: Any) -> str:
     return _format_abundance_value(raw_value)
 
 
+_ATMOSPHERE_TURB_LABEL_RE = re.compile(r"_t(\d+)_st_")
+
+
+@functools.lru_cache(maxsize=16)
+def _scan_available_turb_labels(atmosphere_path: str) -> Tuple[str, ...]:
+    if not atmosphere_path or not os.path.isdir(atmosphere_path):
+        return ()
+    labels = set()
+    for entry in os.listdir(atmosphere_path):
+        if not entry.endswith(".mod"):
+            continue
+        match = _ATMOSPHERE_TURB_LABEL_RE.search(entry)
+        if match:
+            labels.add(match.group(1))
+    return tuple(sorted(labels, key=lambda x: (int(x), x)))
+
+
+def _nearest_turb_label(vmicro: float, available_labels: Sequence[str]) -> Optional[str]:
+    if not available_labels:
+        return None
+    try:
+        target = float(vmicro)
+    except (TypeError, ValueError):
+        return None
+
+    def sort_key(label: str) -> Tuple[float, int]:
+        try:
+            numeric = float(label)
+        except ValueError:
+            numeric = float("inf")
+        return (abs(numeric - target), int(label) if label.lstrip("+-").isdigit() else 10**9)
+
+    return min(available_labels, key=sort_key)
+
+
 def _normalize_turbulence_id(raw_value: Any, default: str = "01") -> str:
     text = str(raw_value if raw_value is not None else "").strip()
     if not text:
@@ -1236,7 +1272,11 @@ def _fit_stem_to_path_limits(
     return result
 
 
-def _resolve_synthesis_request(params: Mapping[str, Any]) -> Dict[str, Any]:
+def _resolve_synthesis_request(
+    params: Mapping[str, Any],
+    *,
+    atmosphere_turb_labels: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     teff = int(params["teff"])
     logg = float(params["logg"])
     feh = float(params["feh"])
@@ -1254,6 +1294,13 @@ def _resolve_synthesis_request(params: Mapping[str, Any]) -> Dict[str, Any]:
         synthesis_turb_raw = params.get("turbulence")
     if synthesis_turb_raw in (None, ""):
         synthesis_turb_raw = model_turb_str
+
+    if atmosphere_turb_labels:
+        vmicro_numeric = _coerce_microturbulence_value(synthesis_turb_raw, fallback=model_turb_str)
+        nearest = _nearest_turb_label(vmicro_numeric, atmosphere_turb_labels)
+        if nearest is not None:
+            model_turb_str = nearest
+
     abundances = _collect_synthesis_abundances(params)
     return {
         "teff": teff,
@@ -1271,8 +1318,9 @@ def get_synthesis_output_stem_from_params(
     default_output_mode: str = "Flux",
     default_calculation_mode: str = "LTE",
     default_mode: str = "",
+    atmosphere_turb_labels: Optional[Sequence[str]] = None,
 ) -> str:
-    request = _resolve_synthesis_request(params)
+    request = _resolve_synthesis_request(params, atmosphere_turb_labels=atmosphere_turb_labels)
     base_stem = get_synthesis_stem(
         request["teff"],
         request["logg"],
@@ -1543,8 +1591,13 @@ class ModelInterpolator:
 
 def run_single_synthesis(args):
     params, config = args
+    atmosphere_turb_labels = _scan_available_turb_labels(
+        str(getattr(config, "model_atmosphere_path", "") or "")
+    )
     if isinstance(params, Mapping):
-        request = _resolve_synthesis_request(params)
+        request = _resolve_synthesis_request(
+            params, atmosphere_turb_labels=atmosphere_turb_labels
+        )
         teff = request["teff"]
         logg = request["logg"]
         feh = request["feh"]
@@ -1559,6 +1612,13 @@ def run_single_synthesis(args):
         feh = float(feh)
         model_turb_str = _normalize_turbulence_id(model_turb_str)
         synthesis_turb_raw = model_turb_str
+        if atmosphere_turb_labels:
+            vmicro_numeric = _coerce_microturbulence_value(
+                synthesis_turb_raw, fallback=model_turb_str
+            )
+            nearest = _nearest_turb_label(vmicro_numeric, atmosphere_turb_labels)
+            if nearest is not None:
+                model_turb_str = nearest
         synthesis_abundances = {}
         mode_value = None
 
@@ -1587,6 +1647,7 @@ def run_single_synthesis(args):
         },
         default_output_mode=output_mode,
         default_calculation_mode=calculation_mode,
+        atmosphere_turb_labels=atmosphere_turb_labels,
     )
     result_suffix = ".intensity.spec" if output_mode == "Intensity" else ".spec"
     opac_root = os.path.join(config.project_root, config.model_opac_dir)
@@ -1627,6 +1688,8 @@ def run_single_synthesis(args):
                 "abundances": dict(runtime_abundances),
                 **extra_params,
             },
+            "t_value": model_turb_str,
+            "turbvel": str(synthesis_turb_raw) if synthesis_turb_raw is not None else "",
             "status": status,
             "message": message,
             "output_path": output_path,
