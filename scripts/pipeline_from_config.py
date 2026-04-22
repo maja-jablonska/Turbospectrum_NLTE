@@ -112,6 +112,10 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
     """Generate grid outputs and return resolved paths."""
     grid_cfg = dict(pipeline_cfg.get("grid") or {})
     outputs = dict(pipeline_cfg.get("outputs") or {})
+
+    top_nlte_ascii = pipeline_cfg.get("nlte_ascii_departures")
+    if isinstance(top_nlte_ascii, Mapping) and "nlte_ascii_departures" not in grid_cfg:
+        grid_cfg["nlte_ascii_departures"] = dict(top_nlte_ascii)
     grid_synthesis = dict(grid_cfg.get("synthesis") or {})
     ts_synthesis = dict(((pipeline_cfg.get("turbospectrum") or {}).get("synthesis_parameters")) or {})
     ts_mu_sampling = ts_synthesis.get("mu_sampling") or {}
