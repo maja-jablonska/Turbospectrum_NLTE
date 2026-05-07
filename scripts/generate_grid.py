@@ -285,7 +285,14 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
     if sample_mu:
         col_idx += 1
 
-    t_value = _choose_series(config.get("t_value_options", ["01"]), rng, sample_count, "t_value_options")
+    # Snap each row's atmosphere t_value to the option nearest its turbvel,
+    # so the stored label matches what `run_turbospectrum._nearest_turb_label`
+    # picks at synthesis time. Mirrors `synthesize_regular_grid.py`.
+    try:
+        from synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
+    except ImportError:
+        from .synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
+    t_value = nearest_t_value_for_turbvel(turbvel, config.get("t_value_options", ["01"]))
 
     lam_min = float(synthesis_cfg.get("lam_min", 6000))
     lam_max = float(synthesis_cfg.get("lam_max", 6100))

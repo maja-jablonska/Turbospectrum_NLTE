@@ -27,8 +27,52 @@ try:
 except ImportError:
     from nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
 
+try:
+    from .run_turbospectrum import _nearest_turb_label, _normalize_turbulence_id
+except ImportError:
+    from run_turbospectrum import _nearest_turb_label, _normalize_turbulence_id
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+
+
+def nearest_t_value_for_turbvel(turbvel_values: Sequence[Any], t_value_options: Sequence[Any]) -> np.ndarray:
+    """Snap each row's atmosphere t_value label to the closest entry in
+    ``t_value_options`` to its synthesis ``turbvel``.
+
+    The atmosphere file's microturbulence label only takes a few discrete
+    values (e.g. "00","01","02","05"), while turbvel may be any of the
+    sampled options. To minimize the physical mismatch between the chosen
+    atmosphere and the synthesis microturbulence, pick the nearest label
+    per row. Mirrors `run_turbospectrum._nearest_turb_label`, which already
+    does the same for atmosphere selection at synthesis time — keeping the
+    stored t_value column consistent with what synthesis actually uses.
+    """
+    pool = [str(tok).strip() for tok in (t_value_options or []) if str(tok).strip()]
+    if not pool:
+        pool = ["01"]
+    fallback = pool[0]
+    out = np.empty(len(turbvel_values), dtype=object)
+    for i, raw in enumerate(turbvel_values):
+        try:
+            target = float(_normalize_turbulence_id(raw, default=fallback))
+        except (TypeError, ValueError):
+            out[i] = fallback
+            continue
+        nearest = _nearest_turb_label(target, pool)
+        out[i] = nearest if nearest is not None else fallback
+    return out
+
+# Mirror generate_grid.py / sample_machine_learning_grid.py so the regular and
+# LHS paths emit the same param_names ordering for downstream ML code.
+LEGACY_ABUNDANCE_KEYS = ("a", "c", "n", "o", "r", "s")
+
+
+def _ordered_abundance_keys(abund_cfg: Mapping[str, Any]) -> List[str]:
+    configured = {str(key).strip() for key in (abund_cfg or {}).keys() if str(key).strip()}
+    ordered: List[str] = [key for key in LEGACY_ABUNDANCE_KEYS if key in configured]
+    ordered.extend(sorted(configured.difference(ordered)))
+    return ordered
 
 
 def _default_run_root() -> str:
@@ -188,6 +232,7 @@ def _build_regular_columns(
     calculation_mode: str,
     abundances: Dict[str, np.ndarray],
     max_rows: int,
+    t_value_options: Sequence[Any],
     nlte_ascii_selector: Any = None,
 ) -> Dict[str, np.ndarray]:
     # Axes that always participate in the cross-product.
@@ -197,8 +242,10 @@ def _build_regular_columns(
     nu = int(turbvel_axis.size)
     nm = int(mu_axis.size) if mu_axis is not None else 1
 
-    # Abundance axes — each may be a single value or a range.
-    abund_keys = ("a", "c", "n", "o", "r", "s")
+    # Abundance axes — only emit configured ones, matching LHS / generate_grid.py
+    # (sample_machine_learning_grid.py:_ordered_abundance_keys). Axes with zero
+    # configured values are dropped so param_names stays consistent across paths.
+    abund_keys = tuple(k for k in _ordered_abundance_keys(abundances) if int(abundances[k].size) > 0)
     abund_sizes = {k: int(abundances[k].size) for k in abund_keys}
     abund_total = 1
     for sz in abund_sizes.values():
@@ -248,6 +295,14 @@ def _build_regular_columns(
         turbvel = turbvel_base
         mu = None
 
+    # Snap t_value to the available label closest to each row's turbvel. The
+    # atmosphere library only ships a discrete set of microturbulence labels
+    # (t_value_options, e.g. ["00","01","02","05"]); using the nearest one
+    # minimizes the physical mismatch between the chosen atmosphere and the
+    # synthesis microturbulence (and matches what run_turbospectrum does at
+    # synthesis time via _nearest_turb_label).
+    t_value = nearest_t_value_for_turbvel(turbvel, t_value_options)
+
     columns: Dict[str, np.ndarray] = {
         "grid_version": np.full(row_count, str(grid_version), dtype=object),
         "teff": teff,
@@ -257,18 +312,13 @@ def _build_regular_columns(
         "lam_max": np.full(row_count, float(lam_max), dtype=np.float64),
         "lam_step": np.full(row_count, float(lam_step), dtype=np.float64),
         "turbvel": turbvel,
-        # Keep t_value aligned with turbvel for compatibility with older readers.
-        "t_value": turbvel.copy(),
-        "a": abund_columns["a"],
-        "c": abund_columns["c"],
-        "n": abund_columns["n"],
-        "o": abund_columns["o"],
-        "r": abund_columns["r"],
-        "s": abund_columns["s"],
+        "t_value": t_value,
         "output_mode": np.full(row_count, output_mode, dtype=object),
         "mode": np.full(row_count, mode, dtype=object),
         "calculation_mode": np.full(row_count, calculation_mode, dtype=object),
     }
+    for k in abund_keys:
+        columns[k] = abund_columns[k]
     if mu is not None:
         columns["mu"] = mu
     columns.update(build_nlte_ascii_selector_columns(row_count, nlte_ascii_selector))
@@ -390,7 +440,11 @@ def _materialize_synthesis_config(
         mu_sampling = synthesis.setdefault("mu_sampling", {})
         if not isinstance(mu_sampling, dict):
             raise ValueError("synthesis_parameters.mu_sampling must be a JSON object in synthesis config")
-        mu_sampling["mode"] = "nearest"
+        # Match the LHS path: respect a user-set mu_sampling.mode and only fill
+        # in the bounds. synthesize_spectra_from_zarr.py auto-selects "nearest"
+        # whenever a per-row mu column is present, so forcing it here would
+        # silently override an explicit "random"/"target" choice.
+        mu_sampling.setdefault("mode", "nearest")
         mu_sampling.setdefault("count", 1)
         mu_sampling["min"] = mu_min
         mu_sampling["max"] = mu_max
@@ -414,6 +468,14 @@ def main() -> None:
     parser.add_argument("--logg-axis", default=None, help="logg axis (start:end:step or comma list)")
     parser.add_argument("--feh-axis", default=None, help="feh axis (start:end:step or comma list)")
     parser.add_argument("--turbvel-axis", default=None, help="Comma-separated turbvel identifiers")
+    parser.add_argument(
+        "--t-value-options",
+        default=None,
+        help=(
+            "Comma-separated atmosphere t_value identifiers (default ['01']). "
+            "Each row's t_value is snapped to the option closest to that row's turbvel."
+        ),
+    )
     parser.add_argument("--grid-version", default=None)
 
     parser.add_argument("--lam-min", type=float, default=None)
@@ -501,12 +563,35 @@ def main() -> None:
     logg_axis_spec = str(_coalesce(args.logg_axis, cfg, ("grid", "axes", "logg"), "0.0:5.0:0.5"))
     feh_axis_spec = str(_coalesce(args.feh_axis, cfg, ("grid", "axes", "feh"), "-2.5:0.5:0.25"))
     turbvel_axis_spec = str(_coalesce(args.turbvel_axis, cfg, ("grid", "axes", "turbvel"), "01,02,03"))
+    # t_value labels available for the atmosphere library. Each row picks the
+    # entry nearest its turbvel (see `nearest_t_value_for_turbvel`). This pool
+    # is shared with the LHS path through the same config key.
+    t_value_options_raw = _coalesce(args.t_value_options, cfg, ("grid", "axes", "t_value_options"), None)
+    if t_value_options_raw is None:
+        t_value_options_raw = _cfg_get(cfg, ("t_value_options",), ["01"])
+    if isinstance(t_value_options_raw, str):
+        t_value_options = [tok.strip() for tok in t_value_options_raw.split(",") if tok.strip()]
+    elif isinstance(t_value_options_raw, Sequence) and not isinstance(t_value_options_raw, (bytes, bytearray)):
+        t_value_options = [str(tok).strip() for tok in t_value_options_raw if str(tok).strip()]
+    else:
+        t_value_options = ["01"]
+    if not t_value_options:
+        t_value_options = ["01"]
+    # Normalize integer-like tokens to zero-padded labels ("1" -> "01").
+    t_value_options = [
+        f"{int(tok):02d}" if tok.lstrip("+-").isdigit() else tok
+        for tok in t_value_options
+    ]
+
     mu_range_spec_raw = _cfg_get(cfg, ("grid", "synthesis", "mu_range"), None)
     mu_range_spec = None if mu_range_spec_raw in (None, "") else str(mu_range_spec_raw)
     grid_version = str(_coalesce(args.grid_version, cfg, ("grid", "grid_version"), "regular-linear-v1"))
 
-    lam_min = float(_coalesce(args.lam_min, cfg, ("grid", "synthesis", "lam_min"), 8400.0))
-    lam_max = float(_coalesce(args.lam_max, cfg, ("grid", "synthesis", "lam_max"), 8800.0))
+    # Defaults match the LHS path (generate_grid.py:290-292,
+    # sample_machine_learning_grid.py:426-428) so unconfigured runs land at the
+    # same wavelength window and the two paths are comparable out-of-the-box.
+    lam_min = float(_coalesce(args.lam_min, cfg, ("grid", "synthesis", "lam_min"), 6000.0))
+    lam_max = float(_coalesce(args.lam_max, cfg, ("grid", "synthesis", "lam_max"), 6100.0))
     lam_step = float(_coalesce(args.lam_step, cfg, ("grid", "synthesis", "lam_step"), 0.01))
     output_mode = str(_coalesce(args.output_mode, cfg, ("grid", "synthesis", "output_mode"), "Flux"))
     mode = str(_coalesce(args.mode, cfg, ("grid", "synthesis", "mode"), "1D"))
@@ -702,9 +787,23 @@ def main() -> None:
         print(json.dumps(resolved_runtime, sort_keys=True))
         return
 
+    # Mirror LHS column emission: only emit abundance columns that are explicitly
+    # configured via CLI flags or `grid.abundances`. Unconfigured abundances
+    # default to "+0.00" inside `_build_abundance_controls`, so dropping the
+    # column does not change synthesis input — it just makes the stored
+    # param_names match what the LHS path produces.
+    cfg_abund_section = _cfg_get(cfg, ("grid", "abundances"), {}) or {}
+    if not isinstance(cfg_abund_section, Mapping):
+        cfg_abund_section = {}
+    cli_abund_keys = [k for k in LEGACY_ABUNDANCE_KEYS if getattr(args, k, None) is not None]
+    cfg_abund_keys = _ordered_abundance_keys(cfg_abund_section)
+    configured_abund_keys: List[str] = []
+    for k in cli_abund_keys + cfg_abund_keys:
+        if k not in configured_abund_keys:
+            configured_abund_keys.append(k)
     abundances = {
         k: _parse_abundance_spec(_coalesce(getattr(args, k), cfg, ("grid", "abundances", k), "+0.00"), k)
-        for k in ("a", "c", "n", "o", "r", "s")
+        for k in configured_abund_keys
     }
     columns = _build_regular_columns(
         teff_axis=teff_axis,
@@ -720,12 +819,13 @@ def main() -> None:
         mode=mode,
         calculation_mode=calculation_mode,
         abundances=abundances,
+        t_value_options=t_value_options,
         nlte_ascii_selector=nlte_ascii_selector,
         max_rows=max_rows,
     )
 
     abund_axis_parts = "".join(
-        f" {k}={abundances[k].size}" for k in ("a", "c", "n", "o", "r", "s") if abundances[k].size > 1
+        f" {k}={abundances[k].size}" for k in configured_abund_keys if abundances[k].size > 1
     )
     print(
         "[regular-grid] axes: "

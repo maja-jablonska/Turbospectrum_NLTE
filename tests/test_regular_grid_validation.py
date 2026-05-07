@@ -240,6 +240,7 @@ class RegularGridValidationTests(unittest.TestCase):
             self.assertEqual(mu_sampling["max"], 0.8)
 
     def test_build_regular_columns_expands_uniform_mu_axis(self) -> None:
+        abund = {k: np.asarray(["+0.00"], dtype=object) for k in ("a", "c", "n", "o", "r", "s")}
         columns = _build_regular_columns(
             teff_axis=np.asarray([4000, 4250], dtype=np.int64),
             logg_axis=np.asarray([1.0], dtype=np.float64),
@@ -253,12 +254,40 @@ class RegularGridValidationTests(unittest.TestCase):
             output_mode="Intensity",
             mode="1D",
             calculation_mode="LTE",
-            abundances={"a": "+0.00", "c": "+0.00", "n": "+0.00", "o": "+0.00", "r": "+0.00", "s": "+0.00"},
+            abundances=abund,
             max_rows=100,
+            t_value_options=["01"],
         )
 
         np.testing.assert_array_equal(columns["teff"], np.asarray([4000, 4000, 4250, 4250], dtype=np.int64))
         np.testing.assert_allclose(columns["mu"], np.asarray([0.2, 0.8, 0.2, 0.8], dtype=np.float64))
+
+    def test_build_regular_columns_snaps_t_value_to_nearest_turbvel(self) -> None:
+        abund = {"a": np.asarray(["+0.00"], dtype=object)}
+        columns = _build_regular_columns(
+            teff_axis=np.asarray([5000], dtype=np.int64),
+            logg_axis=np.asarray([4.0], dtype=np.float64),
+            feh_axis=np.asarray([0.0], dtype=np.float64),
+            turbvel_axis=np.asarray(["01", "02", "03", "05"], dtype=object),
+            mu_axis=None,
+            grid_version="regular-linear-v1",
+            lam_min=6000.0,
+            lam_max=6100.0,
+            lam_step=0.01,
+            output_mode="Flux",
+            mode="1D",
+            calculation_mode="LTE",
+            abundances=abund,
+            max_rows=100,
+            t_value_options=["00", "01", "02", "05"],
+        )
+
+        # turbvel=03 has equal distance to 02 and 05 — _nearest_turb_label
+        # tie-breaks toward the smaller integer, so 02.
+        np.testing.assert_array_equal(
+            columns["t_value"],
+            np.asarray(["01", "02", "02", "05"], dtype=object),
+        )
 
     def test_pipeline_temp_turbospectrum_config_applies_base_config_and_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

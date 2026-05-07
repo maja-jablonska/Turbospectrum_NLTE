@@ -517,7 +517,14 @@ def main() -> None:
     else:
         turbvel_series = _choose_series(turbvel_cfg, rng, sample_count_new, "turbvel")
 
-    t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
+    # Snap each row's atmosphere t_value to the option nearest its turbvel,
+    # so the stored label matches what `run_turbospectrum._nearest_turb_label`
+    # picks at synthesis time. Mirrors `synthesize_regular_grid.py`.
+    try:
+        from synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
+    except ImportError:
+        from .synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
+    t_value_series = nearest_t_value_for_turbvel(turbvel_series, t_value_options)
 
     t_step = time.perf_counter()
     abundance_columns = {
