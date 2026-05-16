@@ -540,6 +540,7 @@ def main() -> None:
     parser.add_argument("--config", default=None, help="Turbospectrum synthesis config JSON path")
     parser.add_argument("--spectra-zarr", default=None, help="Output synthesized spectra Zarr path")
     parser.add_argument("--scratch", default=None, help="Optional scratch directory passed to synthesis")
+    parser.add_argument("--no-scratch", action="store_true", help="Disable automatic scratch override (e.g. to use paths from config)")
     parser.add_argument("--workers", type=int, default=None, help="Worker count passed to synthesis")
     parser.add_argument("--chunk-rows", type=int, default=None, help="Output Zarr chunk_rows for synthesis output")
     parser.add_argument("--output-tmp", default=None, help="Atomic tmp output path passed as --output-tmp")
@@ -884,6 +885,8 @@ def main() -> None:
         cmd.extend(["--workers", str(workers)])
     if scratch:
         cmd.extend(["--scratch", scratch])
+    if args.no_scratch:
+        cmd.append("--no-scratch")
     if output_tmp:
         cmd.extend(["--output-tmp", output_tmp])
     if log_file:

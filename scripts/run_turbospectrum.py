@@ -375,6 +375,10 @@ class TurbospectrumConfig:
     # Output mode
     output_mode: str = "Flux"
     mu_angles: List[float] = field(default_factory=list)
+    # Optional path to a `mupoints.dat` file (line 1: count, line 2: mu values).
+    # When set and output_mode='Intensity', bsyn computes intensities at exactly
+    # those mu points instead of the 12 Gauss-Radau default.
+    mu_points_file: str = ""
     # Optional post-processing configuration for intensity outputs.
     # Expected shape (all keys optional):
     #   {"mode": "nearest", "count": 1, "seed": 123, "min": 0.0, "max": 1.0, "reduce": "first"}
@@ -1914,13 +1918,19 @@ def run_single_synthesis(args):
                 "bsyn %s [%s]: lambda_min=%.4f lambda_max=%.4f lambda_step=%.6f",
                 base_name, mode_str, config.lambda_min, config.lambda_max, config.lambda_step,
             )
+            # NB: 'SPHERICAL:' consumes the next four numeric lines from stdin
+            # (mihal/taum/ncore/diflog), so any extra directive must appear
+            # before it. See source/input.f at the SPHERICAL branch.
+            mu_points_line = ""
+            if mode_str == "Intensity" and getattr(config, "mu_points_file", ""):
+                mu_points_line = f"'MU-POINTS:' '{config.mu_points_file}'\n"
             bsyn_input = f"""'NLTE :'          '{'.true.' if config.nlte else '.false.'}'
 'NLTEINFOFILE:'  '{nlte_info_file_for_run if config.nlte else (config.nlte_info_file if config.nlte_info_file else 'DATA/SPECIES_LTE_NLTE.dat')}'
 'LAMBDA_MIN:'     '{config.lambda_min}'
 'LAMBDA_MAX:'     '{config.lambda_max}'
 'LAMBDA_STEP:'    '{config.lambda_step}'
 'INTENSITY/FLUX:' '{mode_str}'
-'MODELOPAC:' '{opac_path}'
+{mu_points_line}'MODELOPAC:' '{opac_path}'
 'RESULTFILE :' '{current_result_file}'
 'ABUND_SOURCE:'   'magg'
 'METALLICITY:'    '{feh}'

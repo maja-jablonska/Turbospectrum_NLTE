@@ -757,6 +757,7 @@ def main():
     )
 
     parser.add_argument("--scratch", default=None)
+    parser.add_argument("--no-scratch", action="store_true", help="Disable automatic scratch override (e.g. to use paths from config)")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
         "--max-failures",
@@ -826,7 +827,7 @@ def main():
     # Auto scratch
     ############################################
 
-    if args.scratch is None:
+    if args.scratch is None and not args.no_scratch:
         jobfs = os.environ.get("PBS_JOBFS")
         if jobfs:
             args.scratch = jobfs
@@ -866,7 +867,7 @@ def main():
         json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
     )
 
-    if args.scratch:
+    if args.scratch and not args.no_scratch:
         scratch = os.path.abspath(args.scratch)
 
         config.tmp_dir = os.path.join(scratch, "tmp")

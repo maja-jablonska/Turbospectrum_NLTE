@@ -1006,6 +1006,7 @@ def main() -> None:
         help="Temp path for atomic write: write to TMP_PATH, then rename to --output-zarr. Prevents partial outputs.",
     )
     parser.add_argument("--scratch", default=None, help="Optional node-local scratch dir to reduce shared FS I/O")
+    parser.add_argument("--no-scratch", action="store_true", help="Disable automatic scratch override (e.g. to use paths from config)")
     parser.add_argument("--workers", type=int, default=None, help="Override worker process count")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     parser.add_argument("--log-file", default=None, help="Optional log file path")
@@ -1049,7 +1050,7 @@ def main() -> None:
 
     config = _load_config(args.config, project_root=project_root)
     logger.info("mu_sampling=%s", json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True))
-    if args.scratch:
+    if args.scratch and not args.no_scratch:
         scratch = os.path.abspath(args.scratch)
         os.makedirs(scratch, exist_ok=True)
         # Redirect I/O-heavy directories to scratch to reduce shared FS contention.
@@ -1057,6 +1058,10 @@ def main() -> None:
         config.log_dir = os.path.join(scratch, "logs")
         config.output_dir = os.path.join(scratch, "spectra")
         config.model_opac_dir = os.path.join(scratch, "opac")
+        logger.info(
+            "Scratch override — effective paths: output_dir=%s  tmp_dir=%s  log_dir=%s",
+            config.output_dir, config.tmp_dir, config.log_dir,
+        )
     ensure_directories(config)
     validate_runtime_environment(config)
     try:

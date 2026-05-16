@@ -282,6 +282,7 @@ def main() -> None:
 
     parser.add_argument("--workers", type=int, default=None, help="Override worker process count")
     parser.add_argument("--scratch", default=None, help="Optional scratch dir (passed through to synthesis)")
+    parser.add_argument("--no-scratch", action="store_true", help="Disable automatic scratch override (e.g. to use paths from config)")
     parser.add_argument(
         "--output",
         default=None,
@@ -339,6 +340,8 @@ def main() -> None:
             cmd += ["--workers", str(workers)]
         if scratch:
             cmd += ["--scratch", str(scratch)]
+        if args.no_scratch:
+            cmd.append("--no-scratch")
         if args.output_tmp:
             cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
         _run(cmd)
@@ -378,6 +381,8 @@ def main() -> None:
         cmd += ["--workers", str(workers)]
     if scratch:
         cmd += ["--scratch", str(scratch)]
+    if args.no_scratch:
+        cmd.append("--no-scratch")
     if args.output_tmp:
         cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
     _run(cmd)
