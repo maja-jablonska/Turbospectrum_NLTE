@@ -109,6 +109,7 @@ WORKERS_OVERRIDE="${WORKERS:-}"
 SHARD_COUNT_OVERRIDE="${SHARD_COUNT:-}"
 ROWS_PER_SHARD_OVERRIDE="${ROWS_PER_SHARD:-}"
 FINALIZE_ONLY="${FINALIZE_ONLY:-0}"
+NO_SCRATCH="${NO_SCRATCH:-0}"
 FORCE_RESTART="${FORCE_RESTART:-0}"
 ALLOW_PARTIAL_MERGE="${ALLOW_PARTIAL_MERGE:-1}"
 ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
@@ -648,15 +649,21 @@ if (( ARRAY_TASK_MODE == 1 )); then
     echo "[${TAG}] Shard index: ${SHARD_INDEX}"
     echo "[${TAG}] Scratch: ${SCRATCH}"
 
+    local no_scratch_flag=""
+    if [[ "$(to_bool01 "${NO_SCRATCH}")" -eq 1 ]]; then
+        no_scratch_flag="--no-scratch"
+    fi
+
     "${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
         --config "${CONFIG_PATH}" \
         --skip-grid \
         --synthesis-mode sharded \
         --shard-index "${SHARD_INDEX}" \
         --shard-count "${SHARD_COUNT}" \
-        --workers "${WORKERS}" \
         --scratch "${SCRATCH}" \
-        --output "${TMP_OUT}"
+        --output "${TMP_OUT}" \
+        ${no_scratch_flag} \
+        2>&1 | tee "${LOG_FILE}"
 
     rm -rf "${SCRATCH}"
     # Array tasks exit here; submit a FINALIZE_ONLY job after all tasks complete.
@@ -858,6 +865,11 @@ else
             attempt_scratch="${scratch_root}/shard_${shard}_a${attempt}"
             mkdir -p "${attempt_scratch}"
 
+            local no_scratch_flag=""
+            if [[ "$(to_bool01 "${NO_SCRATCH}")" -eq 1 ]]; then
+                no_scratch_flag="--no-scratch"
+            fi
+
             if "${PYTHON}" "${REPO}/scripts/pipeline_from_config.py" \
                 --config "${CONFIG_PATH}" \
                 --skip-grid \
@@ -867,6 +879,7 @@ else
                 --workers 1 \
                 --scratch "${attempt_scratch}" \
                 --output "${tmp_out}" \
+                ${no_scratch_flag} \
                 >> "${log_file}" 2>&1; then
                 end=$(date +%s)
                 echo "runtime_seconds=$((end-start)) attempt=${attempt}" >> "${log_file}"

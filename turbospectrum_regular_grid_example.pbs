@@ -96,6 +96,7 @@ WORKERS_OVERRIDE="${WORKERS:-}"
 SHARD_COUNT_OVERRIDE="${SHARD_COUNT:-}"
 ROWS_PER_SHARD_OVERRIDE="${ROWS_PER_SHARD:-}"
 SKIP_SYNTHESIS_OVERRIDE="${SKIP_SYNTHESIS:-}"
+NO_SCRATCH="${NO_SCRATCH:-0}"
 FINALIZE_ONLY="${FINALIZE_ONLY:-0}"
 FORCE_RESTART="${FORCE_RESTART:-0}"
 ALLOW_PARTIAL_MERGE="${ALLOW_PARTIAL_MERGE:-1}"
@@ -917,6 +918,11 @@ run_shard_attempts () {
                 "${shard}" "${attempt}" "${max_attempts}" "${worker_count}" "${attempt_scratch}" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
         } >> "${log_file}"
 
+        local no_scratch_flag=""
+        if [[ "$(to_bool01 "${NO_SCRATCH}")" -eq 1 ]]; then
+            no_scratch_flag="--no-scratch"
+        fi
+
         if "${PYTHON}" "${REPO}/scripts/run_turbospectrum_shard.py" \
             --grid-zarr "${GRID_ZARR}" \
             --config "${SYNTH_CONFIG_PATH}" \
@@ -927,6 +933,7 @@ run_shard_attempts () {
             --scratch "${attempt_scratch}" \
             --max-failures "${MAX_FAILURES}" \
             --log-level "${SYNTH_LOG_LEVEL}" \
+            ${no_scratch_flag} \
             >> "${log_file}" 2>&1; then
             end=$(date +%s)
             {
