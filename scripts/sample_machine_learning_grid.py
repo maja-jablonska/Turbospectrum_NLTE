@@ -15,17 +15,17 @@ import json
 import os
 import logging
 import time
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Sequence
 
 import numpy as np
 import polars as pl
 import zarr
-from numcodecs import Blosc, VLenUTF8
+from numcodecs import VLenUTF8
 
 try:
-    from .nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+    from .nlte_ascii_departures import normalize_nlte_ascii_selector
 except ImportError:
-    from nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+    from nlte_ascii_departures import normalize_nlte_ascii_selector
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -129,103 +129,6 @@ def _load_config(config_path: str) -> Dict:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     with open(config_path, "r", encoding="utf-8") as handle:
         return json.load(handle)
-
-
-def _latin_hypercube(bounds: Iterable[Tuple[float, float]], samples: int, rng: np.random.Generator) -> np.ndarray:
-    bounds = list(bounds)
-    if samples <= 0:
-        raise ValueError("Number of samples must be positive")
-    if not bounds:
-        raise ValueError("At least one dimension must be provided for sampling")
-
-    dims = len(bounds)
-    lhs = np.empty((samples, dims), dtype=float)
-    for dim, (lower, upper) in enumerate(bounds):
-        if upper <= lower:
-            raise ValueError(f"Upper bound must exceed lower bound for dimension {dim}: {lower} >= {upper}")
-        stratified = (rng.random(samples) + np.arange(samples)) / samples
-        rng.shuffle(stratified)
-        lhs[:, dim] = lower + stratified * (upper - lower)
-    return lhs
-
-
-def _choose_series(raw_value, rng: np.random.Generator, length: int, name: str) -> np.ndarray:
-    if isinstance(raw_value, Sequence) and not isinstance(raw_value, (str, bytes)):
-        if not raw_value:
-            raise ValueError(f"Configuration for '{name}' lists no options")
-        return rng.choice(np.asarray(raw_value, dtype=object), size=length)
-    if raw_value is None:
-        raise ValueError(f"Configuration for '{name}' is missing")
-    return np.full(length, raw_value, dtype=object)
-
-
-def _abundance_value(raw_value) -> str:
-    if raw_value is None:
-        return "+0.00"
-    return f"{float(raw_value):+0.2f}" if isinstance(raw_value, (int, float, np.floating)) else str(raw_value)
-
-
-def _validate_turbvel_options(raw_options) -> List[str]:
-    if raw_options is None:
-        return sorted(ALLOWED_TURBVEL)
-    if isinstance(raw_options, (str, bytes)):
-        raw_options = [raw_options]
-    options = []
-    for entry in raw_options:
-        value = f"{int(entry):02d}" if isinstance(entry, (int, float, np.integer, np.floating)) else str(entry)
-        if value not in ALLOWED_TURBVEL:
-            raise ValueError(f"Turbvel option '{value}' is invalid. Allowed options: {sorted(ALLOWED_TURBVEL)}")
-        if value not in options:
-            options.append(value)
-    if not options:
-        raise ValueError("At least one turbvel option must be provided when sampling turbvel")
-    return options
-
-
-def _resolve_bounds(config: Dict) -> List[Tuple[float, float]]:
-    bounds_cfg = config.get("bounds") or {}
-    ordered_names = ["teff", "logg", "feh"]
-    bounds: List[Tuple[float, float]] = []
-    for name in ordered_names:
-        spec = bounds_cfg.get(name)
-        if not spec or "min" not in spec or "max" not in spec:
-            raise ValueError(f"Bounds for '{name}' must include 'min' and 'max'")
-        bounds.append((float(spec["min"]), float(spec["max"])))
-    return bounds
-
-
-def _ordered_abundance_keys(abundances_cfg: Dict[str, Any]) -> List[str]:
-    configured = {str(key).strip() for key in (abundances_cfg or {}).keys() if str(key).strip()}
-    ordered: List[str] = [key for key in LEGACY_ABUNDANCE_KEYS if key in configured]
-    ordered.extend(sorted(configured.difference(ordered)))
-    return ordered
-
-
-def _resolve_sampling_dimensions(config: Dict) -> Tuple[List[Tuple[float, float]], List[str], Dict[str, str], List[str] | None]:
-    bounds = _resolve_bounds(config)
-
-    abundances_cfg = config.get("abundances", {})
-    sampled_abundances: List[str] = []
-    fixed_abundances: Dict[str, str] = {}
-    for element in _ordered_abundance_keys(abundances_cfg):
-        raw_val = abundances_cfg.get(element)
-        if isinstance(raw_val, dict):
-            if "min" not in raw_val or "max" not in raw_val:
-                raise ValueError(f"Abundance bounds for '{element}' must include 'min' and 'max'")
-            bounds.append((float(raw_val["min"]), float(raw_val["max"])))
-            sampled_abundances.append(element)
-        else:
-            fixed_abundances[element] = _abundance_value(raw_val)
-
-    turbvel_cfg = config.get("turbvel", "01")
-    sample_turbvel = bool(config.get("sample_turbvel", False))
-    turbvel_options = None
-    if sample_turbvel:
-        options_raw = config.get("turbvel_options", turbvel_cfg if isinstance(turbvel_cfg, Sequence) and not isinstance(turbvel_cfg, (str, bytes)) else None)
-        turbvel_options = _validate_turbvel_options(options_raw)
-        bounds.append((0, float(len(turbvel_options))))
-
-    return bounds, sampled_abundances, fixed_abundances, turbvel_options
 
 
 def _default_index_parquet_path(zarr_path: str) -> str:
@@ -371,26 +274,36 @@ def main() -> None:
     sample_count = args.samples or int(config.get("num_samples", 50))
     seed = config.get("seed")
     rng = np.random.default_rng(seed)
-    nlte_ascii_cfg = config.get("nlte_ascii_departures") or {}
+    # Merge CLI NLTE-ASCII overrides into the config so the shared sampler
+    # (generate_grid.resolve_grid_columns) produces matching selector columns.
+    nlte_ascii_cfg = dict(config.get("nlte_ascii_departures") or {})
+    _nlte_cli = {
+        "directory": args.nlte_ascii_dir,
+        "species": args.nlte_ascii_species,
+        "abundance_column": args.nlte_ascii_abundance_column,
+        "abundance_scale": args.nlte_ascii_abundance_scale,
+        "solar_abundance": args.nlte_ascii_solar_abundance,
+        "match": args.nlte_ascii_match,
+    }
+    nlte_ascii_cfg.update({k: v for k, v in _nlte_cli.items() if v is not None})
+    # A CLI --nlte-ascii-dir is resolved relative to CWD; a config value is
+    # resolved relative to the config dir (matches the previous behaviour).
+    nlte_base_dir = None if args.nlte_ascii_dir is not None else cfg_dir
+
+    effective_config = dict(config)
+    effective_config["nlte_ascii_departures"] = nlte_ascii_cfg
+    if args.samples:
+        effective_config["num_samples"] = int(args.samples)
+
+    # Built only for logging; the sampler rebuilds it internally from the config.
     nlte_ascii_selector = normalize_nlte_ascii_selector(
-        directory=args.nlte_ascii_dir if args.nlte_ascii_dir is not None else nlte_ascii_cfg.get("directory"),
-        species=args.nlte_ascii_species if args.nlte_ascii_species is not None else nlte_ascii_cfg.get("species"),
-        abundance_column=(
-            args.nlte_ascii_abundance_column
-            if args.nlte_ascii_abundance_column is not None
-            else nlte_ascii_cfg.get("abundance_column")
-        ),
-        abundance_scale=(
-            args.nlte_ascii_abundance_scale
-            if args.nlte_ascii_abundance_scale is not None
-            else nlte_ascii_cfg.get("abundance_scale")
-        ),
-        solar_abundance=(
-            args.nlte_ascii_solar_abundance
-            if args.nlte_ascii_solar_abundance is not None
-            else nlte_ascii_cfg.get("solar_abundance")
-        ),
-        match=args.nlte_ascii_match if args.nlte_ascii_match is not None else nlte_ascii_cfg.get("match"),
+        directory=nlte_ascii_cfg.get("directory"),
+        species=nlte_ascii_cfg.get("species"),
+        abundance_column=nlte_ascii_cfg.get("abundance_column"),
+        abundance_scale=nlte_ascii_cfg.get("abundance_scale"),
+        solar_abundance=nlte_ascii_cfg.get("solar_abundance"),
+        match=nlte_ascii_cfg.get("match"),
+        base_dir=nlte_base_dir,
     )
 
     logger.info("Loaded config: %s", os.path.abspath(args.config))
@@ -405,36 +318,6 @@ def main() -> None:
             nlte_ascii_selector.abundance_scale,
             nlte_ascii_selector.match,
         )
-
-    t_step = time.perf_counter()
-    bounds, sampled_abundances, fixed_abundances, sampled_turbvel_options = _resolve_sampling_dimensions(config)
-    logger.debug("Fixed abundances: %s", fixed_abundances)
-    logger.debug("turbvel sampled options: %s", sampled_turbvel_options)
-    logger.debug("t_value_options: %s", config.get("t_value_options", ["01"]))
-    logger.info(
-        "Sampling dims: teff/logg/feh + sampled_abundances=%s + sample_turbvel=%s",
-        sampled_abundances,
-        bool(sampled_turbvel_options),
-    )
-    logger.info("Prepared sampling dimensions in %.2fs", time.perf_counter() - t_step)
-
-    t_step = time.perf_counter()
-    lhs = _latin_hypercube(bounds, sample_count, rng)
-    logger.info("Generated Latin hypercube in %.2fs", time.perf_counter() - t_step)
-
-    synthesis_cfg = config.get("synthesis", {})
-    lam_min = synthesis_cfg.get("lam_min", 6000)
-    lam_max = synthesis_cfg.get("lam_max", 6100)
-    lam_step = synthesis_cfg.get("lam_step", 0.01)
-    output_mode = synthesis_cfg.get("output_mode", "Flux")
-
-    abundances = config.get("abundances", {})
-
-    grid_version = config.get("grid_version", "ml-sample")
-    mode = synthesis_cfg.get("mode", config.get("mode", "1D"))
-    calculation_mode = synthesis_cfg.get("calculation_mode", config.get("calculation_mode", "LTE"))
-    turbvel_cfg = config.get("turbvel", "01")
-    t_value_options = config.get("t_value_options", ["01"])
 
     run_root_cfg = config.get("run_root")
     if run_root_cfg not in (None, ""):
@@ -491,67 +374,26 @@ def main() -> None:
         logger.info("Resuming: existing_rows=%d adding=%d", existing_rows, sample_count - existing_rows)
         logger.info("Resume preflight in %.2fs", time.perf_counter() - t_step)
 
-    lhs = lhs[existing_rows:]
-    sample_count_new = lhs.shape[0]
-    logger.info("Generating %d new rows", sample_count_new)
-
-    column_idx = 0
-    int_teff = np.rint(lhs[:, column_idx]).astype(int)
-    column_idx += 1
-    logg_vals = np.round(lhs[:, column_idx], 3)
-    column_idx += 1
-    feh_vals = np.round(lhs[:, column_idx], 3)
-    column_idx += 1
-
-    abundance_samples: Dict[str, np.ndarray] = {}
-    for element in sampled_abundances:
-        abundance_values = np.round(lhs[:, column_idx], 2)
-        abundance_samples[element] = np.array([f"{val:+0.2f}" for val in abundance_values], dtype=object)
-        column_idx += 1
-
-    if sampled_turbvel_options:
-        turbvel_indices = np.floor(lhs[:, column_idx]).astype(int)
-        turbvel_indices = np.clip(turbvel_indices, 0, len(sampled_turbvel_options) - 1)
-        turbvel_series = np.asarray([sampled_turbvel_options[idx] for idx in turbvel_indices], dtype=object)
-        column_idx += 1
-    else:
-        turbvel_series = _choose_series(turbvel_cfg, rng, sample_count_new, "turbvel")
-
-    # Snap each row's atmosphere t_value to the option nearest its turbvel,
-    # so the stored label matches what `run_turbospectrum._nearest_turb_label`
-    # picks at synthesis time. Mirrors `synthesize_regular_grid.py`.
+    # Single LHS implementation: delegate sampling to generate_grid so the
+    # standalone CLI and the pipeline share one sampler. resolve_grid_columns
+    # also snaps t_value, emits the NLTE-ASCII selector columns, and runs the
+    # MARCS-envelope check. The full target grid is generated deterministically
+    # (seeded); --resume slices off the rows already written.
     try:
-        from synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
+        from generate_grid import resolve_grid_columns  # type: ignore
     except ImportError:
-        from .synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
-    t_value_series = nearest_t_value_for_turbvel(turbvel_series, t_value_options)
+        from .generate_grid import resolve_grid_columns  # type: ignore
 
     t_step = time.perf_counter()
-    abundance_columns = {
-        element: abundance_samples.get(
-            element,
-            np.full(sample_count_new, fixed_abundances.get(element, "+0.00"), dtype=object),
-        )
-        for element in _ordered_abundance_keys(abundances)
-    }
-    columns = {
-        "grid_version": np.full(sample_count_new, grid_version, dtype=object),
-        "teff": int_teff,
-        "logg": logg_vals,
-        "feh": feh_vals,
-        "lam_min": np.full(sample_count_new, lam_min, dtype=float),
-        "lam_max": np.full(sample_count_new, lam_max, dtype=float),
-        "lam_step": np.full(sample_count_new, lam_step, dtype=float),
-        "turbvel": turbvel_series,
-        "t_value": t_value_series,
-        **abundance_columns,
-        "output_mode": np.full(sample_count_new, output_mode, dtype=object),
-        "mode": np.full(sample_count_new, mode, dtype=object),
-        "calculation_mode": np.full(sample_count_new, calculation_mode, dtype=object),
-    }
-    columns.update(build_nlte_ascii_selector_columns(sample_count_new, nlte_ascii_selector))
+    columns_full = resolve_grid_columns(effective_config, rng=rng, base_dir=nlte_base_dir)
+    logger.info("Sampled %d-row grid in %.2fs", len(columns_full["teff"]), time.perf_counter() - t_step)
+
+    columns = {name: np.asarray(values)[existing_rows:] for name, values in columns_full.items()}
+    sample_count_new = len(columns["teff"])
+    logger.info("Generating %d new rows", sample_count_new)
+
     df = pl.DataFrame(columns)
-    logger.info("Built Polars DataFrame (%d rows, %d cols) in %.2fs", df.height, len(df.columns), time.perf_counter() - t_step)
+    logger.info("Built Polars DataFrame (%d rows, %d cols)", df.height, len(df.columns))
 
     compression_kwargs = _zarr_compression_kwargs(zarr_compressor_cfg)
     logger.debug("Zarr compression kwargs: %s", compression_kwargs)

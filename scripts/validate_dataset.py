@@ -23,6 +23,7 @@ SHARD_REGEX = re.compile(r"spectra_shard_(\d+)\.zarr")
 PROVENANCE_FILENAMES = (
     "canonical_config.yaml",
     "synthesis_config.yaml",
+    "input_config.json",
     "linelist_manifest.json",
     "atmosphere_manifest.json",
     "software_manifest.json",
@@ -153,7 +154,7 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
                 return False, {"missing_provenance_files": missing_files}
 
             # Basic payload sanity: manifests should be non-empty and JSON parseable.
-            for name in ("canonical_config.yaml", "synthesis_config.yaml", "linelist_manifest.json", "atmosphere_manifest.json", "software_manifest.json"):
+            for name in ("canonical_config.yaml", "synthesis_config.yaml", "input_config.json", "linelist_manifest.json", "atmosphere_manifest.json", "software_manifest.json"):
                 try:
                     raw = provenance[name][...]
                     text = str(raw.item() if hasattr(raw, "item") else raw).strip()

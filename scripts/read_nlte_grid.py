@@ -13,7 +13,8 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     tqdm = None  # type: ignore
 
-import matplotlib.pyplot as plt
+# matplotlib is only needed for plot_departure_coefficients; import it lazily there
+# so that reading/exporting grids does not require a plotting backend.
 
 # Reasonable upper bounds to catch bad pointers / corrupt headers before huge allocations
 _MAX_NDEP = 4096
@@ -175,6 +176,7 @@ def write_departures_for_ts(fileName, tau, depart, abund):
 
 def plot_departure_coefficients(depart, tau, atmosStr, levels_to_plot):
     # plot departure coefficients
+    import matplotlib.pyplot as plt
 
     # if levels_to_plot is int, convert to list
     if isinstance(levels_to_plot, int):

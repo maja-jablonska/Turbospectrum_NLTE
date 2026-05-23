@@ -9,6 +9,7 @@ import re
 import hashlib
 import dataclasses
 import functools
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, List, Tuple, Optional, Dict, Iterator, Mapping, Sequence
@@ -1593,6 +1594,53 @@ class ModelInterpolator:
             
         return True, "Success"
 
+# bsyn allocates muoutp(30) in source/input.f, so at most 30 mu points may be
+# requested per synthesis (see the COS(THETA)/MU-POINTS branch in input.f).
+_MAX_MU_POINTS = 30
+
+
+def _coerce_mu_points(values: Sequence[Any]) -> List[float]:
+    """Validate explicit mu points for an Intensity synthesis.
+
+    mu is the cosine of the limb angle, so it is physically confined to [0, 1].
+    bsyn interpolates intensities to whatever mu values it is handed
+    (source/bsyn.f), so the points below are computed *exactly* rather than
+    snapped to the 12 Gauss-Radau defaults. Returns a de-duplicated, ascending
+    list and raises on out-of-domain, non-finite, or over-count input.
+    """
+    mus: List[float] = []
+    for raw in values:
+        if raw in (None, ""):
+            continue
+        mu = float(raw)
+        if not math.isfinite(mu):
+            raise ValueError(f"mu points must all be finite; got {raw!r}")
+        if mu < -1e-8 or mu > 1.0 + 1e-8:
+            raise ValueError(
+                f"mu points must lie in [0, 1] (cosine of the limb angle); got {mu}"
+            )
+        mus.append(min(1.0, max(0.0, mu)))
+    # De-duplicate (deterministic ascending order) so a shared mu axis maps to a
+    # single bsyn call and the count stays within the muoutp(30) limit.
+    unique = sorted({round(m, 9) for m in mus})
+    if len(unique) > _MAX_MU_POINTS:
+        raise ValueError(
+            f"{len(unique)} distinct mu points requested but bsyn supports at most "
+            f"{_MAX_MU_POINTS} (muoutp(30) in source/input.f)"
+        )
+    return unique
+
+
+def _write_mu_points_file(mus: Sequence[float], out_dir: str, stem: str) -> str:
+    """Write a bsyn MU-POINTS file (line 1 = count, line 2 = mu values)."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{stem}.mupoints.dat")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(f"{len(mus)}\n")
+        handle.write(", ".join(f"{float(m):.6f}" for m in mus) + "\n")
+    return path
+
+
 def run_single_synthesis(args):
     params, config = args
     atmosphere_turb_labels = _scan_available_turb_labels(
@@ -1634,6 +1682,30 @@ def run_single_synthesis(args):
 
     output_mode = _normalize_output_mode(getattr(config, "output_mode", "Flux"))
     calculation_mode = "NLTE" if config.nlte else "LTE"
+
+    # Resolve the mu points bsyn should compute for Intensity output, so the
+    # requested mu are synthesised exactly instead of being snapped to bsyn's
+    # 12 Gauss-Radau defaults. Priority:
+    #   1. config.mu_points_file -- caller already wrote the file (spectrum_api).
+    #   2. mu_sampling["points"] -- a shared mu axis (regular grid); one bsyn call
+    #      emits every column and is shared across the physical point's mu-rows,
+    #      so the output stem stays mu-independent.
+    #   3. params["mu"] -- a per-row mu (LHS / arbitrary); bsyn emits exactly that
+    #      one value. The stem is otherwise mu-independent, so tag it to keep
+    #      distinct mu for the same physical point from colliding on disk.
+    explicit_mu_file = str(getattr(config, "mu_points_file", "") or "")
+    requested_mu_points: Optional[List[float]] = None
+    mu_stem_tag = ""
+    if output_mode == "Intensity" and not explicit_mu_file:
+        ms = getattr(config, "mu_sampling", {}) or {}
+        shared_points = ms.get("points") if isinstance(ms, Mapping) else None
+        if shared_points:
+            requested_mu_points = _coerce_mu_points(shared_points)
+        elif isinstance(params, Mapping) and params.get("mu") not in (None, ""):
+            row_mu = float(params["mu"])
+            requested_mu_points = _coerce_mu_points([row_mu])
+            mu_stem_tag = f"_mu{row_mu:.4f}"
+
     base_name_raw = get_synthesis_output_stem_from_params(
         {
             "teff": teff,
@@ -1652,7 +1724,7 @@ def run_single_synthesis(args):
         default_output_mode=output_mode,
         default_calculation_mode=calculation_mode,
         atmosphere_turb_labels=atmosphere_turb_labels,
-    )
+    ) + mu_stem_tag
     result_suffix = ".intensity.spec" if output_mode == "Intensity" else ".spec"
     opac_root = os.path.join(config.project_root, config.model_opac_dir)
     base_name = _fit_stem_to_path_limits(
@@ -1922,8 +1994,17 @@ def run_single_synthesis(args):
             # (mihal/taum/ncore/diflog), so any extra directive must appear
             # before it. See source/input.f at the SPHERICAL branch.
             mu_points_line = ""
-            if mode_str == "Intensity" and getattr(config, "mu_points_file", ""):
-                mu_points_line = f"'MU-POINTS:' '{config.mu_points_file}'\n"
+            if mode_str == "Intensity":
+                mu_file = explicit_mu_file
+                if not mu_file and requested_mu_points:
+                    mu_tmp_dir = (
+                        str(config.tmp_dir)
+                        if config.tmp_dir
+                        else os.path.join(config.project_root, "tmp")
+                    )
+                    mu_file = _write_mu_points_file(requested_mu_points, mu_tmp_dir, base_name)
+                if mu_file:
+                    mu_points_line = f"'MU-POINTS:' '{mu_file}'\n"
             bsyn_input = f"""'NLTE :'          '{'.true.' if config.nlte else '.false.'}'
 'NLTEINFOFILE:'  '{nlte_info_file_for_run if config.nlte else (config.nlte_info_file if config.nlte_info_file else 'DATA/SPECIES_LTE_NLTE.dat')}'
 'LAMBDA_MIN:'     '{config.lambda_min}'

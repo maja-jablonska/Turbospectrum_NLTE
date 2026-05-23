@@ -61,6 +61,7 @@ except ImportError:
 PROVENANCE_FILENAMES: Tuple[str, ...] = (
     "canonical_config.yaml",
     "synthesis_config.yaml",
+    "input_config.json",
     "linelist_manifest.json",
     "atmosphere_manifest.json",
     "software_manifest.json",
@@ -308,49 +309,6 @@ def _to_float32(values: np.ndarray) -> np.ndarray:
     return out
 
 
-# Group abundance display names — these are abundance *ratios*, not individual elements.
-_GROUP_ABUNDANCE_NAMES = {
-    "a": "[a/Fe]",
-    "c": "[C/Fe]",
-    "n": "[N/Fe]",
-    "o": "[O/Fe]",
-    "r": "[r/Fe]",
-    "s": "[s/Fe]",
-}
-
-# Known element symbols (lowercase key → capitalised symbol).
-_ELEMENT_SYMBOLS = {
-    "h": "H", "he": "He", "li": "Li", "be": "Be", "b": "B",
-    "ne": "Ne", "na": "Na", "mg": "Mg", "al": "Al", "si": "Si",
-    "p": "P", "cl": "Cl", "ar": "Ar", "k": "K", "ca": "Ca",
-    "sc": "Sc", "ti": "Ti", "v": "V", "cr": "Cr", "mn": "Mn",
-    "fe": "Fe", "co": "Co", "ni": "Ni", "cu": "Cu", "zn": "Zn",
-    "ga": "Ga", "ge": "Ge", "as": "As", "se": "Se", "br": "Br",
-    "kr": "Kr", "rb": "Rb", "sr": "Sr", "y": "Y", "zr": "Zr",
-    "nb": "Nb", "mo": "Mo", "ru": "Ru", "rh": "Rh", "pd": "Pd",
-    "ag": "Ag", "cd": "Cd", "in": "In", "sn": "Sn", "sb": "Sb",
-    "te": "Te", "i": "I", "xe": "Xe", "cs": "Cs", "ba": "Ba",
-    "la": "La", "ce": "Ce", "pr": "Pr", "nd": "Nd", "sm": "Sm",
-    "eu": "Eu", "gd": "Gd", "tb": "Tb", "dy": "Dy", "ho": "Ho",
-    "er": "Er", "tm": "Tm", "yb": "Yb", "lu": "Lu", "hf": "Hf",
-    "ta": "Ta", "w": "W", "re": "Re", "os": "Os", "ir": "Ir",
-    "pt": "Pt", "au": "Au", "hg": "Hg", "tl": "Tl", "pb": "Pb",
-    "bi": "Bi", "th": "Th", "u": "U",
-}
-
-
-def _display_param_name(internal_name: str) -> str:
-    """Map an internal column name to a descriptive parameter name."""
-    if internal_name == "feh":
-        return "[Fe/H]"
-    if internal_name in _GROUP_ABUNDANCE_NAMES:
-        return _GROUP_ABUNDANCE_NAMES[internal_name]
-    low = internal_name.lower()
-    if low in _ELEMENT_SYMBOLS:
-        return _ELEMENT_SYMBOLS[low]
-    return internal_name
-
-
 def _ordered_param_names(columns: Mapping[str, np.ndarray]) -> List[str]:
     reserved = {
         "grid_version",
@@ -362,7 +320,7 @@ def _ordered_param_names(columns: Mapping[str, np.ndarray]) -> List[str]:
         "calculation_mode",
         "turb",
     }
-    candidate_order = ["teff", "logg", "feh", "vmicro", "a", "c", "n", "o", "r", "s", "mu"]
+    candidate_order = ["teff", "logg", "feh", "vmicro", "turbvel", "t_value", "a", "c", "n", "o", "r", "s", "mu"]
     extras = sorted(
         name
         for name in columns.keys()
@@ -386,18 +344,25 @@ def _build_params_matrix(columns: Mapping[str, np.ndarray]) -> Tuple[np.ndarray,
     elif "t_value" in columns:
         params_by_name["vmicro"] = _to_float32(np.asarray(columns["t_value"]))
 
+    # Preserve the synthesis microturbulence (turbvel) and the snapped atmosphere
+    # label (t_value) as their own numeric columns, mirroring
+    # synthesize_spectra_from_zarr._build_params_matrix.
+    if "turbvel" in columns:
+        params_by_name["turbvel"] = _to_float32(np.asarray(columns["turbvel"]))
+    if "t_value" in columns:
+        params_by_name["t_value"] = _to_float32(np.asarray(columns["t_value"]))
+
     for name in candidate_order:
-        if name in {"teff", "logg", "feh", "vmicro"}:
+        if name in {"teff", "logg", "feh", "vmicro", "turbvel", "t_value"}:
             continue
         if name in columns:
             params_by_name[name] = _to_float32(np.asarray(columns[name]))
 
-    param_names_internal = [n for n in candidate_order if n in params_by_name]
-    if not param_names_internal:
+    param_names = [n for n in candidate_order if n in params_by_name]
+    if not param_names:
         raise ValueError("Could not construct params matrix from merged metadata")
-    params = np.column_stack([params_by_name[n] for n in param_names_internal]).astype(np.float32, copy=False)
-    display_names = [_display_param_name(n) for n in param_names_internal]
-    return params, np.asarray(display_names, dtype=object)
+    params = np.column_stack([params_by_name[n] for n in param_names]).astype(np.float32, copy=False)
+    return params, np.asarray(param_names, dtype=object)
 
 
 def _compute_model_ids(params: np.ndarray) -> np.ndarray:
@@ -709,6 +674,14 @@ def _build_merge_provenance_payload(
     )
     provenance["synthesis_config.yaml"] = _carry_forward("synthesis_config.yaml") or json.dumps(
         synthesis_payload,
+        indent=2,
+        sort_keys=True,
+    )
+    # Carry the verbatim total input config forward from the source shards/grid so
+    # the merged dataset stays reproducible. Older shards may lack it; emit a JSON
+    # placeholder so the required-file/JSON-sanity checks still pass.
+    provenance["input_config.json"] = _carry_forward("input_config.json") or json.dumps(
+        {"note": "input_config.json not recorded by source shards"},
         indent=2,
         sort_keys=True,
     )

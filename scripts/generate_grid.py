@@ -5,6 +5,7 @@ import argparse
 import gzip
 import io
 import json
+import logging
 import math
 import os
 from itertools import islice, product
@@ -196,7 +197,7 @@ def _ordered_abundance_keys(abund_cfg: Mapping[str, Any]) -> List[str]:
     return ordered
 
 
-def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) -> Dict[str, np.ndarray]:
+def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator, base_dir: str | None = None) -> Dict[str, np.ndarray]:
     """
     Build ML-style sampled parameter columns from
     `configs/sampling/config_ml_sampling.json`.
@@ -234,12 +235,29 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
         else:
             fixed_abundances[element] = _abundance_value(raw_val)
 
+    # Microturbulence can be drawn three ways (most flexible first):
+    #   1. bounds.vmicro {min,max} -> continuous LHS dimension, exactly like
+    #      teff/logg/feh. The km/s float is stored verbatim as `turbvel` (the
+    #      value handed to bsyn), while the atmosphere label `t_value` is snapped
+    #      to the nearest t_value_options entry further down.
+    #   2. sample_turbvel + turbvel_options -> discrete pick from a label list.
+    #   3. fixed `turbvel` series (default).
+    vmicro_bounds = bounds_cfg.get("vmicro")
+    sample_vmicro = isinstance(vmicro_bounds, Mapping)
     sample_turbvel = bool(config.get("sample_turbvel", False))
+    if sample_vmicro and sample_turbvel:
+        raise ValueError(
+            "Use either bounds.vmicro (continuous) or sample_turbvel (discrete), not both"
+        )
     turbvel_options = config.get("turbvel_options") or ["01", "02", "03", "04", "05"]
     if isinstance(turbvel_options, (str, bytes)):
         turbvel_options = [turbvel_options]
     turbvel_options = [f"{int(x):02d}" if isinstance(x, (int, float, np.integer, np.floating)) else str(x) for x in turbvel_options]
-    if sample_turbvel:
+    if sample_vmicro:
+        if "min" not in vmicro_bounds or "max" not in vmicro_bounds:
+            raise ValueError("Bounds for 'vmicro' must include 'min' and 'max'")
+        bounds.append((float(vmicro_bounds["min"]), float(vmicro_bounds["max"])))
+    elif sample_turbvel:
         if not turbvel_options:
             raise ValueError("sample_turbvel=true requires at least one turbvel option")
         bounds.append((0.0, float(len(turbvel_options))))
@@ -273,7 +291,11 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
         col_idx += 1
 
     turbvel_cfg = config.get("turbvel", "01")
-    if sample_turbvel:
+    if sample_vmicro:
+        # Continuous microturbulence in km/s, sampled like teff/logg/feh.
+        turbvel = np.round(lhs[:, col_idx], 2)
+        col_idx += 1
+    elif sample_turbvel:
         indices = np.floor(lhs[:, col_idx]).astype(int)
         indices = np.clip(indices, 0, len(turbvel_options) - 1)
         turbvel = np.asarray([turbvel_options[i] for i in indices], dtype=object)
@@ -331,9 +353,129 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
         abundance_scale=nlte_ascii_cfg.get("abundance_scale"),
         solar_abundance=nlte_ascii_cfg.get("solar_abundance"),
         match=nlte_ascii_cfg.get("match"),
+        base_dir=base_dir,
     )
     out.update(build_nlte_ascii_selector_columns(sample_count, nlte_ascii_selector))
     return out
+
+
+_LHS_SAMPLING_ALIASES = {"lhs", "latin_hypercube", "latin-hypercube", "random", "ml", "sample"}
+_REGULAR_SAMPLING_ALIASES = {"grid", "regular", "cartesian", "axes", "regular_grid"}
+
+
+# Envelope of the MARCS standard-composition grid (Gustafsson et al. 2008).
+# These are the atmosphere-selection axes: sampling teff/logg/feh/vmicro outside
+# this envelope makes the nearest-atmosphere snap clamp to the grid edge, so the
+# stored atmosphere stops reflecting the requested parameters. Abundances are
+# applied at synthesis time on top of a fixed-composition atmosphere, so they are
+# deliberately not range-checked here. Override per-config with a top-level
+# "marcs_bounds" block ({axis: {min, max}}); silence with
+# "warn_outside_marcs_bounds": false.
+MARCS_STANDARD_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "teff": (2500.0, 8000.0),
+    "logg": (-1.0, 5.5),
+    "feh": (-5.0, 1.0),
+    "vmicro": (0.0, 5.0),
+}
+
+# Which grid column carries each MARCS axis (vmicro lives in the `turbvel` column).
+_MARCS_AXIS_COLUMNS: Dict[str, str] = {
+    "teff": "teff",
+    "logg": "logg",
+    "feh": "feh",
+    "vmicro": "turbvel",
+}
+
+
+def _as_float_array(values: Any) -> "np.ndarray | None":
+    """Coerce a grid column to float, accepting numeric arrays and labels like "01".
+
+    Returns None if any entry can't be parsed as a number (e.g. a fixed-series
+    string), so the caller can skip the check instead of raising.
+    """
+    arr = np.asarray(values).ravel()
+    if arr.dtype.kind in "fiu":
+        return arr.astype(float)
+    out = np.empty(arr.size, dtype=float)
+    for i, value in enumerate(arr):
+        try:
+            out[i] = float(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def warn_outside_marcs_bounds(columns: Mapping[str, Any], config: Mapping[str, Any]) -> None:
+    """Warn when sampled atmosphere axes fall outside the MARCS grid envelope.
+
+    Checks teff/logg/feh/vmicro against :data:`MARCS_STANDARD_BOUNDS` (overridable
+    via the config's ``marcs_bounds`` block). Out-of-envelope rows are not an
+    error — synthesis still runs by snapping to the nearest available atmosphere —
+    but that snap silently clamps to the grid edge, so we surface it loudly. Runs
+    for both the LHS and regular-grid paths.
+    """
+    if not config.get("warn_outside_marcs_bounds", True):
+        return
+
+    envelope = dict(MARCS_STANDARD_BOUNDS)
+    override = config.get("marcs_bounds")
+    if isinstance(override, Mapping):
+        for axis, spec in override.items():
+            if isinstance(spec, Mapping) and "min" in spec and "max" in spec:
+                envelope[str(axis).strip().lower()] = (float(spec["min"]), float(spec["max"]))
+
+    log = logging.getLogger("generate_grid")
+    for axis, (lo, hi) in envelope.items():
+        column = _MARCS_AXIS_COLUMNS.get(axis, axis)
+        if column not in columns:
+            continue
+        numeric = _as_float_array(columns[column])
+        if numeric is None or numeric.size == 0:
+            continue
+        outside = (numeric < lo) | (numeric > hi)
+        n_out = int(np.count_nonzero(outside))
+        if n_out:
+            log.warning(
+                "%d/%d sampled rows have %s outside the MARCS grid envelope "
+                "[%g, %g] (sampled range %g..%g); the nearest-atmosphere snap "
+                "will clamp these to the grid edge.",
+                n_out, numeric.size, axis, lo, hi,
+                float(numeric.min()), float(numeric.max()),
+            )
+
+
+def resolve_grid_columns(config: Mapping[str, Any], rng: np.random.Generator, base_dir: str | None = None) -> Dict[str, np.ndarray]:
+    """Build grid columns from a grid config, choosing the sampling mode.
+
+    ``grid.sampling`` selects how the parameter grid is built:
+
+    - ``"lhs"``  -> Latin-Hypercube sampling (``num_samples`` + ``bounds``)
+    - ``"grid"`` -> regular Cartesian product (``axes``)
+
+    When ``grid.sampling`` is omitted it is auto-detected: an explicit ``axes``
+    block means a regular grid, otherwise Latin-Hypercube (so every existing
+    config keeps working unchanged). Both modes return the same column schema,
+    so the synthesis stage downstream is identical either way.
+    """
+    sampling = str(config.get("sampling", "") or "").strip().lower()
+    if not sampling:
+        sampling = "grid" if config.get("axes") else "lhs"
+
+    if sampling in _LHS_SAMPLING_ALIASES:
+        columns = _resolve_ml_sampling(config, rng, base_dir=base_dir)
+    elif sampling in _REGULAR_SAMPLING_ALIASES:
+        try:
+            from synthesize_regular_grid import resolve_regular_sampling  # type: ignore
+        except ImportError:
+            from .synthesize_regular_grid import resolve_regular_sampling  # type: ignore
+        columns = resolve_regular_sampling(config, rng=rng, base_dir=base_dir)
+    else:
+        raise ValueError(
+            f"grid.sampling must be 'lhs' or 'grid' (or an alias), got {sampling!r}"
+        )
+
+    warn_outside_marcs_bounds(columns, config)
+    return columns
 
 
 def _write_csv_from_columns(columns: Mapping[str, np.ndarray], output_path: str, compression: str | None, level: int | None) -> None:
@@ -354,6 +496,70 @@ def _compressed_csv_path(output_path: str, compression: str | None) -> str | Non
     if compression_norm in {"zst", "zstd"}:
         return output_path if output_path.endswith(".zst") else f"{output_path}.zst"
     raise ValueError(f"Unsupported csv_compression={compression!r}. Use none/gzip/zstd.")
+
+
+# Uniform CSV/Zarr I/O defaults shared by every grid path (pipeline,
+# generate_grid, regular grid). Override per-config under the canonical grid.io
+# block; the legacy flat keys are still honoured for back-compat.
+_DEFAULT_GRID_IO: Dict[str, Any] = {
+    "csv_compression": "zstd",
+    "csv_compression_level": 5,
+    "zarr_chunks": 2048,
+    "zarr_compressor": {"cname": "zstd", "clevel": 5, "shuffle": True},
+}
+
+_warned_legacy_grid_io = False
+
+
+def resolve_grid_io(grid_cfg: Mapping[str, Any] | None) -> Dict[str, Any]:
+    """Resolve CSV/Zarr I/O settings from a grid config, uniformly.
+
+    Canonical schema (preferred)::
+
+        grid.io = {csv_compression, csv_compression_level, zarr_chunks, zarr_compressor}
+
+    Legacy keys still accepted as a fallback::
+
+        grid.csv_compression, grid.csv_compression_level,
+        grid.zarr.{chunks, compressor}
+
+    Canonical keys win over legacy; uniform defaults fill anything missing so the
+    pipeline, generate_grid, and regular-grid paths all behave identically.
+    Returns a dict with keys csv_compression, csv_compression_level,
+    zarr_chunks, zarr_compressor.
+    """
+    global _warned_legacy_grid_io
+    grid_cfg = dict(grid_cfg or {})
+    io_block = dict(grid_cfg.get("io") or {})
+    zarr_block = grid_cfg.get("zarr")
+    zarr_block = dict(zarr_block) if isinstance(zarr_block, Mapping) else {}
+
+    legacy = {
+        "csv_compression": grid_cfg.get("csv_compression"),
+        "csv_compression_level": grid_cfg.get("csv_compression_level"),
+        "zarr_chunks": zarr_block.get("chunks"),
+        "zarr_compressor": zarr_block.get("compressor"),
+    }
+    if not io_block and any(v is not None for v in legacy.values()) and not _warned_legacy_grid_io:
+        logging.getLogger("generate_grid").info(
+            "Using legacy grid compression keys (grid.csv_compression / grid.zarr.*); "
+            "prefer the grouped grid.io block for uniform settings."
+        )
+        _warned_legacy_grid_io = True
+
+    def pick(key: str) -> Any:
+        if io_block.get(key) is not None:
+            return io_block[key]
+        if legacy.get(key) is not None:
+            return legacy[key]
+        return _DEFAULT_GRID_IO[key]
+
+    return {
+        "csv_compression": str(pick("csv_compression")).lower(),
+        "csv_compression_level": int(pick("csv_compression_level")),
+        "zarr_chunks": int(pick("zarr_chunks")),
+        "zarr_compressor": pick("zarr_compressor"),
+    }
 
 
 def _write_csv_outputs(columns: Mapping[str, np.ndarray], output_path: str, compression: str | None, level: int | None) -> List[str]:
@@ -587,11 +793,13 @@ if __name__ == '__main__':
 
         seed = cfg.get("seed")
         rng = np.random.default_rng(seed)
-        columns = _resolve_ml_sampling(cfg, rng=rng)
+        columns = resolve_grid_columns(cfg, rng=rng, base_dir=config_dir)
 
-        compression = cfg.get("csv_compression")
-        compression_level = cfg.get("csv_compression_level")
-        written = _write_csv_outputs(columns, csv_out_abs, compression=compression, level=compression_level)
+        grid_io = resolve_grid_io(cfg)
+        written = _write_csv_outputs(
+            columns, csv_out_abs,
+            compression=grid_io["csv_compression"], level=grid_io["csv_compression_level"],
+        )
         if len(written) == 1:
             print(f"Successfully generated parameter grid at {written[0]}")
         else:
@@ -599,9 +807,10 @@ if __name__ == '__main__':
             print(f"Successfully generated compressed CSV at {written[1]}")
 
         if (not args.no_zarr) and zarr_out_abs:
-            zarr_chunks = int(zarr_cfg.get("chunks", 2048)) if isinstance(zarr_cfg, Mapping) else 2048
-            compressor_cfg = (zarr_cfg.get("compressor") or {}) if isinstance(zarr_cfg, Mapping) else {}
-            _write_zarr_from_columns(columns, zarr_out_abs, chunks=zarr_chunks, compressor_cfg=compressor_cfg)
+            _write_zarr_from_columns(
+                columns, zarr_out_abs,
+                chunks=grid_io["zarr_chunks"], compressor_cfg=grid_io["zarr_compressor"],
+            )
             print(f"Successfully wrote Zarr store at {zarr_out_abs}")
 
         index_out = cfg.get("index_parquet")

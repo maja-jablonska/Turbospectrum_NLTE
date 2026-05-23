@@ -26,6 +26,123 @@ https://uu.diva-portal.org/smash/record.jsf?pid=diva2:1880829
 Molecular line lists can be found at: 
 https://box.in2p3.fr/s/Sn72KPCmC8rYQqa
 
+## Setup Guide
+
+End-to-end, from a fresh clone to a synthesized spectra store. Each step links to a deeper section below.
+
+### 0. Prerequisites
+
+- A Fortran compiler: `gfortran` (default), or Intel `ifort` / `ifx`.
+- Python 3.10+ with the pipeline dependencies:
+  ```bash
+  pip install numpy zarr numcodecs polars pytest
+  # optional extras: "jax[cpu]" (training dataloader), pandas/pyarrow
+  ```
+
+### 1. Build the Fortran binaries
+
+```bash
+cd exec-gf && make all        # builds babsma_lu and bsyn_lu in exec-gf/
+# Intel alternatives: exec-intel (ifort) or exec-ifx (ifx)
+```
+
+The model-atmosphere interpolator builds separately — see `interpolator/readme`.
+
+### 2. Download input data
+
+Model atmospheres, line lists, and (optionally) NLTE data:
+
+```bash
+./scripts/download_data.sh --all         # or pick parts: --atmospheres MARCS / --linelists / --nlte-atoms all
+```
+
+See [Downloading Data](#downloading-data) for all options. Files land under `input_files/` and `DATA/`.
+
+### 3. Configure (one file)
+
+Copy the canonical template and edit the four sections:
+
+```bash
+cp configs/pipeline/config_pipeline.example.json configs/pipeline/config_pipeline.json
+```
+
+| Section | What to set |
+|---|---|
+| `grid` | `sampling` mode (see below), the wavelength window (`synthesis.lam_min/lam_max/lam_step`), `output_mode` (`Flux`/`Intensity`), and the `io` compression block. |
+| `turbospectrum` | `paths.model_atmosphere_path` / `paths.linelist_path` / `paths.linelist_files`, compiler (`gf`/`intel`). For NLTE just set `grid.synthesis.calculation_mode: "NLTE"` (the single switch — see [NLTE Quickstart](#nlte-quickstart)); `nlte.enabled` + the info file are derived. |
+| `outputs` | Just `run_root` — all grid/spectra paths default to `outputs/...` under it. |
+| `runtime` | `workers` (null = auto), `chunk_rows`, optional `scratch`. |
+
+Conventions that keep configs consistent:
+- **Sampling mode**: set `grid.sampling` to choose how the parameter grid is built — `"lhs"` (Latin-Hypercube: `num_samples` + `bounds`) or `"grid"` (regular Cartesian product: `grid.axes`, e.g. `"teff": "3800:7500:250"`). The **same** `pipeline_from_config.py` command runs either mode and produces the same column schema. Omit `sampling` and it auto-detects (an `axes` block → `grid`, otherwise `lhs`), so existing configs keep working unchanged.
+- **Paths**: set `run_root` once; leave output paths to their defaults (`_DEFAULT_OUTPUT_PATHS` in `scripts/pipeline_from_config.py`). Override a single key only when you need to deviate.
+- **Compression**: use the grouped `grid.io` block (`csv_compression`, `csv_compression_level`, `zarr_chunks`, `zarr_compressor`). It is read identically by every grid path; omit it to accept the `zstd` defaults.
+- **Comments**: any key starting with `_` is documentation and is stripped before use.
+
+For specialized starting points: regular Cartesian grids → `config_regular_grid.example.json`; minimal NLTE (single switch) → `config_nlte_minimal.example.json`; NLTE Fe with per-abundance ASCII departures → `config_regular_grid_nlte_fe.example.json`; intensity (mu) runs → `config_regular_grid_nlte_fe_intensity.example.json`. The full annotated schema lives in `configs/synthesis/config_sample_comprehensive.json`.
+
+### 4. Run
+
+```bash
+python3 scripts/pipeline_from_config.py --config configs/pipeline/config_pipeline.json
+```
+
+This generates the grid (CSV + Zarr + `index.parquet`) and synthesizes spectra into one Zarr store. See [Run The Pipeline](#2-run-the-pipeline-single-command) for phase splits, resets, and sharded HPC runs.
+
+### 5. Inspect outputs
+
+Under `run_root`:
+- `outputs/grids/parameter_grid.zarr` + `index.parquet` — the parameter grid and lookup table.
+- `outputs/zarr/synthesized_spectra.zarr` — the spectra (`params`, `flux`, wavelength).
+
+Load one spectrum by parameters with `scripts/lazy_spectrum_loader.py`, or stream batches for training with `scripts/jax_spectra_dataloader.py` (both shown under [Workflow](#workflow)).
+
+### Next steps
+
+- **HPC (Gadi/PBS)**: [Main Gadi Synthesis](#main-gadi-synthesis-pbs) and [Regular-grid Gadi Synthesis](#regular-grid-gadi-synthesis-pbs).
+- **Large/sharded runs**: [Optional Sharded Runs + Merge](#3-optional-sharded-runs--merge) and [Shard Layout And Chunking](#shard-layout-and-chunking).
+- **Tests**: `python3 -m pytest tests/ -v` (see [Testing](#testing)).
+
+## NLTE Quickstart
+
+NLTE is a **single switch**: set `grid.synthesis.calculation_mode: "NLTE"` and the pipeline turns on `nlte.enabled` and defaults the species map (`DATA/SPECIES_LTE_NLTE.dat`) for you — you no longer keep two flags in sync.
+
+You don't have to download data or hand-write any of this. The fast path:
+
+```bash
+# 1. Download the NLTE data AND generate a matching DATA/SPECIES_LTE_NLTE.dat
+#    (the shipped one points at an HPC path; this writes one for YOUR machine,
+#     backing up any existing file). Restrict NLTE species with --nlte Fe Mg ...
+python3 scripts/setup_nlte.py
+
+# 2. Generate a ready-to-run pipeline config (runs the preflight for you)
+python3 scripts/init_nlte_config.py --output configs/pipeline/config_nlte.json
+#    --workflow ascii --ascii-dir <dir>  for ASCII per-abundance departures instead
+
+# 3. Run (the same preflight runs automatically before synthesis)
+python3 scripts/pipeline_from_config.py --config configs/pipeline/config_nlte.json
+```
+
+Prefer to do it by hand? Copy the annotated template `configs/pipeline/config_nlte_minimal.example.json`, point the two path headers in `DATA/SPECIES_LTE_NLTE.dat` at your downloaded `input_files/nlte_data/{model_atoms,departure_grids}`, then check it before a long run:
+
+```bash
+./scripts/download_data.sh --nlte-atoms all
+python3 scripts/validate_nlte_config.py --config configs/pipeline/config_nlte_minimal.json
+```
+
+Two NLTE workflows share this one mental model:
+
+- **Binary departure grids** (the default) — selected via the `nlte_info_file` species map; what `--nlte-atoms` downloads and what `setup_nlte.py` configures.
+- **ASCII per-abundance departures** — built by *exporting* the binary grids to per-model ASCII files (the `_abu±X.XXX` files keyed by abundance), then pointed at by an `nlte_ascii_departures` block (top level or under `grid`). Generate them in the same step:
+
+  ```bash
+  python3 scripts/setup_nlte.py --ascii-export   # also writes per-species dirs under DATA/DEP/nlte_departures_ascii/<El>/
+  ```
+
+  Point the config at the per-species directory (e.g. `…/Fe`); see `config_regular_grid_nlte_fe.example.json`. The export tool itself is `scripts/export_nlte_grid_ascii.py` if you need to run it standalone.
+
+The pre-synthesis preflight runs in both `pipeline_from_config.py` and `synthesize_regular_grid.py`; bypass it with `--skip-nlte-preflight`.
+
 ## Downloading Data
 
 A script is provided to download the necessary data to run Turbospectrum. This includes model atmospheres, NLTE data, and line lists. Downloads are resume-safe: existing files are skipped, and partial downloads continue where they left off. Use `--force` to re-download everything if needed.
@@ -139,7 +256,7 @@ If you want one config that handles both ML grid generation and later synthesis,
 
 ```bash
 python3 scripts/pipeline_from_config.py \
-  --config configs/pipeline/config_ml_synthesis.example.json
+  --config configs/pipeline/config_pipeline.example.json
 ```
 
 The helper writes a compressed Zarr store plus a parameter lookup parquet:
@@ -148,7 +265,68 @@ The helper writes a compressed Zarr store plus a parameter lookup parquet:
 - in sampling configs, `run_root` is the base directory and relative output paths like `outputs/grids/...` resolve underneath it
 - after synthesis, both `turbvel` and `t_value` are preserved as numeric parameter columns in addition to `vmicro` when present in the source grid
 
-`index.parquet` contains `row_index` and all grid parameter columns, so you can quickly filter by parameters and map directly to spectrum rows in downstream Zarr outputs. The helper uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream ingestion. Install dependencies with `pip install polars zarr numcodecs`. You can optionally include turbvel and element abundances in the Latin Hypercube by toggling `sample_turbvel` and providing bounded abundance entries in the config; turbvel sampling is constrained to the standard `01`–`05` codes for compatibility with the batch runners.
+`index.parquet` contains `row_index` and all grid parameter columns, so you can quickly filter by parameters and map directly to spectrum rows in downstream Zarr outputs. The helper uses Polars for high-throughput table construction and Zarr with configurable chunking/compression for HPC-friendly downstream ingestion. Install dependencies with `pip install polars zarr numcodecs`. You can optionally include element abundances in the Latin Hypercube by providing bounded abundance entries (`{"min": ..., "max": ...}`) in the config. Microturbulence can be sampled either continuously or discretely — see below.
+
+#### Microturbulence (vmicro) sampling
+
+In the **Latin-Hypercube path**, `vmicro` can be sampled two mutually exclusive ways (setting both raises an error):
+
+- **Continuous (recommended)** — treat it like `teff`/`logg`/`feh`: add `vmicro` to `bounds` and it is drawn continuously (km/s) by the Latin Hypercube. The sampled float is stored as the synthesis microturbulence (`turbvel`, the value passed to `bsyn`), while the atmosphere label (`t_value`) is snapped to the nearest entry of `t_value_options`. This snaps the atmosphere selection to a real grid point while letting synthesis use an arbitrary value.
+
+  ```json
+  "bounds": {
+    "teff":   {"min": 4000, "max": 7000},
+    "logg":   {"min": 0.0,  "max": 5.0},
+    "feh":    {"min": -2.5, "max": 0.5},
+    "vmicro": {"min": 0.5,  "max": 3.0}
+  },
+  "t_value_options": ["00", "01", "02", "05"]
+  ```
+
+- **Discrete (legacy)** — set `sample_turbvel: true` with `turbvel_options` to draw from the standard `01`–`05` codes, for compatibility with the batch runners.
+
+  ```json
+  "sample_turbvel": true,
+  "turbvel_options": ["01", "02", "03", "04", "05"],
+  "t_value_options": ["00", "01", "02", "05"]
+  ```
+
+For a **regular (Cartesian) grid** (`sampling: "grid"`), use a numeric `vmicro` axis — a `start:end:step` range or a uniform comma list in km/s — parsed exactly like the `teff`/`logg`/`feh` axes and stored as floats. It is mutually exclusive with the legacy discrete `turbvel` axis (e.g. `"01,02,05"`), which still works.
+
+  ```json
+  "sampling": "grid",
+  "axes": {
+    "teff":   "4000:7000:250",
+    "logg":   "0.0:5.0:0.5",
+    "feh":    "-2.5:0.5:0.25",
+    "vmicro": "0.5:3.0:0.5",
+    "t_value_options": ["00", "01", "02", "05"]
+  }
+  ```
+
+After synthesis, `turbvel`, `t_value`, and `vmicro` are all preserved as numeric parameter columns.
+
+#### MARCS grid-bounds warnings
+
+When the grid is generated (both LHS and regular-grid paths), the four atmosphere-selection axes are checked against the MARCS standard-composition grid envelope:
+
+| axis     | envelope        |
+|----------|-----------------|
+| `teff`   | 2500–8000 K     |
+| `logg`   | −1.0 to 5.5     |
+| `feh`    | −5.0 to 1.0     |
+| `vmicro` | 0–5 km/s        |
+
+Sampled rows outside the envelope emit a warning naming the axis, the out-of-range row count, and the sampled range. These rows are **not** dropped — synthesis still runs by snapping to the nearest available atmosphere — but that snap clamps to the grid edge, so the stored atmosphere no longer reflects the requested parameters. Abundances are applied on top of a fixed-composition atmosphere and are deliberately not range-checked.
+
+Override or silence the check from the config:
+
+```json
+"warn_outside_marcs_bounds": false,
+"marcs_bounds": { "teff": {"min": 3000, "max": 7500} }
+```
+
+`marcs_bounds` overrides only the axes you list (e.g. to match a sub-grid you actually have on disk); unlisted axes keep their defaults.
 
 #### JAX dataloader for spectra training
 
@@ -346,6 +524,7 @@ All tests are self-contained, use temporary directories, and require no external
 |----------------------------------|--------------------------------------------------------------|
 | Grid generation (regular + LHS)  | `test_grid_generation.py`                                    |
 | ML sampling & abundance bounds   | `test_grid_generation.py`, `test_nlte_ascii_departures.py`   |
+| Sampling dispatch, vmicro & MARCS bounds | `test_sampling_dispatch.py`                          |
 | Spectrum output parsing          | `test_spectrum_output.py`, `test_spectrum_reconstruction.py`  |
 | Continuum reconstruction         | `test_spectrum_reconstruction.py`                            |
 | Flux/Intensity mode extraction   | `test_spectrum_reconstruction.py`                            |

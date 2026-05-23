@@ -165,7 +165,6 @@
         "individual_abundances": [],
         "_individual_abundances_note": "Default list of individual element abundances. Format: [[atomic_number, abundance], ...] where abundance is absolute log abundance (H=12.0 scale). Can be overridden per grid point.",
         "_individual_abundances_example": [[26, 7.50], [20, 6.34]],
-        "_individual_abundances_elements": "Atomic numbers: 1=H, 2=He, 3=Li, 4=Be, 5=B, 6=C, 7=N, 8=O, 9=F, 10=Ne, 11=Na, 12=Mg, 13=Al, 14=Si, 15=P, 16=S, 17=Cl, 18=Ar, 19=K, 20=Ca, 21=Sc, 22=Ti, 23=V, 24=Cr, 25=Mn, 26=Fe, 27=Co, 28=Ni, 29=Cu, 30=Zn, 31=Ga, 32=Ge, 33=As, 34=Se, 35=Br, 36=Kr, 37=Rb, 38=Sr, 39=Y, 40=Zr, 41=Nb, 42=Mo, 43=Tc, 44=Ru, 45=Rh, 46=Pd, 47=Ag, 48=Cd, 49=In, 50=Sn, 51=Sb, 52=Te, 53=I, 54=Xe, 55=Cs, 56=Ba, 57=La, 58=Ce, 59=Pr, 60=Nd, 61=Pm, 62=Sm, 63=Eu, 64=Gd, 65=Tb, 66=Dy, 67=Ho, 68=Er, 69=Tm, 70=Yb, 71=Lu, 72=Hf, 73=Ta, 74=W, 75=Re, 76=Os, 77=Ir, 78=Pt, 79=Au, 80=Hg, 81=Tl, 82=Pb, 83=Bi, 84=Po, 85=At, 86=Rn, 87=Fr, 88=Ra, 89=Ac, 90=Th, 91=Pa, 92=U",
         
         "isotopes": [],
         "_isotopes_note": "Default list of isotopic fraction changes. Format: [[isotope_code, fraction], ...] where isotope_code is element.isotope (e.g., 6.012 for 12C, 6.013 for 13C). Can be overridden per grid point.",
@@ -181,86 +180,8 @@
         "_turbvel_note": "Default microturbulence velocity in km/s (used when xifix=true). Can be overridden per grid point."
     },
     
-    "grid_points": [
-        {
-            "_note": "Grid points can be specified in two formats:",
-            "_format1": "Simple: [Teff, logg, Fe/H, microturb_str] - uses default abundances from 'abundances' section",
-            "_format2": "Extended: object with teff, logg, feh, microturb_str + optional abundance overrides",
-            "_examples": "Examples below show extended format with per-point abundance variations"
-        },
-        
-        {
-            "_comment": "Example 1: Simple format would be: [2500, 3.0, 0.00, \"01\"]",
-            "_comment2": "Below are extended format examples with custom abundances per grid point"
-        },
-        
-        {
-            "teff": 5000,
-            "logg": 4.0,
-            "feh": -0.5,
-            "microturb_str": "01",
-            "alpha_fe": 0.3,
-            "turbvel": 1.5,
-            "_example": "Custom alpha enhancement and microturbulence"
-        },
-        
-        {
-            "teff": 5777,
-            "logg": 4.4,
-            "feh": 0.0,
-            "microturb_str": "01",
-            "individual_abundances": [[26, 7.50]],
-            "_example": "Individual Fe abundance override (absolute log abundance, H=12.0 scale)"
-        },
-        
-        {
-            "teff": 4500,
-            "logg": 2.5,
-            "feh": -1.0,
-            "microturb_str": "02",
-            "isotopes": [[6.012, 0.95], [6.013, 0.05]],
-            "_example": "Custom C isotopes (12C/13C = 19:1 ratio)"
-        },
-        
-        {
-            "teff": 6000,
-            "logg": 4.5,
-            "feh": 0.2,
-            "microturb_str": "01",
-            "alpha_fe": 0.1,
-            "r_process": 0.2,
-            "s_process": 0.15,
-            "individual_abundances": [[26, 7.60], [20, 6.40], [12, 7.70]],
-            "isotopes": [[6.012, 0.98], [6.013, 0.02]],
-            "_example": "Multiple custom abundances (Fe, Ca, Mg) and C isotopes"
-        },
-        
-        {
-            "teff": 5500,
-            "logg": 3.5,
-            "feh": -0.3,
-            "microturb_str": "01",
-            "abund_source": "asp2007",
-            "alpha_fe": 0.2,
-            "_example": "Different abundance source (Asplund 2007) with alpha enhancement"
-        },
-        
-        {
-            "teff": 4000,
-            "logg": 1.5,
-            "feh": -2.0,
-            "microturb_str": "02",
-            "helium": 0.1,
-            "r_process": 0.5,
-            "s_process": 0.3,
-            "individual_abundances": [[3, 1.0], [6, 5.5], [7, 6.0]],
-            "_example": "Metal-poor star with enhanced He, r/s-process, and individual Li, C, N abundances"
-        }
-    ],
-    "_grid_points_note": "List of grid points. Each point can be either a simple array [Teff, logg, Fe/H, microturb_str] or an object with extended parameters.",
-    "_grid_points_simple_format": "Simple: [effective_temperature_K, surface_gravity_dex, metallicity_dex, microturbulence_id]",
-    "_grid_points_extended_format": "Extended: object with teff, logg, feh, microturb_str, and optional: abund_source, metallicity, alpha_fe, helium, r_process, s_process, individual_abundances, isotopes, turbvel",
-    "_grid_points_override_note": "If extended format is used, any abundance/isotope parameters specified override the defaults. Omitted parameters use defaults.",
+    "grid_points": [],
+    "_grid_points_note": "Direct-synthesis grid points (ignored by pipeline_from_config.py, which builds rows from grid.axes). Each entry is a simple array [Teff, logg, Fe/H, microturb_str] using the default abundances above, or an object {teff, logg, feh, microturb_str, ...optional abund_source/metallicity/alpha_fe/helium/r_process/s_process/individual_abundances/isotopes/turbvel overrides}.",
     
     "grid_points_file": "",
     "_grid_points_file_note": "CSV file containing grid points (alternative to grid_points). CSV should have columns: teff, logg, feh, t_value (or turbvel/turbulence/microturb), and optionally: abund_source, metallicity, alpha_fe, helium, r_process, s_process, individual_abundances (JSON string), isotopes (JSON string), turbvel. If specified, grid_points is ignored",

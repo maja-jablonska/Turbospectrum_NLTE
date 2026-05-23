@@ -108,10 +108,32 @@ def _ensure_parent(path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
 
+# Standard output layout under a run root. Configs only need to set
+# outputs.run_root; these relative templates are applied when a key is omitted,
+# so every pipeline config no longer repeats the same boilerplate. Explicit
+# values in the config always win.
+_DEFAULT_OUTPUT_PATHS = {
+    "grid_csv": "outputs/grids/parameter_grid.csv",
+    "grid_zarr": "outputs/grids/parameter_grid.zarr",
+    "grid_index_parquet": "outputs/grids/index.parquet",
+    "spectra_zarr": "outputs/zarr/synthesized_spectra.zarr",
+    "spectra_shard_template": "outputs/shards/spectra_shard_{shard_index}.zarr",
+}
+
+
+def _resolve_outputs(pipeline_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the outputs block with default path templates filled in."""
+    outputs = dict(pipeline_cfg.get("outputs") or {})
+    for key, default in _DEFAULT_OUTPUT_PATHS.items():
+        if not outputs.get(key):
+            outputs[key] = default
+    return outputs
+
+
 def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str, str]:
     """Generate grid outputs and return resolved paths."""
     grid_cfg = dict(pipeline_cfg.get("grid") or {})
-    outputs = dict(pipeline_cfg.get("outputs") or {})
+    outputs = _resolve_outputs(pipeline_cfg)
 
     top_nlte_ascii = pipeline_cfg.get("nlte_ascii_departures")
     if isinstance(top_nlte_ascii, Mapping) and "nlte_ascii_departures" not in grid_cfg:
@@ -152,25 +174,26 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
 
     seed = grid_cfg.get("seed")
     rng = np.random.default_rng(seed)
-    columns = gg._resolve_ml_sampling(grid_cfg, rng=rng)  # type: ignore[attr-defined]
+    columns = gg.resolve_grid_columns(grid_cfg, rng=rng, base_dir=config_dir)  # type: ignore[attr-defined]
 
+    grid_io = gg.resolve_grid_io(grid_cfg)  # type: ignore[attr-defined]
     if grid_csv:
         csv_abs = _abs_output_from(run_root, config_dir, outputs.get("grid_csv"))  # recompute to be safe
         written = gg._write_csv_outputs(  # type: ignore[attr-defined]
             columns,
             csv_abs,
-            compression=grid_cfg.get("csv_compression"),
-            level=grid_cfg.get("csv_compression_level"),
+            compression=grid_io["csv_compression"],
+            level=grid_io["csv_compression_level"],
         )
         # Keep stdout noise low but informative.
         print(f"Wrote grid CSV: {written[0]}")
         if len(written) > 1:
             print(f"Wrote compressed CSV: {written[1]}")
 
-    zarr_cfg = grid_cfg.get("zarr") or {}
-    chunks = int(zarr_cfg.get("chunks", 2048)) if isinstance(zarr_cfg, dict) else 2048
-    compressor_cfg = (zarr_cfg.get("compressor") or {}) if isinstance(zarr_cfg, dict) else {}
-    gg._write_zarr_from_columns(columns, grid_zarr, chunks=chunks, compressor_cfg=compressor_cfg)  # type: ignore[attr-defined]
+    gg._write_zarr_from_columns(  # type: ignore[attr-defined]
+        columns, grid_zarr,
+        chunks=grid_io["zarr_chunks"], compressor_cfg=grid_io["zarr_compressor"],
+    )
     gg._write_index_parquet_from_columns(columns, grid_index_parquet)  # type: ignore[attr-defined]
     print(f"Wrote grid Zarr: {grid_zarr}")
     print(f"Wrote grid parameter index: {grid_index_parquet}")
@@ -202,6 +225,20 @@ def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir
     if not project_root or not os.path.isdir(str(project_root)):
         ts_cfg["project_root"] = REPO_ROOT
 
+    # Single NLTE switch: when the grid asks for NLTE, enable it in the synthesis
+    # config so NLTE intent is expressed once (grid.synthesis.calculation_mode).
+    calc_mode = ((pipeline_cfg.get("grid") or {}).get("synthesis") or {}).get("calculation_mode")
+    try:
+        from nlte_config import apply_single_nlte_switch
+    except ImportError:
+        sys.path.insert(0, SCRIPT_DIR)
+        from nlte_config import apply_single_nlte_switch
+    apply_single_nlte_switch(
+        ts_cfg,
+        calc_mode,
+        warn=lambda msg: print(f"[pipeline] WARNING: {msg}", file=sys.stderr),
+    )
+
     # Place the temp config next to scratch if provided (good for HPC), else in config dir.
     base = scratch or os.path.join(config_dir, ".pipeline_tmp")
     os.makedirs(base, exist_ok=True)
@@ -209,6 +246,38 @@ def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(ts_cfg, handle, indent=2, sort_keys=True)
     return tmp_path
+
+
+def _nlte_preflight_or_exit(pipeline_cfg: Mapping[str, Any], config_dir: str) -> None:
+    """Fail fast (before synthesis) if NLTE is on but its inputs are missing."""
+    try:
+        from nlte_config import preflight_nlte_from_config
+    except ImportError:
+        sys.path.insert(0, SCRIPT_DIR)
+        from nlte_config import preflight_nlte_from_config
+
+    project_root = _get_project_root(pipeline_cfg)
+    result = preflight_nlte_from_config(
+        pipeline_cfg, config_dir=config_dir, project_root=project_root
+    )
+    if not result["enabled"] or not result["problems"]:
+        return
+    print("\nNLTE preflight failed — synthesis would not produce NLTE spectra:", file=sys.stderr)
+    for line in result["problems"]:
+        print(f"  {line}" if line else "", file=sys.stderr)
+    print(
+        "\nFix the above (or re-run with --skip-nlte-preflight to bypass this check).",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def _get_project_root(pipeline_cfg: Mapping[str, Any]) -> str:
+    ts_cfg = pipeline_cfg.get("turbospectrum") if isinstance(pipeline_cfg.get("turbospectrum"), Mapping) else {}
+    for candidate in (ts_cfg.get("project_root"), (ts_cfg.get("overrides") or {}).get("project_root")):
+        if candidate and os.path.isdir(str(candidate)):
+            return str(candidate)
+    return REPO_ROOT
 
 
 def _find_flag_value(cmd: list[str], flag: str) -> tuple[Optional[int], Optional[str]]:
@@ -270,6 +339,11 @@ def main() -> None:
     )
     parser.add_argument("--skip-grid", action="store_true", help="Skip grid generation step")
     parser.add_argument("--skip-synthesis", action="store_true", help="Skip synthesis step")
+    parser.add_argument(
+        "--skip-nlte-preflight",
+        action="store_true",
+        help="Skip the pre-synthesis NLTE input check (run scripts/validate_nlte_config.py manually).",
+    )
 
     parser.add_argument(
         "--synthesis-mode",
@@ -297,7 +371,7 @@ def main() -> None:
     pipeline_cfg = _load_json(cfg_path)
 
     runtime = dict(pipeline_cfg.get("runtime") or {})
-    outputs = dict(pipeline_cfg.get("outputs") or {})
+    outputs = _resolve_outputs(pipeline_cfg)
 
     scratch = args.scratch or runtime.get("scratch")
     workers = args.workers or runtime.get("workers")
@@ -316,6 +390,9 @@ def main() -> None:
     if args.skip_synthesis:
         print("Synthesis deferred for this invocation (--skip-synthesis).")
         return
+
+    if not args.skip_nlte_preflight:
+        _nlte_preflight_or_exit(pipeline_cfg, config_dir=cfg_dir)
 
     ts_cfg_path = _write_temp_turbospectrum_config(pipeline_cfg, config_dir=cfg_dir, scratch=scratch)
 

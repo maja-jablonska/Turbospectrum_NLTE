@@ -179,6 +179,21 @@ def _as_abspath(path: str) -> str:
     return os.path.abspath(os.path.expanduser(os.path.expandvars(str(path))))
 
 
+def _resolve_dir(path: str, base_dir: Any = None) -> str:
+    """Resolve a directory path, honouring the config-relative convention.
+
+    Relative paths are resolved against *base_dir* (the directory of the config
+    file that supplied the value), matching how every other config path is
+    resolved (``_abs_from(cfg_dir, ...)`` in the grid scripts). When *base_dir*
+    is omitted the behaviour falls back to the historical cwd-relative
+    resolution, so existing callers and absolute paths are unaffected.
+    """
+    expanded = os.path.expanduser(os.path.expandvars(str(path)))
+    if base_dir and not os.path.isabs(expanded):
+        expanded = os.path.join(str(base_dir), expanded)
+    return os.path.abspath(expanded)
+
+
 def _coerce_float(raw_value: Any, *, label: str) -> float:
     text = str(raw_value if raw_value is not None else "").strip()
     if not text:
@@ -274,12 +289,13 @@ def normalize_nlte_ascii_selector(
     abundance_scale: Any = None,
     solar_abundance: Any = None,
     match: Any = None,
+    base_dir: Any = None,
 ) -> NlteAsciiSelector | None:
     raw_directory = str(directory if directory is not None else "").strip()
     if not raw_directory:
         return None
 
-    directory_path = _as_abspath(raw_directory)
+    directory_path = _resolve_dir(raw_directory, base_dir)
     if not os.path.isdir(directory_path):
         raise FileNotFoundError(f"NLTE ASCII departure directory not found: {directory_path}")
 
