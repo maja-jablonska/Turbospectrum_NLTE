@@ -1049,6 +1049,11 @@ def main() -> None:
     project_root = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
     config = _load_config(args.config, project_root=project_root)
+    # Verbatim total input config exactly as supplied via --config, before
+    # normalization or filtering to TurbospectrumConfig fields. Recorded in
+    # provenance so the dataset stays reproducible from the original input.
+    with open(args.config, "r", encoding="utf-8") as _cfg_handle:
+        raw_config_text = _cfg_handle.read()
     logger.info("mu_sampling=%s", json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True))
     if args.scratch and not args.no_scratch:
         scratch = os.path.abspath(args.scratch)
@@ -1320,6 +1325,7 @@ def main() -> None:
     provenance_payload = {
         "canonical_config.yaml": json.dumps(canonical_config_payload, sort_keys=True, indent=2),
         "synthesis_config.yaml": json.dumps(config_payload, sort_keys=True, indent=2, default=str),
+        "input_config.json": raw_config_text,
         "linelist_manifest.json": json.dumps(
             {
                 "source": linelist_identifier,

@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -10,6 +11,13 @@ import zarr
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MERGE_SCRIPT = os.path.join(REPO_ROOT, "scripts", "merge_spectra_shards.py")
+
+sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+from merge_spectra_shards import (  # noqa: E402
+    PROVENANCE_FILENAMES,
+    _read_string_scalar_optional,
+)
+from zarr_compat import write_string_scalar  # noqa: E402
 
 
 class MergeSpectraShardsTests(unittest.TestCase):
@@ -208,6 +216,74 @@ class MergeSpectraShardsTests(unittest.TestCase):
             self.assertEqual(int(merged.attrs["skipped_nonexistent_shards"]), 1)
             self.assertEqual(int(merged.attrs["skipped_invalid_shards"]), 1)
             self.assertTrue(bool(merged.attrs["skip_invalid_shards_effective"]))
+
+    def _write_shard_provenance(self, path: str, input_config_text: str) -> None:
+        """Attach a full provenance group to an existing shard zarr."""
+        root = zarr.open_group(path, mode="a")
+        prov = root.require_group("provenance")
+        payload = {
+            "canonical_config.yaml": "config: true",
+            "synthesis_config.yaml": "synth: true",
+            "input_config.json": input_config_text,
+            "linelist_manifest.json": json.dumps({"lines": 1}),
+            "atmosphere_manifest.json": json.dumps({"atm": 1}),
+            "software_manifest.json": json.dumps({"sw": 1}),
+            "environment.txt": "python==3.11",
+        }
+        for name, text in payload.items():
+            write_string_scalar(prov, name, text)
+
+    def test_merge_carries_forward_total_input_config(self) -> None:
+        self.assertIn("input_config.json", PROVENANCE_FILENAMES)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path = os.path.join(tmpdir, "grid.zarr")
+            output_path = os.path.join(tmpdir, "merged.zarr")
+            shard = os.path.join(tmpdir, "spectra_shard_0.zarr")
+
+            # The total input config carries a key the TurbospectrumConfig dataclass
+            # filter would drop; provenance must preserve it verbatim.
+            input_config = {
+                "lambda_min": 5000.0,
+                "extra_key_not_in_dataclass": "must-survive",
+            }
+            input_config_text = json.dumps(input_config, indent=2, sort_keys=True)
+
+            self._write_grid(grid_path, row_count=1)
+            self._write_shard(
+                shard,
+                wavelengths=np.asarray([5000.0, 5000.2], dtype=np.float32),
+                global_index=np.asarray([0], dtype=np.int64),
+                flux=np.asarray([[1.0, 0.95]], dtype=np.float32),
+                statuses=["success"],
+                messages=["ok"],
+            )
+            self._write_shard_provenance(shard, input_config_text)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    MERGE_SCRIPT,
+                    "--output-zarr",
+                    output_path,
+                    "--grid-zarr",
+                    grid_path,
+                    "--shard",
+                    shard,
+                    "--allow-incomplete-provenance",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+
+            merged = zarr.open_group(output_path, mode="r")
+            self.assertIn("provenance", merged)
+            carried = _read_string_scalar_optional(merged["provenance"], "input_config.json")
+            self.assertEqual(carried, input_config_text)
+            self.assertIn("extra_key_not_in_dataclass", carried)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,94 @@
+{
+  "_comment": "HARPS-tuned regular Cartesian grid example for interpolation-ready datasets.",
+  "_harps": [
+    "HARPS = High Accuracy Radial velocity Planet Searcher, the fibre-fed echelle spectrograph on the ESO 3.6 m at La Silla.",
+    "Resolving power R ~ 115000 -> turbospectrum.overrides.synthesis_parameters.resolution = 115000.0 convolves output to the instrument profile.",
+    "Wavelength coverage 3780-6910 A across two CCDs, with a physical gap at ~5304-5337 A (between the blue and red detectors).",
+    "CCD GAP NOTE: this pipeline writes a single contiguous LAMBDA_MIN/MAX/STEP window to bsyn (run_turbospectrum.py); segments_file is NOT wired through the Python wrapper. For detector-faithful spectra, either mask 5304-5337 A downstream, or run two passes - blue CCD lam_min/lam_max = 3780/5304 and red CCD = 5337/6910 - and concatenate.",
+    "lam_step = 0.01 A gives ~4 points per resolution element at 5000 A (FWHM ~ 0.043 A); the full window is ~313k wavelength points per spectrum.",
+    "The axes below form a coarse FGK Cartesian grid (5 x 4 x 4 x 2 = 160 points) suitable for linear interpolation; refine the step syntax for a denser grid."
+  ],
+  "_note": [
+    "Use with: python scripts/synthesize_regular_grid.py --config-json configs/pipeline/config_harps_regular_grid.example.json",
+    "For HPC, use turbospectrum_regular_grid_example.pbs which reads output/runtime paths from this config by default.",
+    "Set runtime.rows_per_shard (or runtime.shard_count) to switch from one-row shards to chunked shards for array jobs and lower startup overhead.",
+    "When synthesized, turbvel is preserved as a numeric parameter column alongside vmicro in the final spectra Zarr."
+  ],
+  "grid": {
+    "grid_version": "harps-regular-v1",
+    "axes": {
+      "teff": "4500:6500:500",
+      "logg": "3.5:5.0:0.5",
+      "feh": "-1.0:0.5:0.5",
+      "turbvel": "01,02"
+    },
+    "abundances": {
+      "a": "+0.00",
+      "c": "+0.00",
+      "n": "+0.00",
+      "o": "+0.00",
+      "r": "+0.00",
+      "s": "+0.00"
+    },
+    "synthesis": {
+      "lam_min": 3780.0,
+      "lam_max": 6910.0,
+      "lam_step": 0.01,
+      "output_mode": "Flux",
+      "mode": "1D",
+      "calculation_mode": "LTE"
+    },
+    "limits": {
+      "max_rows": 2000000
+    },
+    "io": {
+      "csv_compression": "zstd",
+      "csv_compression_level": 5,
+      "zarr_chunks": 2048,
+      "zarr_compressor": {
+        "cname": "zstd",
+        "clevel": 5,
+        "shuffle": true
+      }
+    }
+  },
+  "turbospectrum": {
+    "_note": [
+      "Base synthesis runtime config used by synthesize_spectra_from_zarr.py.",
+      "overrides carries the HARPS resolution and linelist settings without duplicating the full synthesis schema."
+    ],
+    "config": "../synthesis/config_sample_comprehensive.json",
+    "overrides": {
+      "paths": {
+        "linelist_path": "../../input_files/linelists",
+        "linelist_files": [
+          "nlte_ges_linelist_jmg6may2025_I_II"
+        ]
+      },
+      "synthesis_parameters": {
+        "resolution": 115000.0
+      }
+    }
+  },
+  "outputs": {
+    "_note": "run_root is resolved relative to this config unless absolute; output paths under outputs/... are resolved relative to run_root.",
+    "run_root": "../../runs/harps-regular-grid",
+    "grid_csv": "outputs/grids/regular_parameter_grid.csv",
+    "grid_zarr": "outputs/grids/regular_parameter_grid.zarr",
+    "grid_index_parquet": "outputs/grids/index.parquet",
+    "spectra_zarr": "outputs/zarr/regular_synthesized_spectra.zarr",
+    "spectra_shard_template": "outputs/shards/spectra_shard_{shard_index}.zarr"
+  },
+  "runtime": {
+    "_note": "rows_per_shard is recommended for regular-grid HPC runs; PBS arrays can overshoot the final index because extra tasks exit cleanly.",
+    "workers": 16,
+    "shard_count": null,
+    "rows_per_shard": 16,
+    "scratch": null,
+    "chunk_rows": 16,
+    "output_tmp": null,
+    "log_level": "INFO",
+    "log_file": null,
+    "skip_synthesis": false
+  }
+}

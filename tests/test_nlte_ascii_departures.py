@@ -48,6 +48,31 @@ class NlteAsciiDepartureTests(unittest.TestCase):
             self.assertEqual(column, "feh")
             self.assertAlmostEqual(abundance, 7.01, places=6)
 
+    def test_normalize_selector_resolves_relative_dir_against_base_dir(self) -> None:
+        # Mirrors the example configs: a "../../DATA/..." directory must resolve
+        # relative to the config file's directory, not the process cwd.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_dir = os.path.join(tmpdir, "configs", "pipeline")
+            deps_dir = os.path.join(tmpdir, "DATA", "DEP", "nlte_departures_ascii")
+            os.makedirs(cfg_dir)
+            os.makedirs(deps_dir)
+            rel = os.path.join("..", "..", "DATA", "DEP", "nlte_departures_ascii")
+
+            selector = normalize_nlte_ascii_selector(
+                directory=rel, species="Fe", base_dir=cfg_dir
+            )
+
+            self.assertEqual(selector.directory, os.path.abspath(deps_dir))
+
+    def test_normalize_selector_base_dir_ignored_for_absolute_dir(self) -> None:
+        # An absolute directory must be unaffected by base_dir.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selector = normalize_nlte_ascii_selector(
+                directory=tmpdir, species="Fe", base_dir="/nonexistent/base"
+            )
+
+            self.assertEqual(selector.directory, os.path.abspath(tmpdir))
+
     def test_read_departure_file_abundance_uses_file_header(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, f"000001_{self._MODEL_STEM}_abu+7.500.dat")

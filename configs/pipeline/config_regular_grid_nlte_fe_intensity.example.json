@@ -1,0 +1,97 @@
+{
+  "_comment": "Regular-grid example for Fe NLTE intensity synthesis using per-abundance ASCII departure files.",
+  "_note": [
+    "Use with: python scripts/synthesize_regular_grid.py --config-json configs/pipeline/config_regular_grid_nlte_fe_intensity.example.json",
+    "This example combines the Fe NLTE ASCII-departure selection workflow with Intensity-mode output.",
+    "mu_range creates target-mu rows in the regular grid; the synthesized runtime config is materialized with mu_sampling.mode='nearest' so each row keeps the closest mu from the Turbospectrum Intensity output.",
+    "Populate the NLTE ASCII departure directory first (for example with scripts/export_nlte_grid_ascii.py) before running a full synthesis job.",
+    "When synthesized, turbvel is preserved as a numeric parameter column alongside vmicro in the final spectra Zarr."
+  ],
+  "grid": {
+    "grid_version": "regular-fe-nlte-intensity-v1",
+    "axes": {
+      "teff": "5000,5250",
+      "logg": "4.0,4.5",
+      "feh": "-0.5,0.0",
+      "turbvel": "01"
+    },
+    "abundances": {
+    },
+    "synthesis": {
+      "lam_min": 5000.0,
+      "lam_max": 5020.0,
+      "lam_step": 0.01,
+      "output_mode": "Intensity",
+      "mode": "1D",
+      "calculation_mode": "NLTE",
+      "_mu_range_note": "Requested mu targets used when post-selecting from the Turbospectrum intensity output.",
+      "mu_range": "0.1:1.0:0.1"
+    },
+    "limits": {
+      "max_rows": 2000000
+    },
+    "io": {
+      "csv_compression": "zstd",
+      "csv_compression_level": 5,
+      "zarr_chunks": 2048,
+      "zarr_compressor": {
+        "cname": "zstd",
+        "clevel": 5,
+        "shuffle": true
+      }
+    }
+  },
+  "nlte_ascii_departures": {
+    "_note": [
+      "These fields are copied into the generated grid and used at synthesis time.",
+      "For Fe, abundance_column='feh' with abundance_scale='relative' maps A(Fe)=solar_fe+[Fe/H] on the Magg abundance scale used by the synthesis runner.",
+      "match='nearest' chooses the closest available _abu+X.XXX ASCII file for the selected model atmosphere."
+    ],
+    "directory": "/g/data/y89/mj8805/DATA/DEP/nlte_departures_ascii",
+    "species": "Fe",
+    "abundance_column": "feh",
+    "abundance_scale": "relative",
+    "solar_abundance": 7.51,
+    "match": "nearest"
+  },
+  "turbospectrum": {
+    "_note": [
+      "Base synthesis runtime config used by synthesize_spectra_from_zarr.py.",
+      "overrides lets this example turn on NLTE Fe and point at the repository NLTE info file."
+    ],
+    "config": "../synthesis/config_sample_comprehensive.json",
+    "overrides": {
+      "paths": {
+        "linelist_path": "../../input_files/linelists",
+        "linelist_files": [
+          "nlte_ges_linelist_jmg6may2025_I_II"
+        ]
+      },
+      "nlte": {
+        "enabled": true,
+        "nlte_info_file": "/g/data/y89/mj8805/DATA/SPECIES_LTE_NLTE.dat"
+      }
+    }
+  },
+  "outputs": {
+    "_note": "run_root is resolved relative to this config unless absolute; output paths under outputs/... are resolved relative to run_root.",
+    "run_root": "/g/data/y89/mj8805/runs/fe-nlte",
+    "grid_csv": "outputs/grids/regular_parameter_grid.csv",
+    "grid_zarr": "outputs/grids/regular_parameter_grid.zarr",
+    "grid_index_parquet": "outputs/grids/index.parquet",
+    "spectra_zarr": "outputs/zarr/regular_synthesized_spectra.zarr",
+    "spectra_shard_template": "outputs/shards/spectra_shard_{shard_index}.zarr"
+  },
+  "runtime": {
+    "_note": "rows_per_shard helps amortize Turbospectrum startup overhead on HPC and works with the regular-grid PBS array mode.",
+    "workers": 96,
+    "shard_count": null,
+    "rows_per_shard": 256,
+    "scratch": null,
+    "chunk_rows": 64,
+    "output_tmp": null,
+    "log_level": "INFO",
+    "log_file": null,
+    "skip_synthesis": false
+  }
+}

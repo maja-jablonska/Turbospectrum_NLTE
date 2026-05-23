@@ -28,6 +28,11 @@ except ImportError:
     from nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
 
 try:
+    from .nlte_config import apply_single_nlte_switch, preflight_nlte_from_config, resolve_nlte_ascii_cfg
+except ImportError:
+    from nlte_config import apply_single_nlte_switch, preflight_nlte_from_config, resolve_nlte_ascii_cfg
+
+try:
     from .run_turbospectrum import _nearest_turb_label, _normalize_turbulence_id
 except ImportError:
     from run_turbospectrum import _nearest_turb_label, _normalize_turbulence_id
@@ -177,6 +182,27 @@ def _parse_turbvel_values(raw: str) -> np.ndarray:
     return np.asarray(out, dtype=object)
 
 
+def _resolve_turbvel_axis(vmicro_spec: Any, turbvel_spec: Any) -> np.ndarray:
+    """Resolve the regular-grid microturbulence axis.
+
+    A numeric ``vmicro`` axis (a ``start:end:step`` range or a uniform comma list,
+    in km/s) is treated like the teff/logg/feh axes and stored as floats in the
+    ``turbvel`` column — the Cartesian-grid analogue of the continuous LHS path.
+    The legacy discrete ``turbvel`` axis (label list such as ``"01,02,05"``) is
+    kept for back-compat. Supplying both is an error. When neither is given, the
+    discrete default ``"01,02,03"`` is used.
+    """
+    has_vmicro = vmicro_spec not in (None, "")
+    has_turbvel = turbvel_spec not in (None, "")
+    if has_vmicro and has_turbvel:
+        raise ValueError(
+            "Use either axes.vmicro (continuous) or axes.turbvel (discrete), not both"
+        )
+    if has_vmicro:
+        return _parse_numeric_axis(str(vmicro_spec), "vmicro", integer=False)
+    return _parse_turbvel_values(str(turbvel_spec) if has_turbvel else "01,02,03")
+
+
 def _abs_output_from(run_root: str, cfg_dir: str, maybe_relative: str | None) -> str | None:
     if not maybe_relative:
         return None
@@ -268,7 +294,9 @@ def _build_regular_columns(
     teff_base = np.repeat(teff_axis.astype(np.int64), ng * nf * nu * suffix_after_turbvel)
     logg_base = np.tile(np.repeat(logg_axis.astype(np.float64), nf * nu * suffix_after_turbvel), nt)
     feh_base = np.tile(np.repeat(feh_axis.astype(np.float64), nu * suffix_after_turbvel), nt * ng)
-    turbvel_base = np.tile(np.repeat(turbvel_axis.astype(object), suffix_after_turbvel), nt * ng * nf)
+    # Preserve the axis dtype: discrete labels stay object strings ("01"),
+    # a numeric vmicro axis stays float64 — matching the continuous LHS path.
+    turbvel_base = np.tile(np.repeat(turbvel_axis, suffix_after_turbvel), nt * ng * nf)
 
     # Abundance columns via the same repeat/tile pattern.
     prefix = nt * ng * nf * nu
@@ -323,6 +351,106 @@ def _build_regular_columns(
         columns["mu"] = mu
     columns.update(build_nlte_ascii_selector_columns(row_count, nlte_ascii_selector))
     return columns
+
+
+def resolve_regular_sampling(config: Mapping[str, Any], rng: Any = None, base_dir: str | None = None) -> Dict[str, np.ndarray]:
+    """Build regular Cartesian-grid columns from a grid config (no CLI).
+
+    Mirrors ``generate_grid._resolve_ml_sampling``: takes the ``grid`` sub-config
+    and returns the same column schema, so ``generate_grid.resolve_grid_columns``
+    can dispatch to either sampling mode and downstream synthesis is identical.
+    ``rng`` is accepted for a uniform interface but unused (the grid is
+    deterministic). Reuses the same parsers and ``_build_regular_columns`` as the
+    CLI path so there is a single regular-grid implementation.
+    """
+    grid = dict(config or {})
+    axes = grid.get("axes") or {}
+    synth = grid.get("synthesis") or {}
+
+    teff_axis = _parse_numeric_axis(str(axes.get("teff", "4000:7000:250")), "teff", integer=True)
+    logg_axis = _parse_numeric_axis(str(axes.get("logg", "0.0:5.0:0.5")), "logg", integer=False)
+    feh_axis = _parse_numeric_axis(str(axes.get("feh", "-2.5:0.5:0.25")), "feh", integer=False)
+    turbvel_axis = _resolve_turbvel_axis(axes.get("vmicro"), axes.get("turbvel"))
+
+    # t_value pool (grid.axes.t_value_options or top-level), normalized to labels.
+    tvo_raw = axes.get("t_value_options")
+    if tvo_raw is None:
+        tvo_raw = grid.get("t_value_options", ["01"])
+    if isinstance(tvo_raw, str):
+        t_value_options = [tok.strip() for tok in tvo_raw.split(",") if tok.strip()]
+    elif isinstance(tvo_raw, Sequence) and not isinstance(tvo_raw, (bytes, bytearray)):
+        t_value_options = [str(tok).strip() for tok in tvo_raw if str(tok).strip()]
+    else:
+        t_value_options = ["01"]
+    if not t_value_options:
+        t_value_options = ["01"]
+    t_value_options = [
+        f"{int(tok):02d}" if tok.lstrip("+-").isdigit() else tok for tok in t_value_options
+    ]
+
+    output_mode = str(synth.get("output_mode", "Flux"))
+    if output_mode not in {"Flux", "Intensity"}:
+        raise ValueError(f"output_mode must be Flux or Intensity, got {output_mode!r}")
+    mu_range_raw = synth.get("mu_range")
+    mu_axis = None
+    if mu_range_raw not in (None, ""):
+        mu_axis = _parse_numeric_axis(str(mu_range_raw), "mu", integer=False)
+        if output_mode != "Intensity":
+            raise ValueError("grid.synthesis.mu_range requires output_mode='Intensity'")
+
+    abund_section = grid.get("abundances") if isinstance(grid.get("abundances"), Mapping) else {}
+    abundances = {
+        k: _parse_abundance_spec(abund_section.get(k, "+0.00"), k)
+        for k in _ordered_abundance_keys(abund_section)
+    }
+
+    nlte_ascii_cfg = grid.get("nlte_ascii_departures") if isinstance(grid.get("nlte_ascii_departures"), Mapping) else {}
+    nlte_ascii_selector = normalize_nlte_ascii_selector(
+        directory=nlte_ascii_cfg.get("directory"),
+        species=nlte_ascii_cfg.get("species"),
+        abundance_column=nlte_ascii_cfg.get("abundance_column"),
+        abundance_scale=nlte_ascii_cfg.get("abundance_scale"),
+        solar_abundance=nlte_ascii_cfg.get("solar_abundance"),
+        match=nlte_ascii_cfg.get("match"),
+        base_dir=base_dir,
+    )
+
+    limits = grid.get("limits") if isinstance(grid.get("limits"), Mapping) else {}
+    max_rows = int(limits.get("max_rows", 2_000_000))
+
+    return _build_regular_columns(
+        teff_axis=teff_axis,
+        logg_axis=logg_axis,
+        feh_axis=feh_axis,
+        turbvel_axis=turbvel_axis,
+        mu_axis=mu_axis,
+        grid_version=str(grid.get("grid_version", "regular-linear-v1")),
+        lam_min=float(synth.get("lam_min", 6000.0)),
+        lam_max=float(synth.get("lam_max", 6100.0)),
+        lam_step=float(synth.get("lam_step", 0.01)),
+        output_mode=output_mode,
+        mode=str(synth.get("mode", grid.get("mode", "1D"))),
+        calculation_mode=str(synth.get("calculation_mode", grid.get("calculation_mode", "LTE"))),
+        abundances=abundances,
+        t_value_options=t_value_options,
+        nlte_ascii_selector=nlte_ascii_selector,
+        max_rows=max_rows,
+    )
+
+
+def _nlte_preflight_or_exit(cfg: Mapping[str, Any], config_dir: str, project_root: str) -> None:
+    """Fail fast (before synthesis) if NLTE is on but its inputs are missing."""
+    result = preflight_nlte_from_config(cfg, config_dir=config_dir, project_root=project_root)
+    if not result["enabled"] or not result["problems"]:
+        return
+    print("\n[regular-grid] NLTE preflight failed — synthesis would not produce NLTE spectra:", file=sys.stderr)
+    for line in result["problems"]:
+        print(f"  {line}" if line else "", file=sys.stderr)
+    print(
+        "\nFix the above (or re-run with --skip-nlte-preflight to bypass this check).",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def _run(cmd: Sequence[str]) -> None:
@@ -448,6 +576,18 @@ def _materialize_synthesis_config(
         mu_sampling.setdefault("count", 1)
         mu_sampling["min"] = mu_min
         mu_sampling["max"] = mu_max
+        # Hand bsyn the exact mu axis so intensities are synthesised at these
+        # values instead of being snapped to the 12 Gauss-Radau defaults. bsyn
+        # emits one column per point (shared across the physical point's mu-rows),
+        # so the nearest-match in the consumer becomes an identity.
+        unique_mu = sorted({round(float(m), 9) for m in np.asarray(mu_axis).ravel()})
+        if len(unique_mu) > 30:
+            raise ValueError(
+                f"mu axis has {len(unique_mu)} distinct values; bsyn supports at most "
+                "30 mu points per synthesis (muoutp(30) in source/input.f). "
+                "Reduce the mu axis or split it across runs."
+            )
+        mu_sampling["points"] = unique_mu
 
     cfg_dir = os.path.join(run_root, "config")
     os.makedirs(cfg_dir, exist_ok=True)
@@ -467,7 +607,8 @@ def main() -> None:
     parser.add_argument("--teff-axis", default=None, help="Teff axis (start:end:step or comma list)")
     parser.add_argument("--logg-axis", default=None, help="logg axis (start:end:step or comma list)")
     parser.add_argument("--feh-axis", default=None, help="feh axis (start:end:step or comma list)")
-    parser.add_argument("--turbvel-axis", default=None, help="Comma-separated turbvel identifiers")
+    parser.add_argument("--turbvel-axis", default=None, help="Comma-separated turbvel identifiers (discrete labels)")
+    parser.add_argument("--vmicro-axis", default=None, help="Continuous microturbulence axis in km/s (start:end:step or uniform comma list); mutually exclusive with --turbvel-axis")
     parser.add_argument(
         "--t-value-options",
         default=None,
@@ -536,6 +677,11 @@ def main() -> None:
 
     parser.add_argument("--max-rows", type=int, default=None, help="Safety cap for total grid rows")
     parser.add_argument("--skip-synthesis", action="store_true", default=None, help="Only generate the regular grid")
+    parser.add_argument(
+        "--skip-nlte-preflight",
+        action="store_true",
+        help="Skip the pre-synthesis NLTE input check (run scripts/validate_nlte_config.py manually).",
+    )
 
     parser.add_argument("--config", default=None, help="Turbospectrum synthesis config JSON path")
     parser.add_argument("--spectra-zarr", default=None, help="Output synthesized spectra Zarr path")
@@ -563,7 +709,11 @@ def main() -> None:
     teff_axis_spec = str(_coalesce(args.teff_axis, cfg, ("grid", "axes", "teff"), "4000:7000:250"))
     logg_axis_spec = str(_coalesce(args.logg_axis, cfg, ("grid", "axes", "logg"), "0.0:5.0:0.5"))
     feh_axis_spec = str(_coalesce(args.feh_axis, cfg, ("grid", "axes", "feh"), "-2.5:0.5:0.25"))
-    turbvel_axis_spec = str(_coalesce(args.turbvel_axis, cfg, ("grid", "axes", "turbvel"), "01,02,03"))
+    # Microturbulence: a numeric vmicro axis (continuous, km/s) or the legacy
+    # discrete turbvel label axis. Defaults stay None here so _resolve_turbvel_axis
+    # can detect "neither set" and apply the discrete default.
+    vmicro_axis_spec = _coalesce(args.vmicro_axis, cfg, ("grid", "axes", "vmicro"), None)
+    turbvel_axis_spec = _coalesce(args.turbvel_axis, cfg, ("grid", "axes", "turbvel"), None)
     # t_value labels available for the atmosphere library. Each row picks the
     # entry nearest its turbvel (see `nearest_t_value_for_turbvel`). This pool
     # is shared with the LHS path through the same config key.
@@ -600,18 +750,21 @@ def main() -> None:
     if output_mode not in {"Flux", "Intensity"}:
         raise ValueError(f"output_mode must be Flux or Intensity, got {output_mode!r}")
 
-    csv_compression = str(_coalesce(args.csv_compression, cfg, ("grid", "io", "csv_compression"), "zstd")).lower()
+    import generate_grid as gg  # shared, unified grid I/O resolver (grid.io + legacy)
+    grid_io = gg.resolve_grid_io(_cfg_get(cfg, ("grid",), {}))
+    csv_compression = str(
+        args.csv_compression if args.csv_compression is not None else grid_io["csv_compression"]
+    ).lower()
     if csv_compression not in {"none", "gzip", "zstd"}:
         raise ValueError(f"csv_compression must be one of none/gzip/zstd, got {csv_compression!r}")
-    csv_compression_level = int(_coalesce(args.csv_compression_level, cfg, ("grid", "io", "csv_compression_level"), 5))
-    zarr_chunks = int(_coalesce(args.zarr_chunks, cfg, ("grid", "io", "zarr_chunks"), 2048))
+    csv_compression_level = int(
+        args.csv_compression_level if args.csv_compression_level is not None else grid_io["csv_compression_level"]
+    )
+    zarr_chunks = int(args.zarr_chunks if args.zarr_chunks is not None else grid_io["zarr_chunks"])
     max_rows = int(_coalesce(args.max_rows, cfg, ("grid", "limits", "max_rows"), 2_000_000))
 
-    zarr_compressor_raw = _coalesce(
-        args.zarr_compressor,
-        cfg,
-        ("grid", "io", "zarr_compressor"),
-        {"cname": "zstd", "clevel": 5, "shuffle": True},
+    zarr_compressor_raw = (
+        args.zarr_compressor if args.zarr_compressor is not None else grid_io["zarr_compressor"]
     )
     if isinstance(zarr_compressor_raw, str):
         try:
@@ -697,7 +850,12 @@ def main() -> None:
 
     skip_synthesis_cfg = _cfg_get(cfg, ("runtime", "skip_synthesis"), False)
     skip_synthesis = bool(args.skip_synthesis) if args.skip_synthesis is not None else bool(skip_synthesis_cfg)
-    nlte_ascii_cfg = cfg.get("nlte_ascii_departures") if isinstance(cfg.get("nlte_ascii_departures"), dict) else {}
+    # Accept the NLTE ASCII block at the top level (preferred) or nested under
+    # grid, so the same config shape works for every entry point.
+    nlte_ascii_cfg = resolve_nlte_ascii_cfg(
+        cfg.get("nlte_ascii_departures"),
+        (cfg.get("grid") if isinstance(cfg.get("grid"), Mapping) else {}).get("nlte_ascii_departures"),
+    )
     nlte_ascii_selector = normalize_nlte_ascii_selector(
         directory=args.nlte_ascii_dir if args.nlte_ascii_dir is not None else nlte_ascii_cfg.get("directory"),
         species=args.nlte_ascii_species if args.nlte_ascii_species is not None else nlte_ascii_cfg.get("species"),
@@ -717,12 +875,13 @@ def main() -> None:
             else nlte_ascii_cfg.get("solar_abundance")
         ),
         match=args.nlte_ascii_match if args.nlte_ascii_match is not None else nlte_ascii_cfg.get("match"),
+        base_dir=None if args.nlte_ascii_dir is not None else cfg_dir,
     )
 
     teff_axis = _parse_numeric_axis(teff_axis_spec, "teff", integer=True)
     logg_axis = _parse_numeric_axis(logg_axis_spec, "logg", integer=False)
     feh_axis = _parse_numeric_axis(feh_axis_spec, "feh", integer=False)
-    turbvel_axis = _parse_turbvel_values(turbvel_axis_spec)
+    turbvel_axis = _resolve_turbvel_axis(vmicro_axis_spec, turbvel_axis_spec)
     mu_axis = _parse_numeric_axis(mu_range_spec, "mu", integer=False) if mu_range_spec is not None else None
     if mu_axis is not None and output_mode != "Intensity":
         raise ValueError("mu_range requires output_mode='Intensity'")
@@ -748,6 +907,13 @@ def main() -> None:
     grid_synth_overrides["lambda_min"] = lam_min
     grid_synth_overrides["lambda_max"] = lam_max
     grid_synth_overrides["lambda_step"] = lam_step
+    # Single NLTE switch: calculation_mode='NLTE' turns on nlte.enabled so the
+    # config only has to express NLTE intent once (in the grid).
+    apply_single_nlte_switch(
+        synthesis_overrides,
+        calculation_mode,
+        warn=lambda msg: print(f"[regular-grid] WARNING: {msg}"),
+    )
     # Clear the base config's example grid_points — the pipeline uses its
     # own grid Zarr, and leftover example points (e.g. teff=4000) confuse
     # the TurbospectrumConfig printout.
@@ -825,6 +991,16 @@ def main() -> None:
         max_rows=max_rows,
     )
 
+    # This CLI builds columns directly instead of going through
+    # generate_grid.resolve_grid_columns, so call the shared MARCS-envelope
+    # check here too (the pipeline path gets it via resolve_grid_columns).
+    try:
+        from generate_grid import warn_outside_marcs_bounds  # type: ignore
+    except ImportError:
+        from .generate_grid import warn_outside_marcs_bounds  # type: ignore
+    grid_block = cfg.get("grid") if isinstance(cfg.get("grid"), Mapping) else {}
+    warn_outside_marcs_bounds(columns, grid_block)
+
     abund_axis_parts = "".join(
         f" {k}={abundances[k].size}" for k in configured_abund_keys if abundances[k].size > 1
     )
@@ -864,6 +1040,9 @@ def main() -> None:
     if skip_synthesis:
         print("[regular-grid] skip-synthesis requested; done.")
         return
+
+    if not args.skip_nlte_preflight:
+        _nlte_preflight_or_exit(cfg, config_dir=cfg_dir, project_root=REPO_ROOT)
 
     cmd: List[str] = [
         sys.executable,

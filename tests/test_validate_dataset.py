@@ -45,6 +45,7 @@ def _make_valid_shard(path, n_rows=3, n_lambda=10, *, with_provenance=True):
         prov = root.require_group("provenance")
         prov.array("canonical_config.yaml", np.array("config: true"))
         prov.array("synthesis_config.yaml", np.array("synth: true"))
+        prov.array("input_config.json", np.array(json.dumps({"input": True})))
         prov.array("linelist_manifest.json", np.array(json.dumps({"lines": 1})))
         prov.array("atmosphere_manifest.json", np.array(json.dumps({"atm": 1})))
         prov.array("software_manifest.json", np.array(json.dumps({"sw": 1})))
@@ -188,6 +189,16 @@ def test_validate_shard_rejects_missing_provenance():
         _make_valid_shard(path, with_provenance=False)
         ok, info = validate_shard(path, enforce_provenance=True)
         assert ok is False
+
+
+def test_validate_shard_rejects_missing_input_config():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "spectra_shard_0.zarr"
+        root = _make_valid_shard(path, with_provenance=True)
+        del root["provenance"]["input_config.json"]
+        ok, info = validate_shard(path, enforce_provenance=True)
+        assert ok is False
+        assert "input_config.json" in info.get("missing_provenance_files", [])
 
 
 def test_validate_shard_rejects_nan_flux():

@@ -840,7 +840,8 @@ def main():
     project_root = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
     with open(args.config) as f:
-        cfg_data = json.load(f)
+        raw_config_text = f.read()
+    cfg_data = json.loads(raw_config_text)
 
     # Guardrail: users sometimes accidentally pass the ML sampling config here.
     if isinstance(cfg_data, dict) and any(k in cfg_data for k in ("bounds", "num_samples", "output_csv")):
@@ -988,6 +989,10 @@ def main():
             indent=2,
         ),
         "synthesis_config.yaml": json.dumps(config_payload, sort_keys=True, indent=2, default=str),
+        # Verbatim total input config exactly as supplied via --config, before
+        # normalization or filtering to TurbospectrumConfig fields. This preserves
+        # any keys the dataclass drops, so the dataset is fully reproducible.
+        "input_config.json": raw_config_text,
         "linelist_manifest.json": json.dumps(
             {
                 "source": linelist_identifier,

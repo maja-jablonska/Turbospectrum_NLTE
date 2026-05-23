@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -6,7 +7,12 @@ from unittest import mock
 import numpy as np
 
 from scripts.generate_grid import _resolve_ml_sampling
-from scripts.run_turbospectrum import TurbospectrumConfig
+from scripts.run_turbospectrum import (
+    TurbospectrumConfig,
+    _coerce_mu_points,
+    _write_mu_points_file,
+)
+from scripts.synthesize_regular_grid import _materialize_synthesis_config
 from scripts.synthesize_spectra_from_zarr import _choose_mu_indices
 import scripts.synthesize_spectra_from_zarr as synth_zarr
 
@@ -203,6 +209,123 @@ class MuSamplingTests(unittest.TestCase):
             # mu_selected_index must be a valid column index.
             self.assertGreaterEqual(results[0]["mu_selected_index"], 0)
             self.assertGreaterEqual(results[1]["mu_selected_index"], 0)
+
+
+class ExactMuPointsTests(unittest.TestCase):
+    """bsyn should synthesise the requested mu exactly (via a MU-POINTS file)
+    rather than snapping to its 12 Gauss-Radau defaults."""
+
+    def test_coerce_mu_points_dedups_sorts_and_clips(self) -> None:
+        self.assertEqual(_coerce_mu_points([0.8, 0.2, 0.8, 0.5]), [0.2, 0.5, 0.8])
+        # Tiny float overshoot within tolerance is clipped back into the domain.
+        self.assertEqual(_coerce_mu_points([1.0 + 1e-9, -1e-9]), [0.0, 1.0])
+        # Blank / None entries are ignored.
+        self.assertEqual(_coerce_mu_points([None, "", 0.3]), [0.3])
+
+    def test_coerce_mu_points_rejects_out_of_domain(self) -> None:
+        for bad in ([1.5], [-0.5], [float("nan")], [float("inf")]):
+            with self.assertRaises(ValueError):
+                _coerce_mu_points(bad)
+
+    def test_coerce_mu_points_enforces_bsyn_limit(self) -> None:
+        # 31 distinct values exceeds bsyn's muoutp(30).
+        too_many = [i / 40.0 for i in range(1, 32)]
+        with self.assertRaises(ValueError):
+            _coerce_mu_points(too_many)
+        # Exactly 30 is allowed.
+        ok = [i / 40.0 for i in range(1, 31)]
+        self.assertEqual(len(_coerce_mu_points(ok)), 30)
+
+    def test_write_mu_points_file_matches_bsyn_format(self) -> None:
+        # bsyn reads `nangles` from line 1 then the values from line 2
+        # (source/input.f MU-POINTS branch).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write_mu_points_file([0.2, 0.55, 1.0], tmp, "p5000_g+4.0")
+            self.assertTrue(path.endswith("p5000_g+4.0.mupoints.dat"))
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            self.assertEqual(int(lines[0]), 3)
+            vals = [float(x) for x in lines[1].replace(",", " ").split()]
+            np.testing.assert_allclose(vals, [0.2, 0.55, 1.0], atol=1e-6)
+
+    def _write_base_config(self, tmp: str) -> str:
+        base = os.path.join(tmp, "base.json")
+        with open(base, "w", encoding="utf-8") as fh:
+            json.dump({"synthesis_parameters": {"output_mode": "Intensity"}}, fh)
+        return base
+
+    def test_regular_grid_sets_exact_mu_points(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = _materialize_synthesis_config(
+                base_config_path=self._write_base_config(tmp),
+                run_root=tmp,
+                mu_axis=np.array([0.8, 0.2, 0.8, 0.5]),
+            )
+            with open(out, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            ms = cfg["synthesis_parameters"]["mu_sampling"]
+            self.assertEqual(ms["points"], [0.2, 0.5, 0.8])
+            self.assertAlmostEqual(ms["min"], 0.2)
+            self.assertAlmostEqual(ms["max"], 0.8)
+
+    def test_regular_grid_rejects_more_than_30_mu(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                _materialize_synthesis_config(
+                    base_config_path=self._write_base_config(tmp),
+                    run_root=tmp,
+                    mu_axis=np.linspace(0.02, 1.0, 31),
+                )
+
+
+class GridIoResolverTests(unittest.TestCase):
+    """Compression/chunk settings must resolve uniformly across grid paths."""
+
+    def _resolve(self, grid_cfg):
+        from scripts.generate_grid import resolve_grid_io
+        return resolve_grid_io(grid_cfg)
+
+    def test_canonical_grid_io_block(self) -> None:
+        io = self._resolve({
+            "io": {
+                "csv_compression": "gzip",
+                "csv_compression_level": 3,
+                "zarr_chunks": 8192,
+                "zarr_compressor": {"cname": "zstd", "clevel": 9, "shuffle": False},
+            }
+        })
+        self.assertEqual(io["csv_compression"], "gzip")
+        self.assertEqual(io["csv_compression_level"], 3)
+        self.assertEqual(io["zarr_chunks"], 8192)
+        self.assertEqual(io["zarr_compressor"]["clevel"], 9)
+
+    def test_legacy_flat_keys_still_honoured(self) -> None:
+        io = self._resolve({
+            "csv_compression": "gzip",
+            "csv_compression_level": 7,
+            "zarr": {"chunks": 1024, "compressor": {"cname": "lz4"}},
+        })
+        self.assertEqual(io["csv_compression"], "gzip")
+        self.assertEqual(io["csv_compression_level"], 7)
+        self.assertEqual(io["zarr_chunks"], 1024)
+        self.assertEqual(io["zarr_compressor"]["cname"], "lz4")
+
+    def test_canonical_wins_over_legacy(self) -> None:
+        io = self._resolve({
+            "io": {"zarr_chunks": 256},
+            "zarr": {"chunks": 1024},
+        })
+        self.assertEqual(io["zarr_chunks"], 256)
+
+    def test_uniform_defaults_when_omitted(self) -> None:
+        # Both an empty config and a path-only zarr block fall back to the same
+        # zstd defaults, so every grid path behaves identically.
+        for cfg in ({}, {"zarr": {"path": "x.zarr"}}):
+            io = self._resolve(cfg)
+            self.assertEqual(io["csv_compression"], "zstd")
+            self.assertEqual(io["csv_compression_level"], 5)
+            self.assertEqual(io["zarr_chunks"], 2048)
+            self.assertEqual(io["zarr_compressor"], {"cname": "zstd", "clevel": 5, "shuffle": True})
 
 
 if __name__ == "__main__":

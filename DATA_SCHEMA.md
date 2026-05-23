@@ -321,11 +321,21 @@ Storage is cheap. Scientific ambiguity is not.
 /provenance
     canonical_config.yaml
     synthesis_config.yaml
+    input_config.json
     linelist_manifest.json
     atmosphere_manifest.json
     software_manifest.json
     environment.txt
 ```
+
+### input_config.json (CRITICAL)
+
+The verbatim total input config exactly as supplied via `--config`, recorded
+before normalization or filtering to `TurbospectrumConfig` fields. Unlike
+`synthesis_config.yaml` (which holds the effective dataclass config after
+normalization and any scratch overrides), this preserves every key from the
+original file — including ones the dataclass drops — so the dataset can always be
+traced back to the exact input that produced it.
 
 ### canonical_config.yaml (CRITICAL)
 

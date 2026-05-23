@@ -1,0 +1,40 @@
+{
+  "_comment": "Smallest working NLTE config. NLTE is turned on once, via grid.synthesis.calculation_mode='NLTE'; nlte.enabled and the NLTE info file are derived/defaulted for you.",
+  "_nlte_quickstart": [
+    "1. Download data:  ./scripts/download_data.sh --nlte-atoms all",
+    "   Model atoms + binary departure grids land under input_files/nlte_data/{model_atoms,departure_grids}.",
+    "2. Point the two path headers in DATA/SPECIES_LTE_NLTE.dat at those folders (the shipped file points at an HPC path), and set the species you want to 'nlte'.",
+    "3. Check setup:    python3 scripts/validate_nlte_config.py --config configs/pipeline/config_nlte_minimal.json",
+    "4. Run:            python3 scripts/pipeline_from_config.py --config configs/pipeline/config_nlte_minimal.json",
+    "The pipeline runs the same NLTE preflight automatically before synthesis; pass --skip-nlte-preflight to bypass it.",
+    "For per-abundance ASCII departures instead of binary grids, add an nlte_ascii_departures block (see config_regular_grid_nlte_fe.example.json)."
+  ],
+
+  "grid": {
+    "grid_version": "nlte-minimal-v1",
+    "sampling": "grid",
+    "axes": { "teff": "5000,5500", "logg": "4.0,4.5", "feh": "-0.5,0.0", "turbvel": "01" },
+    "synthesis": {
+      "lam_min": 5000.0,
+      "lam_max": 5200.0,
+      "lam_step": 0.01,
+      "output_mode": "Flux",
+      "calculation_mode": "NLTE"
+    }
+  },
+
+  "turbospectrum": {
+    "_note": "Only the inputs every synthesis needs. NLTE adds nothing here — calculation_mode above is the single switch, and the info file defaults to DATA/SPECIES_LTE_NLTE.dat.",
+    "compiler": "gf",
+    "paths": {
+      "_paths_note": "Inline turbospectrum paths resolve against project_root (the repo root), NOT relative to this file. Leave model_atmosphere_path empty to auto-locate input_files/model_atmospheres/1D/marcs_standard_comp (also handles the nested-extract layout).",
+      "model_atmosphere_path": "",
+      "linelist_path": "input_files/linelists",
+      "linelist_files": ["nlte_ges_linelist_jmg16jan2026_I_II"]
+    }
+  },
+
+  "outputs": { "run_root": "../../runs/nlte-minimal" },
+
+  "runtime": { "workers": null, "chunk_rows": 64 }
+}

@@ -1,0 +1,43 @@
+name: turbospectrum
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+
+  # Core scientific stack (numpy pinned to match requirements-flax-ml.txt)
+  - numpy=1.26.4
+  - astropy
+  - matplotlib
+  - polars
+  - pyarrow        # parquet backend for index.parquet
+  - pyyaml
+  - pydantic
+
+  # Zarr storage (scripts/zarr_compat.py supports v2 and v3)
+  - zarr
+  - numcodecs
+
+  # VO / archive access
+  - pyvo
+
+  # Testing
+  - pytest
+
+  # Fortran toolchain for building exec-gf/ (optional — remove if you only need Python)
+  - gfortran
+
+  - pip
+  - pip:
+      # Pinned ML stack from requirements-flax-ml.txt
+      # (tested combo; avoids JAX 0.8 + NumPy 1.26 + Flax incompatibilities)
+      - jax==0.4.28
+      - jaxlib==0.4.28
+      - flax==0.8.1
+      - optax==0.1.9
+      - rich>=13.0
+      - protobuf>=4.25,<6
+      - wandb>=0.17
+
+      # Orchestration (dagster pulls many subpackages; pip is cleaner than conda)
+      - dagster
+      - dagster-webserver

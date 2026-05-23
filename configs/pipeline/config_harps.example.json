@@ -1,0 +1,101 @@
+{
+  "_comment": "HARPS-tuned one-config pipeline example. Latin-Hypercube sample an FGK parameter grid, then synthesize spectra at HARPS resolution, in a single command.",
+  "_harps": [
+    "HARPS = High Accuracy Radial velocity Planet Searcher, the fibre-fed echelle spectrograph on the ESO 3.6 m at La Silla.",
+    "Resolving power R ~ 115000 -> synthesis_parameters.resolution = 115000.0 below convolves the output to the instrument profile.",
+    "Wavelength coverage 3780-6910 A across two CCDs, with a physical gap at ~5304-5337 A (between the blue and red detectors).",
+    "CCD GAP NOTE: this pipeline writes a single contiguous LAMBDA_MIN/MAX/STEP window to bsyn (run_turbospectrum.py); segments_file is NOT wired through the Python wrapper. This example synthesizes the full 3780-6910 A window as one array and does NOT carve out the gap. For detector-faithful spectra, either mask 5304-5337 A downstream, or run two passes - blue CCD lam_min/lam_max = 3780/5304 and red CCD = 5337/6910 - and concatenate.",
+    "lam_step = 0.01 A gives ~4 points per resolution element at 5000 A (FWHM ~ 0.043 A). The full window is ~313k wavelength points per spectrum.",
+    "Parameter bounds target the bright FGK dwarfs/subgiants typical of HARPS RV programs; widen them for a more general grid."
+  ],
+  "_usage": [
+    "1. Copy:  cp configs/pipeline/config_harps.example.json configs/pipeline/config_harps.json",
+    "2. Edit:  the four sections below (grid / turbospectrum / outputs / runtime).",
+    "3. Run:   python3 scripts/pipeline_from_config.py --config configs/pipeline/config_harps.json",
+    "Keys starting with '_' are documentation only and are stripped before use."
+  ],
+
+  "grid": {
+    "_note": "FGK Latin-Hypercube sample plus the HARPS wavelength window. Switch to sampling='grid' + grid.axes for a regular Cartesian grid (see config_regular_grid.example.json).",
+    "grid_version": "harps-example-v1",
+    "sampling": "lhs",
+    "num_samples": 5000,
+    "seed": 20260521,
+    "bounds": {
+      "teff": { "min": 4500, "max": 6500 },
+      "logg": { "min": 3.5, "max": 5.0 },
+      "feh": { "min": -1.0, "max": 0.5 }
+    },
+    "sample_turbvel": true,
+    "turbvel_options": ["01", "02"],
+    "t_value_options": ["01"],
+    "abundances": {
+      "_note": "Each element is either a fixed string ('+0.00') or a {min,max} range added to the Latin Hypercube.",
+      "a": { "min": -0.10, "max": 0.40 },
+      "c": "+0.00",
+      "n": "+0.00",
+      "o": { "min": -0.10, "max": 0.40 },
+      "r": "+0.00",
+      "s": "+0.00"
+    },
+    "synthesis": {
+      "lam_min": 3780.0,
+      "lam_max": 6910.0,
+      "lam_step": 0.01,
+      "output_mode": "Flux"
+    },
+    "mode": "1D",
+    "calculation_mode": "LTE",
+    "io": {
+      "_note": "Canonical compression block shared by every grid path (resolve_grid_io in scripts/generate_grid.py). Omit it entirely to accept these same defaults.",
+      "csv_compression": "zstd",
+      "csv_compression_level": 5,
+      "zarr_chunks": 4096,
+      "zarr_compressor": { "cname": "zstd", "clevel": 5, "shuffle": true }
+    }
+  },
+
+  "turbospectrum": {
+    "_note": "Synthesis runtime. project_root and the output_dir/log_dir/tmp_dir paths default sensibly when empty; see configs/synthesis/config_sample_comprehensive.json for every available field.",
+    "compiler": "gf",
+    "force": false,
+    "max_workers": null,
+    "executables": {
+      "babsma_exec": "babsma_lu",
+      "bsyn_exec": "bsyn_lu",
+      "interpol_exec": "interpol_modeles"
+    },
+    "paths": {
+      "_paths_note": "Inline turbospectrum paths resolve against project_root (the repo root), NOT relative to this file. Leave model_atmosphere_path empty to auto-locate input_files/model_atmospheres/1D/marcs_standard_comp (also handles the nested-extract layout).",
+      "model_atmosphere_path": "",
+      "linelist_path": "input_files/linelists",
+      "linelist_files": ["nlte_ges_linelist_jmg16jan2026_I_II"],
+      "model_opac_dir": "COM/contopac"
+    },
+    "synthesis_parameters": {
+      "output_mode": "Flux",
+      "resolution": 115000.0
+    },
+    "nlte": {
+      "_note": "Set enabled=true and point nlte_info_file at your SPECIES_LTE_NLTE.dat for NLTE. For per-abundance ASCII departures, add a top-level nlte_ascii_departures block (see config_regular_grid_nlte_fe_intensity.example.json).",
+      "enabled": false,
+      "nlte_info_file": ""
+    },
+    "provenance": {
+      "_note": "Optional tags embedded in outputs; checksums and code/linelist/atmosphere versions auto-fill when the source files are reachable.",
+      "environment_capture": "pip_freeze"
+    }
+  },
+
+  "outputs": {
+    "_note": "Only run_root is required. grid/spectra paths default to outputs/... under run_root (_DEFAULT_OUTPUT_PATHS in scripts/pipeline_from_config.py); set grid_csv / grid_zarr / spectra_zarr / spectra_shard_template here to override.",
+    "run_root": "../../runs/harps-example"
+  },
+
+  "runtime": {
+    "_note": "workers: null = auto (PBS_NCPUS or CPU count). chunk_rows = row chunk of the spectra Zarr. scratch: optional fast-filesystem staging dir.",
+    "workers": null,
+    "scratch": null,
+    "chunk_rows": 64
+  }
+}
