@@ -455,7 +455,7 @@ shard_count    = ceil(row_count / rows_per_shard)
 If both are supplied, they must cover the full dataset. If neither is supplied:
 
 - `rechunk_array_example.pbs` defaults to `CHUNK_ROWS=1500`
-- `turbospectrum_regular_grid_example.pbs` defaults to one-row shards unless config or env overrides say otherwise
+- `turbospectrum_pipeline_example.pbs` (the single script for both LHS and regular grids) reads `runtime.shard_count` / `runtime.rows_per_shard` from config, or `SHARD_COUNT` / `ROWS_PER_SHARD` from the environment
 - `turbospectrum_example_array.pbs` requires one of `SHARD_COUNT` or `ROWS_PER_SHARD`
 
 You can preview the resolved layout before submitting:
@@ -494,7 +494,7 @@ python3 scripts/resolve_shard_layout.py \
 
 qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_pipeline.json,SHARD_COUNT=10 turbospectrum_example_array.pbs
 
-qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,SHARD_COUNT=10,WORKERS=32 turbospectrum_regular_grid_example.pbs
+qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,SHARD_COUNT=10,WORKERS=32 turbospectrum_pipeline_example.pbs
 ```
 
 The array wrappers now log `ROW_COUNT`, `ROWS_PER_SHARD`, `SHARD_COUNT`, and `ARRAY_RANGE` so it is obvious how the grid is being split before any synthesis work starts.
@@ -625,45 +625,48 @@ Behavior summary:
 
 ## Regular-grid Gadi Synthesis (PBS)
 
-For the regular Cartesian-grid workflow, use:
+Regular (Cartesian) grids use the **same** `turbospectrum_pipeline_example.pbs` as LHS/ML
+grids — the grid type lives in the config (`grid.sampling: "grid"` with a `grid.axes` block),
+not in the script name. There is no separate regular-grid PBS script. Just point
+`CONFIG_PATH` at a regular-grid config:
 
 ```bash
-qsub turbospectrum_regular_grid_example.pbs
+qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json turbospectrum_pipeline_example.pbs
 ```
-
-The regular-grid wrapper now supports the same chunked shard layout idea as `turbospectrum_example_array.pbs`, so you can avoid the inefficient one-row-per-shard pattern.
 
 Single-job chunked run:
 
 ```bash
-qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_regular_grid_example.pbs
+qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_pipeline_example.pbs
 ```
 
 PBS array synthesis:
 
 ```bash
-qsub -J 0-511 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_regular_grid_example.pbs
+qsub -J 0-511 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,ROWS_PER_SHARD=128,WORKERS=32 turbospectrum_pipeline_example.pbs
 ```
 
 Finalize/merge after the array completes:
 
 ```bash
-qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,FINALIZE_ONLY=1 turbospectrum_regular_grid_example.pbs
+qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,FINALIZE_ONLY=1 turbospectrum_pipeline_example.pbs
 ```
 
-Optional early-abort safety for cold starts:
+Generate the grid only (no synthesis/merge), e.g. to inspect it before a large run:
 
 ```bash
-qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,INITIAL_FAILURE_ABORT_THRESHOLD=3 turbospectrum_regular_grid_example.pbs
+qsub -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,SKIP_SYNTHESIS=1 turbospectrum_pipeline_example.pbs
 ```
 
 Behavior summary:
-- reads `runtime.shard_count` / `runtime.rows_per_shard` from the regular-grid config and falls back to one-row shards only when neither is set
-- in array mode, task `0` prepares the grid once and later tasks wait for it before starting synthesis
+- reads `runtime.shard_count` / `runtime.rows_per_shard` from the config (env `SHARD_COUNT` / `ROWS_PER_SHARD` override)
+- in array mode, the first task to acquire the grid-preparation lock generates the grid once and the others wait for it before starting synthesis (any task can be the preparer — it does not have to be task `0`)
 - array tasks beyond the true shard count exit cleanly, so it is safe to submit a slightly oversized `-J` range
-- non-array runs still support resume/merge in one submission, but chunked shards reduce startup overhead and usually improve CPU utilization substantially
+- non-array runs support resume/merge in one submission; chunked shards reduce startup overhead and usually improve CPU utilization substantially
 - `FINALIZE_ONLY=1` skips synthesis and just validates/merges the shard directory, which is the intended post-array follow-up step
-- `INITIAL_FAILURE_ABORT_THRESHOLD=N` aborts the job once the first `N` shard calculations all fail before any success, and writes a stop marker plus summary under `RUN_ROOT`
+- `SKIP_SYNTHESIS=1` (or `runtime.skip_synthesis: true`) stops after the grid is built
+- `AUTO_PRUNE_STALE_SHARDS=1` (opt-in) drops shards whose layout no longer matches the current `SHARD_COUNT` before resuming
+- `CONSECUTIVE_FAILURE_ABORT_THRESHOLD=N` aborts the job once `N` shard calculations fail consecutively, writing a stop marker plus summary under `RUN_ROOT`
 
 ### Tiny NLTE Regular-grid Gadi Smoke Jobs
 
@@ -686,6 +689,7 @@ qsub turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
 ```
 
 Notes:
+- these are thin wrappers that set a few defaults and then `exec` the unified `turbospectrum_pipeline_example.pbs`
 - these wrappers default to `configs/pipeline/config_regular_grid_nlte_fe_tiny_gadi.json`
 - the tiny config uses 8 grid rows and defaults to `ROWS_PER_SHARD=2`, so the array job intentionally overshoots and lets extra tasks exit cleanly
 - outputs default under `/scratch/<PROJECT>/<USER>/Turbospectrum_NLTE_regular_nlte_tiny` unless you override `RUN_ROOT`

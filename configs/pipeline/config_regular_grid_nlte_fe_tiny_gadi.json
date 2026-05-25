@@ -1,7 +1,7 @@
 {
   "_comment": "Tiny Gadi-oriented regular-grid smoke test for Fe NLTE generation with ASCII departures.",
   "_note": [
-    "Use with the tiny PBS wrappers at the repo root or directly with turbospectrum_regular_grid_example.pbs.",
+    "Use with the tiny PBS wrappers at the repo root or directly with turbospectrum_pipeline_example.pbs.",
     "This config intentionally omits explicit output paths so RUN_ROOT or SCRATCH can control where files land on Gadi.",
     "The grid is deliberately tiny: 2 teff x 2 logg x 2 feh x 1 turbvel = 8 rows."
   ],

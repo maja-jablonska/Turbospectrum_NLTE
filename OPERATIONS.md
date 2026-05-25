@@ -245,7 +245,7 @@ Temp survival across runs is considered a bug.
 
 ### Post-Merge Cleanup (Inode Reclamation)
 
-After a successful merge, the shard directory should be removed to reclaim inodes. The PBS merge scripts (`merge_shards_example.pbs`, `turbospectrum_regular_grid_example.pbs`) do this automatically unless disabled:
+After a successful merge, the shard directory should be removed to reclaim inodes. The PBS merge scripts (`merge_shards_example.pbs`, `turbospectrum_pipeline_example.pbs`) do this automatically unless disabled:
 
 ```bash
 CLEANUP_SHARDS=0 qsub merge_shards_example.pbs   # keep shards after merge

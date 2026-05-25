@@ -9,7 +9,7 @@ import zarr
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-PBS_SCRIPT = os.path.join(REPO_ROOT, "turbospectrum_regular_grid_example.pbs")
+PBS_SCRIPT = os.path.join(REPO_ROOT, "turbospectrum_pipeline_example.pbs")
 SYNTHESIS_CONFIG = os.path.join(REPO_ROOT, "configs", "synthesis", "config_sample_comprehensive.json")
 
 
@@ -89,13 +89,19 @@ class RegularGridArrayPrepareTests(unittest.TestCase):
             )
 
             grid_zarr = config["outputs"]["grid_zarr"]
-            marker_path = os.path.join(run_root, ".regular_grid_array_prepare_123456.done")
+            # The unified pipeline PBS writes a grid-prep marker named
+            # .grid_prepare_<jobid>.done where <jobid> is PBS_JOBID truncated at
+            # the first '[' (123456[5].gadi-pbs -> 123456). It records a timestamp.
+            marker_path = os.path.join(run_root, ".grid_prepare_123456.done")
 
             self.assertTrue(os.path.isdir(grid_zarr))
             self.assertTrue(os.path.isfile(marker_path))
             with open(marker_path, "r", encoding="utf-8") as handle:
-                marker_text = handle.read()
-            self.assertIn("prepared_by=123456[5].gadi-pbs task=5", marker_text)
+                marker_text = handle.read().strip()
+            self.assertTrue(
+                marker_text,
+                msg="grid-prep marker should record a non-empty timestamp",
+            )
 
             root = zarr.open_group(grid_zarr, mode="r")
             self.assertEqual(int(root["teff"].shape[0]), 8)

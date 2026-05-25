@@ -2,7 +2,7 @@
   "_comment": "Regular Cartesian grid template for linear interpolation workflows.",
   "_note": [
     "Use with: python scripts/synthesize_regular_grid.py --config-json configs/pipeline/config_regular_grid.example.json",
-    "For HPC, use turbospectrum_regular_grid_example.pbs which reads output/runtime paths from this config by default.",
+    "For HPC, use turbospectrum_pipeline_example.pbs (the single script for LHS and regular grids) which reads output/runtime paths from this config by default.",
     "Set runtime.rows_per_shard (or runtime.shard_count) to switch from one-row shards to chunked shards for array jobs and lower startup overhead.",
     "When synthesized, turbvel is preserved as a numeric parameter column alongside vmicro in the final spectra Zarr."
   ],
