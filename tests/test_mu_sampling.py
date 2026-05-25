@@ -10,6 +10,7 @@ from scripts.generate_grid import _resolve_ml_sampling
 from scripts.run_turbospectrum import (
     TurbospectrumConfig,
     _coerce_mu_points,
+    _normalize_config_dict,
     _write_mu_points_file,
 )
 from scripts.synthesize_regular_grid import _materialize_synthesis_config
@@ -276,6 +277,97 @@ class ExactMuPointsTests(unittest.TestCase):
                     run_root=tmp,
                     mu_axis=np.linspace(0.02, 1.0, 31),
                 )
+
+    def test_regular_grid_sets_nearest_mode_for_mu_axis(self) -> None:
+        # mu_range rows are explicit per-mu targets; the runtime config must
+        # select "nearest" so each row keeps its own mu (not "random"/"none").
+        with tempfile.TemporaryDirectory() as tmp:
+            out = _materialize_synthesis_config(
+                base_config_path=self._write_base_config(tmp),
+                run_root=tmp,
+                mu_axis=np.array([0.15, 0.45, 0.75]),
+            )
+            with open(out, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            self.assertEqual(cfg["synthesis_parameters"]["mu_sampling"]["mode"], "nearest")
+
+
+class SynthesisDedupTests(unittest.TestCase):
+    """Intensity rows that share a mu axis must collapse to one synthesis per
+    physical point (one bsyn call computes all mu), not one per mu-row."""
+
+    @staticmethod
+    def _row(teff, mu):
+        return {
+            "teff": teff, "logg": 4.5, "feh": 0.0, "turbvel": "01", "t_value": "01",
+            "lam_min": 5000.0, "lam_max": 5010.0, "lam_step": 0.01,
+            "output_mode": "Intensity", "calculation_mode": "LTE", "mode": "1D", "mu": mu,
+        }
+
+    def test_group_tasks_dedups_shared_mu_rows(self) -> None:
+        cfg = TurbospectrumConfig(
+            project_root="/tmp",
+            output_mode="Intensity",
+            mu_sampling={"mode": "nearest", "points": [0.15, 0.45, 0.75], "min": 0.15, "max": 0.75},
+        )
+        tasks = []
+        i = 0
+        for teff in (5500, 6000):
+            for mu in (0.15, 0.45, 0.75):
+                tasks.append((i, self._row(teff, mu)))
+                i += 1
+        groups = synth_zarr._group_tasks(tasks, cfg)
+        self.assertEqual(len(groups), 2)  # 6 rows -> 2 physical points
+        self.assertTrue(all(len(g) == 3 for g in groups))
+        for g in groups:
+            self.assertEqual(len({t[1]["teff"] for t in g}), 1)  # one star per group
+
+    def test_group_tasks_singletons_without_shared_axis(self) -> None:
+        # No shared mu axis (e.g. Flux, or per-row LHS mu) => one group per row.
+        cfg = TurbospectrumConfig(project_root="/tmp", output_mode="Flux", mu_sampling={})
+        tasks = [
+            (0, {"teff": 5500, "logg": 4.5, "feh": 0.0, "turbvel": "01", "t_value": "01",
+                 "lam_min": 5000.0, "lam_max": 5010.0, "lam_step": 0.01,
+                 "output_mode": "Flux", "calculation_mode": "LTE", "mode": "1D"}),
+            (1, {"teff": 6000, "logg": 4.5, "feh": 0.0, "turbvel": "01", "t_value": "01",
+                 "lam_min": 5000.0, "lam_max": 5010.0, "lam_step": 0.01,
+                 "output_mode": "Flux", "calculation_mode": "LTE", "mode": "1D"}),
+        ]
+        groups = synth_zarr._group_tasks(tasks, cfg)
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(len(g) == 1 for g in groups))
+
+
+class IntensityModeLoadTests(unittest.TestCase):
+    """Regression: loading an Intensity config must not force mu_sampling.mode to
+    'random'. Doing so at load time defeats the per-row 'nearest' selection that
+    keeps each target-mu row's own angle (bug: rows got an arbitrary mu)."""
+
+    def test_nested_intensity_config_does_not_force_random(self) -> None:
+        flat = _normalize_config_dict(
+            {
+                "synthesis_parameters": {
+                    "output_mode": "Intensity",
+                    "mu_sampling": {"points": [0.15, 0.45, 0.75], "min": 0.15, "max": 0.75},
+                }
+            },
+            default_project_root="/tmp",
+        )
+        self.assertNotEqual(str(flat["mu_sampling"].get("mode", "none")).lower(), "random")
+
+    def test_flat_intensity_config_does_not_force_random(self) -> None:
+        out = _normalize_config_dict(
+            {"output_mode": "Intensity", "mu_sampling": {"points": [0.2, 0.6]}},
+            default_project_root="/tmp",
+        )
+        self.assertNotEqual(str(out["mu_sampling"].get("mode", "none")).lower(), "random")
+
+    def test_explicit_user_mode_is_preserved(self) -> None:
+        out = _normalize_config_dict(
+            {"output_mode": "Intensity", "mu_sampling": {"mode": "random"}},
+            default_project_root="/tmp",
+        )
+        self.assertEqual(str(out["mu_sampling"]["mode"]).lower(), "random")
 
 
 class GridIoResolverTests(unittest.TestCase):

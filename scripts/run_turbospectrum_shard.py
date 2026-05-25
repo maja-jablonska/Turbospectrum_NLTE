@@ -666,20 +666,42 @@ def _build_task_batches(
         str(getattr(config, "model_atmosphere_path", "") or "")
     )
 
-    for batch_indices in _build_batches(indices, batch_size):
-        batch: list[tuple[int, dict[str, Any]]] = []
-        for global_i in batch_indices:
-            local_i = global_to_local[int(global_i)]
-            row_values = {k: columns[k][local_i] for k in columns}
-            output_stem = get_synthesis_output_stem_from_params(
-                row_values,
+    # Intensity rows that share a mu axis (mu_sampling.points) collapse to one
+    # mu-independent .intensity.spec. Group those rows by that stem so a group is
+    # never split across batches: each batch is processed serially by one worker,
+    # so the spectrum is synthesised once (first row) and the rest reuse it — no
+    # redundant bsyn calls and no concurrent writes to the same .opac/.spec.
+    ms = getattr(config, "mu_sampling", {}) or {}
+    shared_mu_axis = isinstance(ms, Mapping) and bool(ms.get("points"))
+
+    groups: "Dict[str, list[tuple[int, dict[str, Any]]]]" = {}
+    group_order: list[str] = []
+    for global_i in indices.tolist():
+        local_i = global_to_local[int(global_i)]
+        row_values = {k: columns[k][local_i] for k in columns}
+        output_stem = get_synthesis_output_stem_from_params(
+            row_values,
+            default_output_mode=getattr(config, "output_mode", "Flux"),
+            default_calculation_mode="NLTE" if config.nlte else "LTE",
+            atmosphere_turb_labels=atmosphere_turb_labels,
+        )
+        output_name_counts[output_stem] = output_name_counts.get(output_stem, 0) + 1
+
+        output_mode = str(row_values.get("output_mode") or getattr(config, "output_mode", "Flux"))
+        if shared_mu_axis and output_mode.lower() == "intensity":
+            key_row = {k: v for k, v in row_values.items() if k != "mu"}
+            group_key = get_synthesis_output_stem_from_params(
+                key_row,
                 default_output_mode=getattr(config, "output_mode", "Flux"),
                 default_calculation_mode="NLTE" if config.nlte else "LTE",
                 atmosphere_turb_labels=atmosphere_turb_labels,
             )
-            output_name_counts[output_stem] = output_name_counts.get(output_stem, 0) + 1
-            batch.append((int(global_i), row_values))
-        tasks.append(batch)
+        else:
+            group_key = f"__row_{int(global_i)}"  # singleton: preserve per-row behaviour
+        if group_key not in groups:
+            groups[group_key] = []
+            group_order.append(group_key)
+        groups[group_key].append((int(global_i), row_values))
 
     duplicate_output_names = [name for name, count in output_name_counts.items() if count > 1]
     if duplicate_output_names:
@@ -689,6 +711,20 @@ def _build_task_batches(
             f"which can overwrite spectra/opacity files (examples: {sample}). "
             "Preserve all distinguishing columns or adjust naming."
         )
+
+    # Pack whole groups into batches without splitting a group across batches.
+    batch: list[tuple[int, dict[str, Any]]] = []
+    for group_key in group_order:
+        members = groups[group_key]
+        if batch and len(batch) + len(members) > batch_size:
+            tasks.append(batch)
+            batch = []
+        batch.extend(members)
+        if len(batch) >= batch_size:
+            tasks.append(batch)
+            batch = []
+    if batch:
+        tasks.append(batch)
 
     return tasks, global_to_local
 
