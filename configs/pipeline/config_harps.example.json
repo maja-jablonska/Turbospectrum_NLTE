@@ -21,14 +21,14 @@
     "sampling": "lhs",
     "num_samples": 5000,
     "seed": 20260521,
+    "_vmicro_note": "Microturbulence is sampled CONTINUOUSLY via bounds.vmicro {min,max}: it becomes an LHS dimension like teff/logg/feh, and the km/s float is stored verbatim as `turbvel` (handed to bsyn for line formation). For the older DISCRETE behaviour (turbvel pinned to a label list, e.g. only 1 or 2 km/s) drop bounds.vmicro and instead set sample_turbvel=true + turbvel_options=[\"01\",\"02\"]. The two are mutually exclusive.",
     "bounds": {
       "teff": { "min": 4500, "max": 6500 },
       "logg": { "min": 3.5, "max": 5.0 },
-      "feh": { "min": -1.0, "max": 0.5 }
+      "feh": { "min": -1.0, "max": 0.5 },
+      "vmicro": { "min": 1.0, "max": 2.0 }
     },
-    "sample_turbvel": true,
-    "turbvel_options": ["01", "02"],
-    "t_value_options": ["01"],
+    "t_value_options": ["01", "02"],
     "abundances": {
       "_note": "Each element is either a fixed string ('+0.00') or a {min,max} range added to the Latin Hypercube.",
       "a": { "min": -0.10, "max": 0.40 },

@@ -261,6 +261,62 @@ def test_resolve_ml_sampling_with_sampled_abundances():
         assert -0.5 <= f <= 0.5
 
 
+def test_resolve_ml_sampling_continuous_vmicro_keeps_turbvel_and_derives_t_value():
+    """Continuous `bounds.vmicro` must keep `turbvel` continuous (it flows to
+    babsma line formation) while `t_value` — the discrete atmosphere label that
+    will actually be read — is provably the nearest `t_value_options` entry to
+    each row's sampled `turbvel`. Mirrors the snap synthesis re-applies against
+    the on-disk MARCS labels, so the two stay faithful to each other.
+    """
+    from synthesize_regular_grid import nearest_t_value_for_turbvel
+
+    options = ["01", "02"]
+    cfg = {
+        "num_samples": 200,
+        "seed": 7,
+        "bounds": {
+            "teff": {"min": 4500, "max": 6500},
+            "logg": {"min": 3.5, "max": 5.0},
+            "feh": {"min": -1.0, "max": 0.5},
+            "vmicro": {"min": 1.0, "max": 2.0},
+        },
+        "t_value_options": options,
+        "abundances": {"a": "+0.00", "c": "+0.00", "n": "+0.00", "o": "+0.00", "r": "+0.00", "s": "+0.00"},
+        "synthesis": {"lam_min": 5000, "lam_max": 5100, "lam_step": 0.01},
+    }
+    cols = _resolve_ml_sampling(cfg, np.random.default_rng(7))
+
+    turbvel = np.asarray(cols["turbvel"], dtype=float)
+    # Continuous: within bounds and NOT collapsed onto the discrete label set.
+    assert np.all(turbvel >= 1.0) and np.all(turbvel <= 2.0)
+    assert len(np.unique(turbvel)) > len(options)
+    # t_value is a discrete atmosphere label drawn only from the options...
+    assert set(cols["t_value"].tolist()).issubset(set(options))
+    # ...and is provably the nearest option to turbvel for every single row.
+    expected = nearest_t_value_for_turbvel(cols["turbvel"], options)
+    np.testing.assert_array_equal(expected, cols["t_value"])
+
+
+def test_resolve_ml_sampling_rejects_continuous_and_discrete_turbvel_together():
+    """`bounds.vmicro` (continuous) and `sample_turbvel` (discrete) are mutually
+    exclusive — choosing both is ambiguous about what drives the atmosphere."""
+    cfg = {
+        "num_samples": 5,
+        "bounds": {
+            "teff": {"min": 4500, "max": 6500},
+            "logg": {"min": 3.5, "max": 5.0},
+            "feh": {"min": -1.0, "max": 0.5},
+            "vmicro": {"min": 1.0, "max": 2.0},
+        },
+        "sample_turbvel": True,
+        "turbvel_options": ["01", "02"],
+        "abundances": {"a": "+0.00", "c": "+0.00", "n": "+0.00", "o": "+0.00", "r": "+0.00", "s": "+0.00"},
+        "synthesis": {},
+    }
+    with pytest.raises(ValueError, match="continuous"):
+        _resolve_ml_sampling(cfg, np.random.default_rng(0))
+
+
 def test_resolve_ml_sampling_deterministic():
     cfg = {
         "num_samples": 20,
