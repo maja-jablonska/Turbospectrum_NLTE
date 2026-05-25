@@ -588,14 +588,36 @@ def _expected_wavelengths(column_data: Mapping[str, np.ndarray]) -> Tuple[np.nda
     return wavelengths, count
 
 
-def _synthesis_task(args) -> Dict:
-    index, row_values = args
+_ROW_NON_ABUNDANCE_KEYS = {
+    "teff",
+    "logg",
+    "feh",
+    "turbvel",
+    "t_value",
+    "lam_min",
+    "lam_max",
+    "lam_step",
+    "mu",
+    "output_mode",
+    "calculation_mode",
+    "mode",
+    "grid_version",
+}
+
+
+def _row_abundance_values(row_values: Mapping[str, Any]) -> Dict[str, Any]:
+    excluded = _ROW_NON_ABUNDANCE_KEYS | set(NLTE_ASCII_CONTROL_KEYS)
+    return {key: value for key, value in row_values.items() if key not in excluded}
+
+
+def _prepare_cfg_for_row(row_values: Mapping[str, Any]):
+    """Build a per-row config copy; resolve intensity + target mu + mu mode."""
     if _WORKER_CONFIG is None:
         raise RuntimeError("Worker config not initialized")
     cfg = copy.deepcopy(_WORKER_CONFIG)
-    lam_min = float(row_values["lam_min"])
-    lam_max = float(row_values["lam_max"])
-    lam_step = float(row_values["lam_step"])
+    cfg.lambda_min = float(row_values["lam_min"])
+    cfg.lambda_max = float(row_values["lam_max"])
+    cfg.lambda_step = float(row_values["lam_step"])
     # If the grid provides per-row mode flags, honor them; otherwise fall back
     # to whatever the Turbospectrum config requested.
     output_mode = row_values.get("output_mode")
@@ -607,9 +629,6 @@ def _synthesis_task(args) -> Dict:
     output_mode = str(output_mode)
     calculation_mode = str(calculation_mode)
 
-    cfg.lambda_min = lam_min
-    cfg.lambda_max = lam_max
-    cfg.lambda_step = lam_step
     cfg.output_mode = output_mode
     cfg.nlte = calculation_mode.lower() == "nlte"
     is_intensity = output_mode.lower() == "intensity"
@@ -621,33 +640,11 @@ def _synthesis_task(args) -> Dict:
     if is_intensity and str(mu_sampling.get("mode", "none")).strip().lower() in {"", "none"}:
         mu_sampling["mode"] = "nearest" if target_mu is not None else "random"
     cfg.mu_sampling = mu_sampling
+    return cfg, is_intensity, target_mu
 
-    abundance_values = {
-        key: value
-        for key, value in row_values.items()
-        if key
-        not in {
-            "teff",
-            "logg",
-            "feh",
-            "turbvel",
-            "t_value",
-            "lam_min",
-            "lam_max",
-            "lam_step",
-            "mu",
-            "output_mode",
-            "calculation_mode",
-            "mode",
-            "grid_version",
-            *NLTE_ASCII_CONTROL_KEYS,
-        }
-    }
-    start = time.perf_counter()
-    result = run_single_synthesis((row_values, cfg))
-    duration = time.perf_counter() - start
+
+def _resolve_spec_path(cfg, row_values, result, is_intensity):
     log_path = str(result.get("log_path", "") or "")
-
     spec_path = str(result.get("output_path", "") or "")
     if not spec_path:
         base_name = str(result.get("base_name", "") or get_synthesis_stem(
@@ -655,11 +652,31 @@ def _synthesis_task(args) -> Dict:
             float(row_values["logg"]),
             float(row_values["feh"]),
             str(row_values.get("t_value") or row_values.get("turbvel") or "01").strip(),
-            abundance_values,
+            _row_abundance_values(row_values),
         ))
         suffix = ".intensity.spec" if is_intensity else ".spec"
         spec_path = os.path.join(cfg.output_dir, f"{os.path.splitext(base_name)[0]}{suffix}")
     base_name = str(result.get("base_name", "") or os.path.splitext(os.path.basename(spec_path))[0])
+    return spec_path, base_name, log_path
+
+
+def _extract_row_result(
+    index,
+    cfg,
+    is_intensity,
+    target_mu,
+    result,
+    duration,
+    spec_path,
+    base_name,
+    log_path,
+) -> Dict:
+    """Read the (already-synthesised) spectrum file and build this row's result.
+
+    The synthesis itself is performed once per output stem; for Intensity grids
+    that share a mu axis this is called once per mu-row against the same
+    ``spec_path``, selecting that row's own target mu.
+    """
     spectrum = None
     mu_selected = float("nan")
     mu_selected_index = -1
@@ -776,6 +793,73 @@ def _synthesis_task(args) -> Dict:
         "mu_selected": float(mu_selected),
         "mu_selected_index": int(mu_selected_index),
     }
+
+
+def _synthesis_group_task(group) -> List[Dict]:
+    """Synthesise one output stem once, then extract every row in the group.
+
+    A group is a list of ``(index, row_values)`` tasks that all map to the same
+    Turbospectrum output stem (identical physics; for Intensity grids that share
+    a mu axis the stem is mu-independent so the rows differ only in target mu).
+    bsyn is run a single time (computing all mu columns); each row then selects
+    its own mu from that shared spectrum. This avoids the redundant re-synthesis
+    and the concurrent writes to the same .opac/.spec that one-task-per-row caused.
+    """
+    rep_index, rep_row = group[0]
+    cfg, is_intensity, target_mu = _prepare_cfg_for_row(rep_row)
+    start = time.perf_counter()
+    result = run_single_synthesis((rep_row, cfg))
+    duration = time.perf_counter() - start
+    spec_path, base_name, log_path = _resolve_spec_path(cfg, rep_row, result, is_intensity)
+
+    results = [
+        _extract_row_result(
+            rep_index, cfg, is_intensity, target_mu, result, duration, spec_path, base_name, log_path
+        )
+    ]
+    if len(group) == 1:
+        return results
+
+    synth_ok = str(result.get("status", "")).lower() in _SUCCESS_STATUSES
+    for index, row_values in group[1:]:
+        if not synth_ok:
+            # The shared synthesis failed; report the same failure per row rather
+            # than re-attempting (which would just fail again).
+            results.append(
+                {
+                    "index": index,
+                    "base_name": base_name,
+                    "status": result.get("status", "error"),
+                    "message": result.get("message", "shared synthesis failed"),
+                    "duration": 0.0,
+                    "spectrum": None,
+                    "mu_selected": float("nan"),
+                    "mu_selected_index": -1,
+                }
+            )
+            continue
+        member_cfg, member_is_intensity, member_target_mu = _prepare_cfg_for_row(row_values)
+        # Reuse the representative synthesis result (status/output_path); only the
+        # per-row mu selection differs. No re-synthesis -> no redundancy, no race.
+        results.append(
+            _extract_row_result(
+                index,
+                member_cfg,
+                member_is_intensity,
+                member_target_mu,
+                result,
+                0.0,
+                spec_path,
+                base_name,
+                log_path,
+            )
+        )
+    return results
+
+
+def _synthesis_task(args) -> Dict:
+    """Synthesise and extract a single row (thin wrapper over the group path)."""
+    return _synthesis_group_task([args])[0]
 
 
 def _write_zarr_output(
@@ -977,6 +1061,40 @@ def _build_tasks(row_count: int, column_data: Mapping[str, np.ndarray], base_con
     return tasks
 
 
+def _group_tasks(tasks, base_config: TurbospectrumConfig):
+    """Group tasks that map to the same Turbospectrum output stem.
+
+    Each group is synthesised exactly once. Only Intensity rows driven by a
+    shared mu axis (``mu_sampling.points``) collapse together — they share one
+    mu-independent ``.intensity.spec`` and differ only in target mu. Every other
+    row (Flux, or per-row LHS mu, whose stem already encodes mu) is its own
+    group, preserving the previous one-task-per-row behaviour.
+    """
+    ms = getattr(base_config, "mu_sampling", {}) or {}
+    shared_mu_axis = isinstance(ms, Mapping) and bool(ms.get("points"))
+    if not shared_mu_axis:
+        return [[task] for task in tasks]
+
+    groups: "Dict[str, List]" = {}
+    singletons: List = []
+    for task in tasks:
+        _, row_values = task
+        output_mode = str(row_values.get("output_mode") or getattr(base_config, "output_mode", "Flux"))
+        if output_mode.lower() != "intensity":
+            singletons.append([task])
+            continue
+        # The output stem run_single_synthesis writes for the shared-mu case is
+        # mu-independent, so dropping "mu" yields the same key for a point's rows.
+        key_row = {k: v for k, v in row_values.items() if k != "mu"}
+        stem = get_synthesis_output_stem_from_params(
+            key_row,
+            default_output_mode=getattr(base_config, "output_mode", "Flux"),
+            default_calculation_mode="NLTE" if base_config.nlte else "LTE",
+        )
+        groups.setdefault(stem, []).append(task)
+    return list(groups.values()) + singletons
+
+
 def _validate_synthesis_results(
     *,
     statuses: Sequence[str],
@@ -1096,6 +1214,13 @@ def main() -> None:
     mu_selected_index = np.full(row_count, -1, dtype=np.int16)
 
     tasks = _build_tasks(row_count, column_data, config)
+    groups = _group_tasks(tasks, config)
+    if len(groups) < len(tasks):
+        logger.info(
+            "Deduplicated synthesis: %d rows -> %d unique output stems (shared mu axis)",
+            len(tasks),
+            len(groups),
+        )
     worker_count = determine_worker_count(config, requested_workers=args.workers)
 
     compressor_cfg: Dict[str, object] = {}
@@ -1108,67 +1233,72 @@ def main() -> None:
     tracker = FailFastTracker(threshold=args.fail_fast_after)
     early_exit = False
 
+    def _record_result(result: Dict) -> None:
+        idx = int(result["index"])
+        statuses[idx] = result["status"]
+        messages[idx] = result["message"]
+        try:
+            mu_selected[idx] = float(result.get("mu_selected", np.nan))
+        except Exception:
+            mu_selected[idx] = np.nan
+        try:
+            mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
+        except Exception:
+            mu_selected_index[idx] = -1
+        if result.get("spectrum"):
+            fluxes[idx] = result["spectrum"][0]
+            continua[idx] = result["spectrum"][1]
+        is_success = str(result["status"]).lower() in _SUCCESS_STATUSES
+        if is_success:
+            tracker.record_success()
+        else:
+            tracker.record_failure(result["message"])
+        log_method = logger.info if is_success else logger.error
+        log_method(
+            "[%d/%d] %s %s (%.2fs) - %s",
+            idx + 1,
+            row_count,
+            str(result["status"]).upper(),
+            result["base_name"],
+            result["duration"],
+            result["message"],
+        )
+
+    def _trigger_early_exit() -> None:
+        logger.error(
+            "Early exit after %d consecutive failures — cancelling remaining tasks. %s",
+            tracker.consecutive_failures,
+            tracker.summary(),
+        )
+        for f in futures:
+            f.cancel()
+
     with ProcessPoolExecutor(max_workers=worker_count, initializer=_init_worker, initargs=(config,)) as executor:
-        futures = {executor.submit(_synthesis_task, task): task[0] for task in tasks}
+        futures = {executor.submit(_synthesis_group_task, group): group for group in groups}
         for future in as_completed(futures):
-            idx = futures[future]
+            group = futures[future]
             try:
-                result = future.result()
+                group_results = future.result()
             except Exception as exc:  # noqa: BLE001
-                statuses[idx] = "exception"
-                messages[idx] = str(exc)
-                logger.exception("Task %d crashed: %s", idx, exc)
-                tracker.record_failure(str(exc))
+                for gidx, _row in group:
+                    statuses[gidx] = "exception"
+                    messages[gidx] = str(exc)
+                    tracker.record_failure(str(exc))
+                logger.exception("Group task crashed (%d rows): %s", len(group), exc)
                 if tracker.should_exit:
-                    logger.error(
-                        "Early exit after %d consecutive failures — cancelling remaining tasks. %s",
-                        tracker.consecutive_failures,
-                        tracker.summary(),
-                    )
                     early_exit = True
-                    for f in futures:
-                        f.cancel()
+                    _trigger_early_exit()
                     break
                 continue
 
-            statuses[idx] = result["status"]
-            messages[idx] = result["message"]
-            try:
-                mu_selected[idx] = float(result.get("mu_selected", np.nan))
-            except Exception:
-                mu_selected[idx] = np.nan
-            try:
-                mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
-            except Exception:
-                mu_selected_index[idx] = -1
-            if result.get("spectrum"):
-                fluxes[idx] = result["spectrum"][0]
-                continua[idx] = result["spectrum"][1]
-            status_text = str(result["status"]).upper()
-            if str(result["status"]).lower() in _SUCCESS_STATUSES:
-                tracker.record_success()
-            else:
-                tracker.record_failure(result["message"])
-            log_method = logger.info if str(result["status"]).lower() in _SUCCESS_STATUSES else logger.error
-            log_method(
-                "[%d/%d] %s %s (%.2fs) - %s",
-                idx + 1,
-                row_count,
-                status_text,
-                result["base_name"],
-                result["duration"],
-                result["message"],
-            )
+            for result in group_results:
+                _record_result(result)
+                if tracker.should_exit:
+                    break
 
             if tracker.should_exit:
-                logger.error(
-                    "Early exit after %d consecutive failures — cancelling remaining tasks. %s",
-                    tracker.consecutive_failures,
-                    tracker.summary(),
-                )
                 early_exit = True
-                for f in futures:
-                    f.cancel()
+                _trigger_early_exit()
                 break
 
     if early_exit:

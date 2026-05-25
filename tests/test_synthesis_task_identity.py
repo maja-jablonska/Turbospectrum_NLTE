@@ -115,6 +115,36 @@ class SynthesisTaskIdentityTests(unittest.TestCase):
             self.assertEqual(str(tasks[0][0][1]["a"]), "+0.00")
             self.assertEqual(str(tasks[0][1][1]["a"]), "+0.10")
 
+    def test_build_shard_task_batches_groups_shared_mu_rows_into_one_batch(self) -> None:
+        # Intensity rows that share a mu axis must land in a single batch so the
+        # spectrum is synthesised once (serially) instead of racing across workers.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TurbospectrumConfig(
+                project_root=tmpdir,
+                output_mode="Intensity",
+                nlte=False,
+                mu_sampling={"mode": "nearest", "points": [0.15, 0.45, 0.75], "min": 0.15, "max": 0.75},
+            )
+            indices = np.arange(3, dtype=np.int64)  # one physical point, 3 mu rows
+            columns = {
+                "teff": np.asarray([5000, 5000, 5000]),
+                "logg": np.asarray([4.5, 4.5, 4.5]),
+                "feh": np.asarray([0.0, 0.0, 0.0]),
+                "lam_min": np.asarray([5000.0, 5000.0, 5000.0]),
+                "lam_max": np.asarray([5010.0, 5010.0, 5010.0]),
+                "lam_step": np.asarray([0.01, 0.01, 0.01]),
+                "turbvel": np.asarray(["01", "01", "01"], dtype=object),
+                "t_value": np.asarray(["01", "01", "01"], dtype=object),
+                "mu": np.asarray([0.15, 0.45, 0.75]),
+                "output_mode": np.asarray(["Intensity"] * 3, dtype=object),
+                "calculation_mode": np.asarray(["LTE"] * 3, dtype=object),
+            }
+            # batch_size smaller than the group: the group must still stay whole.
+            tasks, _ = _build_task_batches(indices, columns, batch_size=2, config=config)
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(len(tasks[0]), 3)
+            self.assertEqual({float(row["mu"]) for _g, row in tasks[0]}, {0.15, 0.45, 0.75})
+
     def test_fit_stem_to_path_limits_shortens_long_fortran_paths(self) -> None:
         stem = (
             "p5000_g+4.0_m0.0_t01_st_z-0.50_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00_"

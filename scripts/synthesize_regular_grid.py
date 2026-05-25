@@ -568,11 +568,13 @@ def _materialize_synthesis_config(
         mu_sampling = synthesis.setdefault("mu_sampling", {})
         if not isinstance(mu_sampling, dict):
             raise ValueError("synthesis_parameters.mu_sampling must be a JSON object in synthesis config")
-        # Match the LHS path: respect a user-set mu_sampling.mode and only fill
-        # in the bounds. synthesize_spectra_from_zarr.py auto-selects "nearest"
-        # whenever a per-row mu column is present, so forcing it here would
-        # silently override an explicit "random"/"target" choice.
-        mu_sampling.setdefault("mode", "nearest")
+        # mu_range rows are explicit per-mu targets, so each row must keep the
+        # mu nearest its own target ("random" would scramble the row->mu map).
+        # Make that explicit in the runtime config; only preserve an already
+        # target-style mode ("target" is equivalent to "nearest").
+        mode = str(mu_sampling.get("mode", "")).strip().lower()
+        if mode not in {"nearest", "target"}:
+            mu_sampling["mode"] = "nearest"
         mu_sampling.setdefault("count", 1)
         mu_sampling["min"] = mu_min
         mu_sampling["max"] = mu_max

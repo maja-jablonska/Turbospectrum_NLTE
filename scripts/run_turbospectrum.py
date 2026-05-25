@@ -165,10 +165,11 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
         mu_sampling = cfg_data.get("mu_sampling", {}) or {}
         if not isinstance(mu_sampling, dict):
             mu_sampling = {}
-        if cfg_data["output_mode"] == "Intensity":
-            mode = str(mu_sampling.get("mode", "none")).strip().lower()
-            if mode in {"", "none"}:
-                mu_sampling["mode"] = "random"
+        # Do NOT force an Intensity default of mode="random" here. The per-row
+        # consumers (synthesize_spectra_from_zarr.py / run_turbospectrum_shard.py)
+        # pick "nearest" when the row carries a target mu and "random" only when
+        # it does not. Forcing "random" at load time would defeat that and make
+        # each row select an arbitrary mu instead of its requested one.
         cfg_data["mu_sampling"] = mu_sampling
         return cfg_data
 
@@ -222,10 +223,8 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     mu_sampling = synthesis.get("mu_sampling", {}) or {}
     if not isinstance(mu_sampling, dict):
         mu_sampling = {}
-    if output_mode == "Intensity":
-        mode = str(mu_sampling.get("mode", "none")).strip().lower()
-        if mode in {"", "none"}:
-            mu_sampling["mode"] = "random"
+    # Leave mode unset for Intensity; the per-row consumer resolves it to
+    # "nearest" (target mu present) or "random" (no target). See note above.
     flat["mu_sampling"] = mu_sampling
 
     top_nlte_cfg = cfg_data.get("nlte", {}) or {}
@@ -431,10 +430,8 @@ class TurbospectrumConfig:
             raise ValueError(f"resolution must be > 0, got {self.resolution!r}")
         if not isinstance(self.mu_sampling, dict):
             self.mu_sampling = {}
-        if self.output_mode == "Intensity":
-            mode = str(self.mu_sampling.get("mode", "none")).strip().lower()
-            if mode in {"", "none"}:
-                self.mu_sampling["mode"] = "random"
+        # Intentionally no Intensity default of mode="random": the per-row
+        # consumer chooses "nearest" when the row has a target mu, else "random".
         if self.worker_memory_gb not in (None, ""):
             self.worker_memory_gb = float(self.worker_memory_gb)
             if self.worker_memory_gb <= 0:
