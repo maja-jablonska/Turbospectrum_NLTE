@@ -54,6 +54,9 @@ __pycache__/
 # IDE
 */*.code-workspace
 
+# Local conda env (copy from environment.example.yml). Template stays tracked.
+/environment.yml
+
 # Runtime / output dirs
 spectra/
 */*.dat

@@ -24,4 +24,4 @@ export ROWS_PER_SHARD="${ROWS_PER_SHARD:-2}"
 export VALIDATE_WORKERS="${VALIDATE_WORKERS:-2}"
 export MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-8}"
 
-exec bash "${PBS_O_WORKDIR}/turbospectrum_regular_grid_example.pbs"
+exec bash "${PBS_O_WORKDIR}/turbospectrum_pipeline_example.pbs"

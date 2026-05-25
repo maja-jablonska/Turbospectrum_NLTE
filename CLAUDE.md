@@ -74,7 +74,7 @@ python3 scripts/resolve_shard_layout.py --zarr-path ... --shard-count N
 
 ### PBS / Gadi
 
-Production synthesis uses `turbospectrum_pipeline_example.pbs` or `turbospectrum_regular_grid_example.pbs`. Common overrides via `qsub -v CONFIG_PATH=...,RUN_ROOT=...,WORKERS=32,ROWS_PER_SHARD=128,...`. `FORCE_RESTART=1` wipes the grid zarr and regenerates it, then also discards prior shard outputs and the merged zarr (grid is kept intact under `FINALIZE_ONLY=1`); default behavior resumes missing shards. `FINALIZE_ONLY=1` skips synthesis and just validates/merges.
+Production synthesis uses a single config-driven script, `turbospectrum_pipeline_example.pbs`, for **both** LHS/ML and regular/Cartesian grids — the grid type is selected by the config (`grid.sampling: "lhs"|"grid"`), not by the script name. Common overrides via `qsub -v CONFIG_PATH=...,RUN_ROOT=...,WORKERS=32,ROWS_PER_SHARD=128,...`. `FORCE_RESTART=1` wipes the grid zarr and regenerates it, then also discards prior shard outputs and the merged zarr (grid is kept intact under `FINALIZE_ONLY=1`); default behavior resumes missing shards. `FINALIZE_ONLY=1` skips synthesis and just validates/merges. `SKIP_SYNTHESIS=1` (or `runtime.skip_synthesis`) builds the grid only. `AUTO_PRUNE_STALE_SHARDS=1` (opt-in) drops layout-mismatched shards before resuming. (`scripts/synthesize_regular_grid.py` remains as the regular-grid sampler library imported by `generate_grid.py`, not a standalone production entry point.)
 
 ## Repository Layout (Big Picture)
 

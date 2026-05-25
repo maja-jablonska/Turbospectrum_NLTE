@@ -1,3 +1,7 @@
+# Conda environment template.
+# Copy to a local, gitignored working copy and edit as needed:
+#   cp environment.example.yml environment.yml
+#   conda env create -f environment.yml
 name: turbospectrum
 channels:
   - conda-forge
