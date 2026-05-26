@@ -22,6 +22,8 @@ import polars as pl
 import zarr
 from numcodecs import Blosc, VLenUTF8
 
+from generate_grid import nearest_t_value_for_turbvel
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -221,8 +223,9 @@ def _ordered_abundance_keys(abundances_cfg: Dict[str, Any]) -> List[str]:
     return ordered
 
 
-def _resolve_sampling_dimensions(config: Dict) -> Tuple[List[Tuple[float, float]], List[str], Dict[str, str], List[str] | None]:
+def _resolve_sampling_dimensions(config: Dict) -> Tuple[List[Tuple[float, float]], List[str], Dict[str, str], List[str] | None, Tuple[float, float] | None]:
     bounds = _resolve_bounds(config)
+    bounds_cfg = config.get("bounds") or {}
 
     abundances_cfg = config.get("abundances", {})
     sampled_abundances: List[str] = []
@@ -237,15 +240,31 @@ def _resolve_sampling_dimensions(config: Dict) -> Tuple[List[Tuple[float, float]
         else:
             fixed_abundances[element] = _abundance_value(raw_val)
 
+    # Microturbulence: continuous (bounds.vmicro) takes precedence over the
+    # discrete sample_turbvel path; the two are mutually exclusive.
+    vmicro_bounds_cfg = bounds_cfg.get("vmicro")
+    vmicro_range: Tuple[float, float] | None = None
+    if isinstance(vmicro_bounds_cfg, dict):
+        if "min" not in vmicro_bounds_cfg or "max" not in vmicro_bounds_cfg:
+            raise ValueError("Bounds for 'vmicro' must include 'min' and 'max'")
+        vmicro_range = (float(vmicro_bounds_cfg["min"]), float(vmicro_bounds_cfg["max"]))
+
     turbvel_cfg = config.get("turbvel", "01")
     sample_turbvel = bool(config.get("sample_turbvel", False))
+    if vmicro_range is not None and sample_turbvel:
+        raise ValueError(
+            "Use either bounds.vmicro (continuous) or sample_turbvel (discrete), not both"
+        )
+
     turbvel_options = None
-    if sample_turbvel:
+    if vmicro_range is not None:
+        bounds.append(vmicro_range)
+    elif sample_turbvel:
         options_raw = config.get("turbvel_options", turbvel_cfg if isinstance(turbvel_cfg, Sequence) and not isinstance(turbvel_cfg, (str, bytes)) else None)
         turbvel_options = _validate_turbvel_options(options_raw)
         bounds.append((0, float(len(turbvel_options))))
 
-    return bounds, sampled_abundances, fixed_abundances, turbvel_options
+    return bounds, sampled_abundances, fixed_abundances, turbvel_options, vmicro_range
 
 
 def _default_index_parquet_path(zarr_path: str) -> str:
@@ -345,14 +364,16 @@ def main() -> None:
     logger.info("Versions: polars=%s zarr=%s numpy=%s", getattr(pl, "__version__", "?"), getattr(zarr, "__version__", "?"), getattr(np, "__version__", "?"))
 
     t_step = time.perf_counter()
-    bounds, sampled_abundances, fixed_abundances, sampled_turbvel_options = _resolve_sampling_dimensions(config)
+    bounds, sampled_abundances, fixed_abundances, sampled_turbvel_options, vmicro_range = _resolve_sampling_dimensions(config)
     logger.debug("Fixed abundances: %s", fixed_abundances)
     logger.debug("turbvel sampled options: %s", sampled_turbvel_options)
+    logger.debug("vmicro continuous range: %s", vmicro_range)
     logger.debug("t_value_options: %s", config.get("t_value_options", ["01"]))
     logger.info(
-        "Sampling dims: teff/logg/feh + sampled_abundances=%s + sample_turbvel=%s",
+        "Sampling dims: teff/logg/feh + sampled_abundances=%s + sample_turbvel=%s + sample_vmicro=%s",
         sampled_abundances,
         bool(sampled_turbvel_options),
+        vmicro_range is not None,
     )
     logger.info("Prepared sampling dimensions in %.2fs", time.perf_counter() - t_step)
 
@@ -429,15 +450,22 @@ def main() -> None:
         abundance_samples[element] = np.array([f"{val:+0.2f}" for val in abundance_values], dtype=object)
         column_idx += 1
 
-    if sampled_turbvel_options:
+    if vmicro_range is not None:
+        # Continuous microturbulence sampled as an LHS dimension; t_value snaps
+        # to the nearest MARCS atmosphere label so the stored label matches the
+        # one synthesis will actually load.
+        turbvel_series = np.round(lhs[:, column_idx], 2)
+        column_idx += 1
+        t_value_series = nearest_t_value_for_turbvel(turbvel_series, t_value_options)
+    elif sampled_turbvel_options:
         turbvel_indices = np.floor(lhs[:, column_idx]).astype(int)
         turbvel_indices = np.clip(turbvel_indices, 0, len(sampled_turbvel_options) - 1)
         turbvel_series = np.asarray([sampled_turbvel_options[idx] for idx in turbvel_indices], dtype=object)
         column_idx += 1
+        t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
     else:
         turbvel_series = _choose_series(turbvel_cfg, rng, sample_count_new, "turbvel")
-
-    t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
+        t_value_series = _choose_series(t_value_options, rng, sample_count_new, "t_value_options")
 
     t_step = time.perf_counter()
     abundance_columns = {

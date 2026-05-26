@@ -187,6 +187,44 @@ def _choose_series(raw_value: Any, rng: np.random.Generator, length: int, name: 
     return np.full(length, raw_value, dtype=object)
 
 
+def nearest_t_value_for_turbvel(turbvel_values: Sequence[Any], t_value_options: Sequence[Any]) -> np.ndarray:
+    """Snap each row's atmosphere t_value label to the option closest in km/s
+    to its sampled turbvel.
+
+    Used when microturbulence is sampled continuously: turbvel is the float
+    handed to babsma/bsyn, while the on-disk MARCS atmosphere only exists at
+    a few discrete labels ("01","02","05",...). Picking the nearest label per
+    row keeps the stored t_value faithful to what synthesis will actually load.
+    """
+    pool = [str(opt).strip() for opt in (t_value_options or []) if str(opt).strip()]
+    if not pool:
+        pool = ["01"]
+    fallback = pool[0]
+    label_floats: List[Tuple[str, float]] = []
+    for label in pool:
+        try:
+            label_floats.append((label, float(label)))
+        except ValueError:
+            label_floats.append((label, float("inf")))
+
+    out = np.empty(len(turbvel_values), dtype=object)
+    for i, raw in enumerate(turbvel_values):
+        try:
+            target = float(str(raw).strip())
+        except (TypeError, ValueError):
+            out[i] = fallback
+            continue
+        best_label = fallback
+        best_dist = float("inf")
+        for label, value in label_floats:
+            d = abs(value - target)
+            if d < best_dist:
+                best_dist = d
+                best_label = label
+        out[i] = best_label
+    return out
+
+
 def _ordered_abundance_keys(abund_cfg: Mapping[str, Any]) -> List[str]:
     configured = {str(key).strip() for key in (abund_cfg or {}).keys() if str(key).strip()}
     ordered: List[str] = [key for key in LEGACY_ABUNDANCE_KEYS if key in configured]
@@ -225,12 +263,28 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
         else:
             fixed_abundances[element] = _abundance_value(raw_val)
 
+    # Microturbulence can be drawn three ways:
+    #   1. bounds.vmicro {min,max} -> continuous LHS dimension (km/s float
+    #      stored verbatim as `turbvel` for babsma/bsyn; `t_value` snaps to
+    #      the nearest entry in `t_value_options`).
+    #   2. sample_turbvel + turbvel_options -> discrete pick from a label list.
+    #   3. Fixed `turbvel` series (legacy default).
+    vmicro_bounds = bounds_cfg.get("vmicro")
+    sample_vmicro = isinstance(vmicro_bounds, Mapping)
     sample_turbvel = bool(config.get("sample_turbvel", False))
+    if sample_vmicro and sample_turbvel:
+        raise ValueError(
+            "Use either bounds.vmicro (continuous) or sample_turbvel (discrete), not both"
+        )
     turbvel_options = config.get("turbvel_options") or ["01", "02", "03", "04", "05"]
     if isinstance(turbvel_options, (str, bytes)):
         turbvel_options = [turbvel_options]
     turbvel_options = [f"{int(x):02d}" if isinstance(x, (int, float, np.integer, np.floating)) else str(x) for x in turbvel_options]
-    if sample_turbvel:
+    if sample_vmicro:
+        if "min" not in vmicro_bounds or "max" not in vmicro_bounds:
+            raise ValueError("Bounds for 'vmicro' must include 'min' and 'max'")
+        bounds.append((float(vmicro_bounds["min"]), float(vmicro_bounds["max"])))
+    elif sample_turbvel:
         if not turbvel_options:
             raise ValueError("sample_turbvel=true requires at least one turbvel option")
         bounds.append((0.0, float(len(turbvel_options))))
@@ -252,15 +306,20 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator) ->
         col_idx += 1
 
     turbvel_cfg = config.get("turbvel", "01")
-    if sample_turbvel:
+    t_value_options = config.get("t_value_options", ["01"])
+    if sample_vmicro:
+        turbvel = np.round(lhs[:, col_idx], 2)
+        col_idx += 1
+        t_value = nearest_t_value_for_turbvel(turbvel, t_value_options)
+    elif sample_turbvel:
         indices = np.floor(lhs[:, col_idx]).astype(int)
         indices = np.clip(indices, 0, len(turbvel_options) - 1)
         turbvel = np.asarray([turbvel_options[i] for i in indices], dtype=object)
         col_idx += 1
+        t_value = _choose_series(t_value_options, rng, sample_count, "t_value_options")
     else:
         turbvel = _choose_series(turbvel_cfg, rng, sample_count, "turbvel")
-
-    t_value = _choose_series(config.get("t_value_options", ["01"]), rng, sample_count, "t_value_options")
+        t_value = _choose_series(t_value_options, rng, sample_count, "t_value_options")
 
     synthesis_cfg = config.get("synthesis") or {}
     lam_min = float(synthesis_cfg.get("lam_min", 6000))
