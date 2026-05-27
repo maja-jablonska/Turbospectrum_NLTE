@@ -314,7 +314,7 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator, ba
         from synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
     except ImportError:
         from .synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
-    t_value = nearest_t_value_for_turbvel(turbvel, config.get("t_value_options", ["01"]))
+    t_value = nearest_t_value_for_turbvel(turbvel, config.get("t_value_options", ["01", "02", "05"]))
 
     lam_min = float(synthesis_cfg.get("lam_min", 6000))
     lam_max = float(synthesis_cfg.get("lam_max", 6100))

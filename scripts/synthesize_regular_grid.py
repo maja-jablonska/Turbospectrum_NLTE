@@ -375,15 +375,15 @@ def resolve_regular_sampling(config: Mapping[str, Any], rng: Any = None, base_di
     # t_value pool (grid.axes.t_value_options or top-level), normalized to labels.
     tvo_raw = axes.get("t_value_options")
     if tvo_raw is None:
-        tvo_raw = grid.get("t_value_options", ["01"])
+        tvo_raw = grid.get("t_value_options", ["01", "02", "05"])
     if isinstance(tvo_raw, str):
         t_value_options = [tok.strip() for tok in tvo_raw.split(",") if tok.strip()]
     elif isinstance(tvo_raw, Sequence) and not isinstance(tvo_raw, (bytes, bytearray)):
         t_value_options = [str(tok).strip() for tok in tvo_raw if str(tok).strip()]
     else:
-        t_value_options = ["01"]
+        t_value_options = ["01", "02", "05"]
     if not t_value_options:
-        t_value_options = ["01"]
+        t_value_options = ["01", "02", "05"]
     t_value_options = [
         f"{int(tok):02d}" if tok.lstrip("+-").isdigit() else tok for tok in t_value_options
     ]
@@ -615,7 +615,7 @@ def main() -> None:
         "--t-value-options",
         default=None,
         help=(
-            "Comma-separated atmosphere t_value identifiers (default ['01']). "
+            "Comma-separated atmosphere t_value identifiers (default ['01','02','05'], the standard MARCS values). "
             "Each row's t_value is snapped to the option closest to that row's turbvel."
         ),
     )
@@ -721,15 +721,15 @@ def main() -> None:
     # is shared with the LHS path through the same config key.
     t_value_options_raw = _coalesce(args.t_value_options, cfg, ("grid", "axes", "t_value_options"), None)
     if t_value_options_raw is None:
-        t_value_options_raw = _cfg_get(cfg, ("t_value_options",), ["01"])
+        t_value_options_raw = _cfg_get(cfg, ("t_value_options",), ["01", "02", "05"])
     if isinstance(t_value_options_raw, str):
         t_value_options = [tok.strip() for tok in t_value_options_raw.split(",") if tok.strip()]
     elif isinstance(t_value_options_raw, Sequence) and not isinstance(t_value_options_raw, (bytes, bytearray)):
         t_value_options = [str(tok).strip() for tok in t_value_options_raw if str(tok).strip()]
     else:
-        t_value_options = ["01"]
+        t_value_options = ["01", "02", "05"]
     if not t_value_options:
-        t_value_options = ["01"]
+        t_value_options = ["01", "02", "05"]
     # Normalize integer-like tokens to zero-padded labels ("1" -> "01").
     t_value_options = [
         f"{int(tok):02d}" if tok.lstrip("+-").isdigit() else tok
