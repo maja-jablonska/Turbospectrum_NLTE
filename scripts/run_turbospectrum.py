@@ -382,6 +382,12 @@ class TurbospectrumConfig:
     # Optional post-processing configuration for intensity outputs.
     # Expected shape (all keys optional):
     #   {"mode": "nearest", "count": 1, "seed": 123, "min": 0.0, "max": 1.0, "reduce": "first"}
+    # mode values:
+    #   "nearest" / "target" / "exact" - with a per-row target mu, bsyn is invoked
+    #       with MU-POINTS=[target_mu] so the spectrum is synthesised at exactly
+    #       that mu; the post-selection then trivially returns the single column.
+    #   "random" - pick a uniformly random mu column (no target).
+    #   "none" - no post-selection (Flux, or all 12 default columns kept).
     mu_sampling: Dict[str, Any] = field(default_factory=dict)
 
     # Synthesis Parameters

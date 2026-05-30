@@ -144,7 +144,7 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
     if (
         isinstance(ts_mu_sampling, Mapping)
         and str(grid_synthesis.get("output_mode", "Flux")).strip().lower() == "intensity"
-        and str(ts_mu_sampling.get("mode", "none")).strip().lower() in {"nearest", "target"}
+        and str(ts_mu_sampling.get("mode", "none")).strip().lower() in {"nearest", "target", "exact"}
     ):
         grid_synthesis["mu_sampling"] = dict(ts_mu_sampling)
         grid_cfg["synthesis"] = grid_synthesis
@@ -238,6 +238,23 @@ def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir
         calc_mode,
         warn=lambda msg: print(f"[pipeline] WARNING: {msg}", file=sys.stderr),
     )
+
+    # Single output_mode switch: grid.synthesis.output_mode is authoritative,
+    # so users don't repeat it under turbospectrum.synthesis_parameters.
+    grid_output_mode = ((pipeline_cfg.get("grid") or {}).get("synthesis") or {}).get("output_mode")
+    if grid_output_mode is not None:
+        synth_params = ts_cfg.setdefault("synthesis_parameters", {})
+        if not isinstance(synth_params, dict):
+            raise ValueError("turbospectrum.synthesis_parameters must be a JSON object")
+        existing = synth_params.get("output_mode")
+        if existing is not None and str(existing).strip().lower() != str(grid_output_mode).strip().lower():
+            print(
+                f"[pipeline] WARNING: grid.synthesis.output_mode={grid_output_mode!r} disagrees with "
+                f"turbospectrum.synthesis_parameters.output_mode={existing!r}; using the grid value. "
+                "Set output_mode only under grid.synthesis to avoid the duplicate.",
+                file=sys.stderr,
+            )
+        synth_params["output_mode"] = str(grid_output_mode)
 
     # Place the temp config next to scratch if provided (good for HPC), else in config dir.
     base = scratch or os.path.join(config_dir, ".pipeline_tmp")

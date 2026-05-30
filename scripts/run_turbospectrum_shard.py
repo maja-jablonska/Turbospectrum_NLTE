@@ -129,7 +129,7 @@ def _choose_mu_indices(
 
     count = int(ms.get("count", 1) or 1)
     candidates = _mu_candidates(mu_points, cfg)
-    if mode in {"nearest", "target"} and target_mu is not None:
+    if mode in {"nearest", "target", "exact"} and target_mu is not None:
         distances = np.abs(mu_points[candidates] - float(target_mu))
         order = np.lexsort((candidates, distances))
         ranked = candidates[order]
@@ -565,7 +565,7 @@ def _synthesis_task(batch):
                             mu_min = float(ms_cfg.get("min", 0.0))
                             mu_max = float(ms_cfg.get("max", 1.0))
                             count = int(ms_cfg.get("count", 1) or 1)
-                            if mu_mode in {"nearest", "target"} and target_mu is not None:
+                            if mu_mode in {"nearest", "target", "exact"} and target_mu is not None:
                                 denom = mu_max - mu_min
                                 frac = 0.0 if denom <= 0 else float(np.clip((target_mu - mu_min) / denom, 0.0, 1.0))
                                 ranked = np.argsort(np.abs(np.arange(n_mu, dtype=np.float64) - frac * max(0, n_mu - 1)))

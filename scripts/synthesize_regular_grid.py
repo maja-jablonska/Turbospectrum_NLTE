@@ -571,9 +571,9 @@ def _materialize_synthesis_config(
         # mu_range rows are explicit per-mu targets, so each row must keep the
         # mu nearest its own target ("random" would scramble the row->mu map).
         # Make that explicit in the runtime config; only preserve an already
-        # target-style mode ("target" is equivalent to "nearest").
+        # target-style mode ("target" and "exact" are equivalent to "nearest").
         mode = str(mu_sampling.get("mode", "")).strip().lower()
-        if mode not in {"nearest", "target"}:
+        if mode not in {"nearest", "target", "exact"}:
             mu_sampling["mode"] = "nearest"
         mu_sampling.setdefault("count", 1)
         mu_sampling["min"] = mu_min

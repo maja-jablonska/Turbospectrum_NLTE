@@ -266,7 +266,7 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator, ba
     sample_mu = False
     if isinstance(mu_sampling_cfg, Mapping) and str(synthesis_cfg.get("output_mode", "Flux")).strip().lower() == "intensity":
         mu_mode = str(mu_sampling_cfg.get("mode", "none")).strip().lower()
-        if mu_mode in {"nearest", "target"}:
+        if mu_mode in {"nearest", "target", "exact"}:
             mu_min = float(mu_sampling_cfg.get("min", 0.0))
             mu_max = float(mu_sampling_cfg.get("max", 1.0))
             if mu_max <= mu_min:
