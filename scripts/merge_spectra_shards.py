@@ -1429,6 +1429,32 @@ def main() -> None:
     for s in statuses:
         status_counts[s] = status_counts.get(s, 0) + 1
 
+    # Aggregate the per-shard out-of-memory verdict (stamped by
+    # run_turbospectrum_shard.py) so the merged store records whether the run
+    # was degraded by memory pressure rather than bad input data.
+    mem_shards_suspected = 0
+    mem_counts_total = {"explicit_oom": 0, "truncated_or_empty_output": 0, "other": 0}
+    for snapshot in shard_attr_snapshots:
+        if str(snapshot.get("memory_pressure_suspected", "")).lower() in ("1", "true"):
+            mem_shards_suspected += 1
+        raw_counts = snapshot.get("memory_pressure_counts")
+        if raw_counts:
+            try:
+                parsed = json.loads(raw_counts) if isinstance(raw_counts, str) else dict(raw_counts)
+                for key in mem_counts_total:
+                    mem_counts_total[key] += int(parsed.get(key, 0))
+            except (ValueError, TypeError):
+                pass
+    memory_pressure_suspected = mem_shards_suspected > 0
+    if memory_pressure_suspected:
+        print(
+            f"WARNING: memory pressure suspected in {mem_shards_suspected}/{len(shards)} "
+            f"merged shard(s) (explicit_oom={mem_counts_total['explicit_oom']}, "
+            f"truncated_or_empty_output={mem_counts_total['truncated_or_empty_output']}). "
+            "Affected rows were most likely killed mid-write by the kernel OOM killer; "
+            "re-run them with fewer workers per node or more memory to recover."
+        )
+
     param_units: Dict[str, str] = {}
     for name in param_name_list:
         if name == "teff":
@@ -1459,6 +1485,9 @@ def main() -> None:
         "n_params": int(params.shape[1]),
         "shards_merged": len(shards),
         "status_counts": status_counts,
+        "memory_pressure_suspected": bool(memory_pressure_suspected),
+        "memory_pressure_shards": int(mem_shards_suspected),
+        "memory_pressure_counts": json.dumps(mem_counts_total, sort_keys=True),
         "continuum_present": bool(saw_continuum),
         "output_mode_values": output_mode_values,
         "calculation_mode_values": calculation_mode_values,
