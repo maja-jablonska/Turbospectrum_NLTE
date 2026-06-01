@@ -48,7 +48,12 @@ from provenance_contract import (  # noqa: E402
     is_meaningful_provenance_value,
 )
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
-from synthesis_validation import SUCCESS_STATUSES, FailFastTracker, validate_synthesis_results
+from synthesis_validation import (
+    SUCCESS_STATUSES,
+    FailFastTracker,
+    diagnose_memory_pressure,
+    validate_synthesis_results,
+)
 
 # Number of spectra rows per Zarr chunk for flux/continuum arrays in shard
 # output.  Higher values drastically reduce inode count on parallel
@@ -1362,6 +1367,11 @@ def main():
     n_failures = sum(v for k, v in status_counts.items() if k.lower() not in SUCCESS_STATUSES)
     validation_failed = n_failures > args.max_failures
 
+    # Classify any failures by whether they look memory-induced (OOM kill /
+    # truncated output) so the verdict is queryable from the shard attrs at
+    # merge time, not just visible in the log.
+    memory_diagnosis = diagnose_memory_pressure(statuses, messages)
+
     logger.info(
         "Writing shard output: %s (rows=%d wl=%d)",
         write_path if write_path != final_path else final_path,
@@ -1450,6 +1460,16 @@ def main():
         "compiler": str(getattr(config, "compiler", "")),
         "nlte": bool(getattr(config, "nlte", False)),
         "status_counts": dict(status_counts),
+        "n_failures": int(n_failures),
+        "memory_pressure_suspected": bool(memory_diagnosis["suspected"]),
+        "memory_pressure_counts": json.dumps(
+            {
+                "explicit_oom": int(memory_diagnosis["explicit_oom"]),
+                "truncated_or_empty_output": int(memory_diagnosis["truncated_or_empty_output"]),
+                "other": int(memory_diagnosis["other"]),
+            },
+            sort_keys=True,
+        ),
     }
     attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
     root.attrs.update(attrs_payload)
