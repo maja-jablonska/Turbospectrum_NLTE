@@ -1000,6 +1000,82 @@ def get_model_filename(teff, logg, feh, turb_str):
     return filename
 
 
+# The MARCS standard-composition model atmosphere actually used for a synthesis
+# encodes its intrinsic composition in the filename, e.g.
+#   p2500_g+3.0_m0.0_t00_st_z-0.25_a+0.10_c+0.00_n+0.00_o+0.10_r+0.00_s+0.00.mod
+# where z=[Fe/H], a=[alpha/Fe] (standard enhancement vs metallicity), and
+# o=[O/Fe] follows alpha while c/n=[C,N/Fe] are solar-scaled. These are
+# properties of the model *atmosphere* (the structure used), distinct from the
+# requested synthesis abundances handed to bsyn. We record them per-row so the
+# dataset captures which MARCS composition the lines were synthesised against.
+_MARCS_COMP_KEYS = ("marcs_fe_h", "marcs_a_fe", "marcs_c_fe", "marcs_n_fe", "marcs_o_fe")
+
+# Stellar parameters of the MARCS atmosphere actually used (the resolved model
+# file, whether exact match or nearest-neighbour snap). Always reported per row so
+# the dataset records the atmosphere the lines were synthesised against; for exact
+# matches these equal the requested teff/logg/turb, for snapped rows they are the
+# grid point the selection was clamped to. Distinct from the requested params in
+# result["params"]. (marcs_turb is the microturbulence in km/s, from the t-label.)
+# The atmosphere's [Fe/H] is reported by the composition column marcs_fe_h, so it
+# is deliberately not duplicated here.
+_MARCS_ATM_KEYS = ("marcs_teff", "marcs_logg", "marcs_turb")
+
+_MARCS_MODEL_RE = re.compile(
+    r"_z([+\-]\d+\.\d+)_a([+\-]\d+\.\d+)_c([+\-]\d+\.\d+)_n([+\-]\d+\.\d+)_o([+\-]\d+\.\d+)"
+)
+
+# Teff / logg / t-label / [Fe/H] prefix of a MARCS model filename, e.g.
+# "p5000_g+4.0_m0.0_t01_st_z+0.00_...". Handles plane-parallel (p) and spherical (s).
+_MARCS_ATM_RE = re.compile(
+    r"[ps](\d+)_g([+\-]\d+\.\d+)_m[\d.]+_t(\d+)_st_z([+\-]\d+\.\d+)"
+)
+
+
+def parse_marcs_composition(model_path: str) -> Dict[str, float]:
+    """Extract the MARCS atmosphere composition (z, a, c, n, o) from its filename.
+
+    Returns a dict keyed by :data:`_MARCS_COMP_KEYS`. Values are NaN when the
+    filename does not follow the standard MARCS naming convention (so callers
+    can write a uniform float column without special-casing).
+    """
+    name = os.path.basename(str(model_path or ""))
+    match = _MARCS_MODEL_RE.search(name)
+    if not match:
+        return {key: float("nan") for key in _MARCS_COMP_KEYS}
+    z, a, c, n, o = (float(match.group(i)) for i in range(1, 6))
+    return {
+        "marcs_fe_h": z,
+        "marcs_a_fe": a,
+        "marcs_c_fe": c,
+        "marcs_n_fe": n,
+        "marcs_o_fe": o,
+    }
+
+
+def parse_marcs_atmosphere_params(model_path: str) -> Dict[str, float]:
+    """Extract the MARCS atmosphere's teff/logg/turb from its filename.
+
+    Returns a dict keyed by :data:`_MARCS_ATM_KEYS`. ``marcs_turb`` is the
+    microturbulence in km/s decoded from the t-label (``t01`` -> 1.0). The
+    atmosphere's [Fe/H] is reported separately by the composition column
+    ``marcs_fe_h`` and so is not duplicated here. Values are NaN when the filename
+    does not follow the standard MARCS naming convention, so callers can write a
+    uniform float column without special-casing.
+    """
+    name = os.path.basename(str(model_path or ""))
+    match = _MARCS_ATM_RE.search(name)
+    if not match:
+        return {key: float("nan") for key in _MARCS_ATM_KEYS}
+    teff = float(match.group(1))
+    logg = float(match.group(2))
+    turb = float(match.group(3))  # t-label "01"/"02"/"05" -> 1.0/2.0/5.0 km/s
+    return {
+        "marcs_teff": teff,
+        "marcs_logg": logg,
+        "marcs_turb": turb,
+    }
+
+
 PERIODIC_TABLE = {
     "h": 1, "he": 2, "li": 3, "be": 4, "b": 5, "c": 6, "n": 7, "o": 8, "f": 9, "ne": 10,
     "na": 11, "mg": 12, "al": 13, "si": 14, "p": 15, "s": 16, "cl": 17, "ar": 18, "k": 19, "ca": 20,
@@ -1742,6 +1818,14 @@ def run_single_synthesis(args):
     is_intensity = output_mode == "Intensity"
     nlte_ascii_info: Optional[Dict[str, Any]] = None
     runtime_abundances: Dict[str, Any] = dict(synthesis_abundances)
+    # Composition of the MARCS atmosphere actually used. Populated once the model
+    # file is resolved (exact match or nearest-neighbour) below; stays NaN for
+    # rows that return before resolution (e.g. skipped/already-existing outputs).
+    marcs_composition: Dict[str, float] = {key: float("nan") for key in _MARCS_COMP_KEYS}
+    # Stellar params (teff/logg/feh/turb) of the MARCS atmosphere actually used.
+    # Populated alongside the composition once the model file is resolved (exact or
+    # nearest); stays NaN for rows that return before resolution (e.g. skipped).
+    marcs_atm: Dict[str, Any] = {key: float("nan") for key in _MARCS_ATM_KEYS}
 
     def build_result(status: str, message: str, *, output_path: str = "", log_path: str = ""):
         extra_params: Dict[str, Any] = {}
@@ -1767,6 +1851,8 @@ def run_single_synthesis(args):
                 "abundances": dict(runtime_abundances),
                 **extra_params,
             },
+            **{key: marcs_composition[key] for key in _MARCS_COMP_KEYS},
+            **{key: marcs_atm[key] for key in _MARCS_ATM_KEYS},
             "t_value": model_turb_str,
             "turbvel": str(synthesis_turb_raw) if synthesis_turb_raw is not None else "",
             "status": status,
@@ -1806,6 +1892,13 @@ def run_single_synthesis(args):
             return build_result("error", f"Model missing and nearest-neighbor selection failed: {message}")
         model_input_path = nearest["path"]
         fallback_model_message = message
+
+    # Record the composition and stellar params of the MARCS atmosphere actually
+    # used (the resolved model file, whether exact or nearest-neighbour) so they
+    # travel with the row. For exact matches these equal the requested params; for
+    # snapped rows they are the grid point the selection was clamped to.
+    marcs_composition = parse_marcs_composition(model_input_path)
+    marcs_atm = parse_marcs_atmosphere_params(model_input_path)
 
     nlte_info_file_for_run = (
         os.path.abspath(str(config.nlte_info_file))

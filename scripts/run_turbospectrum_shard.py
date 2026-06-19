@@ -25,6 +25,8 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from run_turbospectrum import (  # noqa: E402
+    _MARCS_ATM_KEYS,
+    _MARCS_COMP_KEYS,
     LinelistValidationError,
     TurbospectrumConfig,
     _normalize_config_dict,
@@ -476,6 +478,14 @@ def _build_batches(indices: np.ndarray, batch_size: int):
 # Worker task
 ############################################
 
+def _coerce_marcs_value(raw: Any) -> float:
+    """Coerce a MARCS composition value to float, mapping anything unparseable to NaN."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _synthesis_task(batch):
     results = []
 
@@ -515,6 +525,14 @@ def _synthesis_task(batch):
         result = run_single_synthesis((row_values, cfg))
         duration = time.perf_counter() - start
         log_path = str(result.get("log_path", "") or "")
+
+        # Composition of the MARCS atmosphere used for this row; carried verbatim
+        # into every result branch so the shard column is populated regardless of
+        # success/error/missing-output outcome.
+        marcs_vals = {
+            key: _coerce_marcs_value(result.get(key))
+            for key in (*_MARCS_COMP_KEYS, *_MARCS_ATM_KEYS)
+        }
 
         spec_path = str(result.get("output_path", "") or "")
         base_name = str(result.get("base_name", "") or os.path.splitext(os.path.basename(spec_path))[0])
@@ -620,6 +638,7 @@ def _synthesis_task(batch):
                     "mu_selected_index": -1,
                     "t_value": str(result.get("t_value", "") or ""),
                     "turbvel": str(result.get("turbvel", "") or ""),
+                    **marcs_vals,
                 })
                 continue
         else:
@@ -638,6 +657,7 @@ def _synthesis_task(batch):
                     "spectrum": None,
                     "t_value": str(result.get("t_value", "") or ""),
                     "turbvel": str(result.get("turbvel", "") or ""),
+                    **marcs_vals,
                 })
                 continue
 
@@ -652,6 +672,7 @@ def _synthesis_task(batch):
             "mu_selected_index": int(mu_selected_index),
             "t_value": str(result.get("t_value", "") or ""),
             "turbvel": str(result.get("turbvel", "") or ""),
+            **marcs_vals,
         })
 
     return results
@@ -1242,6 +1263,12 @@ def main():
     base_names = [""] * len(indices)
     resolved_t_values = [""] * len(indices)
     resolved_turbvels = [""] * len(indices)
+    # Composition + snapped stellar params of the MARCS atmosphere used per row
+    # (NaN until a result lands; atm params stay NaN unless the row was snapped).
+    marcs_columns = {
+        key: np.full(len(indices), np.nan, dtype=np.float32)
+        for key in (*_MARCS_COMP_KEYS, *_MARCS_ATM_KEYS)
+    }
 
     logger.info("Starting synthesis with %d workers", worker_count)
 
@@ -1302,6 +1329,8 @@ def main():
                     mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
                 except Exception:
                     mu_selected_index[idx] = -1
+                for _marcs_key in (*_MARCS_COMP_KEYS, *_MARCS_ATM_KEYS):
+                    marcs_columns[_marcs_key][idx] = _coerce_marcs_value(result.get(_marcs_key))
 
                 if result["spectrum"]:
                     fluxes[idx], continua[idx] = result["spectrum"]
@@ -1402,6 +1431,10 @@ def main():
         resolved_t_values=resolved_t_values,
         resolved_turbvels=resolved_turbvels,
     )
+
+    # Attach the per-row MARCS atmosphere composition as float metadata columns so
+    # the merge step can fold them into the params matrix alongside the inputs.
+    columns = {**columns, **marcs_columns}
 
     # Write per-row metadata columns for later merging/QA (best-effort).
     _STRING_METADATA_COLS = {"turbvel", "t_value", "output_mode", "calculation_mode", "mode", "grid_version"}

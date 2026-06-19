@@ -35,6 +35,8 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from run_turbospectrum import (  # noqa: E402
+    _MARCS_ATM_KEYS,
+    _MARCS_COMP_KEYS,
     LinelistValidationError,
     TurbospectrumConfig,
     _normalize_config_dict,
@@ -289,11 +291,17 @@ def _ordered_param_names(column_data: Mapping[str, np.ndarray]) -> List[str]:
         "turb",
         *NLTE_ASCII_CONTROL_KEYS,
     }
-    candidate_order = ["teff", "logg", "feh", "vmicro", "turbvel", "t_value", "a", "c", "n", "o", "r", "s"]
+    candidate_order = [
+        "teff", "logg", "feh", "vmicro", "turbvel", "t_value",
+        "a", "c", "n", "o", "r", "s",
+        *_MARCS_COMP_KEYS,
+        *_MARCS_ATM_KEYS,
+    ]
+    explicit = set(candidate_order) | {"turbvel", "t_value"}
     extras = sorted(
         name
         for name in column_data.keys()
-        if name not in reserved and name not in {"teff", "logg", "feh", "turbvel", "t_value", "a", "c", "n", "o", "r", "s"}
+        if name not in reserved and name not in explicit
     )
     return candidate_order + extras
 
@@ -660,6 +668,14 @@ def _resolve_spec_path(cfg, row_values, result, is_intensity):
     return spec_path, base_name, log_path
 
 
+def _coerce_marcs_value(raw: Any) -> float:
+    """Coerce a MARCS composition value to float, mapping anything unparseable to NaN."""
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _extract_row_result(
     index,
     cfg,
@@ -677,6 +693,12 @@ def _extract_row_result(
     that share a mu axis this is called once per mu-row against the same
     ``spec_path``, selecting that row's own target mu.
     """
+    # Composition of the MARCS atmosphere used for the shared synthesis; identical
+    # for every row in the group (same physical point / model file).
+    marcs_vals = {
+        key: _coerce_marcs_value(result.get(key))
+        for key in (*_MARCS_COMP_KEYS, *_MARCS_ATM_KEYS)
+    }
     spectrum = None
     mu_selected = float("nan")
     mu_selected_index = -1
@@ -767,6 +789,7 @@ def _extract_row_result(
                 "spectrum": None,
                 "mu_selected": float("nan"),
                 "mu_selected_index": -1,
+                **marcs_vals,
             }
     elif str(result.get("status", "")).lower() in _SUCCESS_STATUSES:
         return {
@@ -781,6 +804,7 @@ def _extract_row_result(
             "spectrum": None,
             "mu_selected": float("nan"),
             "mu_selected_index": -1,
+            **marcs_vals,
         }
 
     return {
@@ -792,6 +816,7 @@ def _extract_row_result(
         "spectrum": spectrum,
         "mu_selected": float(mu_selected),
         "mu_selected_index": int(mu_selected_index),
+        **marcs_vals,
     }
 
 
@@ -835,6 +860,10 @@ def _synthesis_group_task(group) -> List[Dict]:
                     "spectrum": None,
                     "mu_selected": float("nan"),
                     "mu_selected_index": -1,
+                    **{
+                        key: _coerce_marcs_value(result.get(key))
+                        for key in (*_MARCS_COMP_KEYS, *_MARCS_ATM_KEYS)
+                    },
                 }
             )
             continue
@@ -948,11 +977,15 @@ def _write_zarr_output(
 
     param_units = {}
     for name in param_name_list:
-        if name == "teff":
+        if name in {"teff", "marcs_teff"}:
             param_units[name] = "K"
-        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"} or name.isalpha():
+        elif (
+            name in {"logg", "feh", "a", "c", "n", "o", "r", "s", "marcs_logg"}
+            or name in _MARCS_COMP_KEYS
+            or name.isalpha()
+        ):
             param_units[name] = "dex"
-        elif name == "vmicro":
+        elif name in {"vmicro", "marcs_turb"}:
             param_units[name] = "km/s"
         else:
             param_units[name] = ""
@@ -1212,6 +1245,12 @@ def main() -> None:
     messages: List[str] = [""] * row_count
     mu_selected = np.full(row_count, np.nan, dtype=np.float32)
     mu_selected_index = np.full(row_count, -1, dtype=np.int16)
+    # Composition + snapped stellar params of the MARCS atmosphere used per row
+    # (NaN until a result lands; atm params stay NaN unless the row was snapped).
+    marcs_columns = {
+        key: np.full(row_count, np.nan, dtype=np.float32)
+        for key in (*_MARCS_COMP_KEYS, *_MARCS_ATM_KEYS)
+    }
 
     tasks = _build_tasks(row_count, column_data, config)
     groups = _group_tasks(tasks, config)
@@ -1245,6 +1284,8 @@ def main() -> None:
             mu_selected_index[idx] = int(result.get("mu_selected_index", -1))
         except Exception:
             mu_selected_index[idx] = -1
+        for _marcs_key in (*_MARCS_COMP_KEYS, *_MARCS_ATM_KEYS):
+            marcs_columns[_marcs_key][idx] = _coerce_marcs_value(result.get(_marcs_key))
         if result.get("spectrum"):
             fluxes[idx] = result["spectrum"][0]
             continua[idx] = result["spectrum"][1]
@@ -1318,6 +1359,11 @@ def main() -> None:
             "cross-FS rename will copy+delete (not atomic)"
         )
 
+    # Fold in the per-row MARCS atmosphere composition (a synthesis output, not a
+    # grid column) so it appears in the params matrix alongside the inputs.
+    for _marcs_key, _marcs_data in marcs_columns.items():
+        if not np.all(np.isnan(_marcs_data)):
+            column_data[_marcs_key] = _marcs_data
     params, param_names = _build_params_matrix(column_data)
     model_id = _compute_model_ids(params)
     physics_hash = args.physics_hash or _compute_physics_hash(config, column_data)

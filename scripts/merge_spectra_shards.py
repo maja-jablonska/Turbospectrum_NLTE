@@ -309,6 +309,22 @@ def _to_float32(values: np.ndarray) -> np.ndarray:
     return out
 
 
+# Composition of the MARCS model atmosphere used per row (written by the shard
+# step). These are properties of the atmosphere structure the lines were
+# synthesised against — distinct from the requested input abundances a/c/n/o.
+# Kept in step with run_turbospectrum._MARCS_COMP_KEYS.
+_MARCS_PARAM_COLS = ("marcs_fe_h", "marcs_a_fe", "marcs_c_fe", "marcs_n_fe", "marcs_o_fe")
+
+# Stellar params (teff/logg/turb) of the MARCS atmosphere actually used per row.
+# Always reported; for exact matches they equal the requested params, for snapped
+# rows they are the grid point the selection was clamped to. [Fe/H] is carried by
+# the composition column marcs_fe_h above, so it is not duplicated here. Kept in
+# step with run_turbospectrum._MARCS_ATM_KEYS. Both groups are per-row synthesis
+# outputs written by the shard step and folded into the grid store at merge time.
+_MARCS_ATM_COLS = ("marcs_teff", "marcs_logg", "marcs_turb")
+_MARCS_SHARD_COLS = _MARCS_PARAM_COLS + _MARCS_ATM_COLS
+
+
 def _ordered_param_names(columns: Mapping[str, np.ndarray]) -> List[str]:
     reserved = {
         "grid_version",
@@ -320,11 +336,16 @@ def _ordered_param_names(columns: Mapping[str, np.ndarray]) -> List[str]:
         "calculation_mode",
         "turb",
     }
-    candidate_order = ["teff", "logg", "feh", "vmicro", "turbvel", "t_value", "a", "c", "n", "o", "r", "s", "mu"]
+    candidate_order = [
+        "teff", "logg", "feh", "vmicro", "turbvel", "t_value",
+        "a", "c", "n", "o", "r", "s", "mu",
+        *_MARCS_SHARD_COLS,
+    ]
+    explicit = set(candidate_order) | {"turbvel", "t_value"}
     extras = sorted(
         name
         for name in columns.keys()
-        if name not in reserved and name not in {"teff", "logg", "feh", "turbvel", "t_value", "a", "c", "n", "o", "r", "s", "mu"}
+        if name not in reserved and name not in explicit
     )
     return candidate_order + extras
 
@@ -1033,6 +1054,7 @@ def main() -> None:
         "o",
         "r",
         "s",
+        *_MARCS_SHARD_COLS,
         "output_mode",
         "calculation_mode",
     ]
@@ -1053,7 +1075,7 @@ def main() -> None:
     merged_meta: Dict[str, np.ndarray] = {}
     merged_meta_is_str: Dict[str, bool] = {}
     for name in param_candidate_cols:
-        if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"} or name.isalpha():
+        if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"} or name in _MARCS_SHARD_COLS or name.isalpha():
             merged_meta[name] = np.full(out_row_count, np.nan, dtype=np.float32)
             merged_meta_is_str[name] = False
         else:
@@ -1231,6 +1253,12 @@ def main() -> None:
             mu_sel_data = np.asarray(mu_selected_out[:], dtype=np.float32)
             if not np.all(np.isnan(mu_sel_data)):
                 grid_cols["mu"] = mu_sel_data
+        # The MARCS atmosphere composition is a per-row synthesis output (it lives
+        # in the shards, not the grid), so fold it in from the merged metadata.
+        for _marcs_key in _MARCS_SHARD_COLS:
+            _marcs_data = merged_meta.get(_marcs_key)
+            if _marcs_data is not None and not np.all(np.isnan(_marcs_data)):
+                grid_cols[_marcs_key] = np.asarray(_marcs_data, dtype=np.float32)
         params, param_names = _build_params_matrix(grid_cols)
     else:
         params_source: Dict[str, np.ndarray] = {}
@@ -1457,11 +1485,11 @@ def main() -> None:
 
     param_units: Dict[str, str] = {}
     for name in param_name_list:
-        if name == "teff":
+        if name in {"teff", "marcs_teff"}:
             param_units[name] = "K"
-        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"}:
+        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"} or name in _MARCS_PARAM_COLS or name == "marcs_logg":
             param_units[name] = "dex"
-        elif name == "vmicro":
+        elif name in {"vmicro", "marcs_turb"}:
             param_units[name] = "km/s"
         else:
             param_units[name] = ""

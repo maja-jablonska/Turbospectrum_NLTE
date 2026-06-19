@@ -165,6 +165,52 @@ Avoid symbols in storage (`[Fe/H]`) — map them in metadata instead.
 
 AI agents parse this more reliably.
 
+### MARCS atmosphere composition columns
+
+When the synthesis resolves a MARCS model atmosphere (exact match or
+nearest-neighbour), the composition of the atmosphere *actually used* is recorded
+as five additional, immutable trailing parameter columns:
+
+```
+marcs_fe_h   # [Fe/H] of the MARCS model
+marcs_a_fe   # [alpha/Fe] (standard enhancement vs metallicity)
+marcs_c_fe   # [C/Fe]   (solar-scaled in standard composition)
+marcs_n_fe   # [N/Fe]   (solar-scaled in standard composition)
+marcs_o_fe   # [O/Fe]   (follows alpha in standard composition)
+```
+
+These are properties of the model-atmosphere *structure* the lines were
+synthesised against — distinct from the requested input abundances
+(`feh`, `a`, `c`, `n`, `o`), which may differ (e.g. nearest-neighbour atmosphere
+selection, or standard-composition alpha enhancement). They are parsed from the
+MARCS `.mod` filename and carried per-row through the shard → merge pipeline.
+Rows whose model could not be resolved store `NaN`. Units: `dex`.
+
+### MARCS atmosphere parameter columns
+
+The stellar parameters of the MARCS model atmosphere *actually used* (exact match
+or nearest-neighbour) are recorded as three additional trailing parameter columns,
+parsed from the resolved model filename:
+
+```
+marcs_teff   # Teff  of the MARCS model used (K)
+marcs_logg   # log g of the MARCS model used (dex)
+marcs_turb   # microturbulence of the MARCS model used (km/s, from the t-label)
+```
+
+These are **always reported** for every resolved row, like the composition
+columns above. For an exact model match they equal the requested params
+(`teff`, `logg`, `turbvel`); when the requested point had no exact model and
+synthesis fell back to the nearest atmosphere, they are the grid point the
+selection was *clamped to*, so any difference from the requested params is the
+clipping amount. Rows whose model could not be resolved (e.g. skipped/existing
+outputs) store `NaN`.
+
+The atmosphere's [Fe/H] is **not** duplicated here — it is already reported by the
+composition column `marcs_fe_h` above (both decode the model's `z` field). So the
+full snapped-atmosphere descriptor is `marcs_teff`, `marcs_logg`, `marcs_turb`
+plus `marcs_fe_h`.
+
 # Identity Layer (Extremely High Value)
 
 ## model_id
