@@ -749,7 +749,7 @@ if (( ARRAY_TASK_MODE == 1 )); then
     echo "[${TAG}] Shard index: ${SHARD_INDEX}"
     echo "[${TAG}] Scratch: ${SCRATCH}"
 
-    local no_scratch_flag=""
+    no_scratch_flag=""
     if [[ "$(to_bool01 "${NO_SCRATCH}")" -eq 1 ]]; then
         no_scratch_flag="--no-scratch"
     fi
