@@ -744,6 +744,7 @@ if (( ARRAY_TASK_MODE == 1 )); then
 
     SCRATCH="${TMP_WORK_DIR}/shard_${SHARD_INDEX}"
     TMP_OUT="${TMP_OUTPUT_DIR}/spectra_shard_${SHARD_INDEX}.tmp.zarr"
+    LOG_FILE="${LOG_DIR}/shard_${SHARD_INDEX}.log"
     mkdir -p "${SCRATCH}"
 
     echo "[${TAG}] Shard index: ${SHARD_INDEX}"
