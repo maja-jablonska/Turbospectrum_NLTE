@@ -989,14 +989,27 @@ def create_linelist_file(config: TurbospectrumConfig) -> str:
             
     return list_file_path
 
+def standard_composition_alpha(feh) -> float:
+    """[alpha/Fe] of the MARCS standard-composition grid for a given [Fe/H].
+
+    The standard grid alpha-enhances subsolar models: 0.0 at [Fe/H] >= 0,
+    ramping by +0.1 per -0.25 dex to +0.4 at [Fe/H] <= -1 (Gustafsson et al.
+    2008). [O/Fe] follows alpha; [C/Fe] and [N/Fe] stay solar-scaled.
+    """
+    return min(0.4, max(0.0, -0.4 * float(feh)))
+
+
 def get_model_filename(teff, logg, feh, turb_str):
     # Construct the model filename based on the convention
     # Example: p2500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod
-    
+    # The a/o fields carry the standard-composition alpha coupled to [Fe/H];
+    # hardcoding a+0.00 would make every subsolar point miss its exact file.
+
     logg_str = f"{logg:+.1f}" # Note: +3.0 not +3.00
     feh_str = f"{feh:+.2f}"
-    
-    filename = f"p{teff}_g{logg_str}_m0.0_t{turb_str}_st_z{feh_str}_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod"
+    alpha_str = f"{standard_composition_alpha(feh):+.2f}"
+
+    filename = f"p{teff}_g{logg_str}_m0.0_t{turb_str}_st_z{feh_str}_a{alpha_str}_c+0.00_n+0.00_o{alpha_str}_r+0.00_s+0.00.mod"
     return filename
 
 
@@ -1505,6 +1518,21 @@ def _resolve_nlte_ascii_runtime_info(
         "model_stem": model_stem,
     }
 
+# Distance scales of the nearest-atmosphere snap, roughly matching common MARCS
+# grid spacings; vmicro is deliberately down-weighted (2 km/s ~ 0.5 dex) because
+# babsma applies the requested vmicro via XIFIX regardless of the atmosphere's
+# t-label. Shared with scripts/filter_bad_snap_rows.py, which re-derives the
+# correct snap for already-synthesised rows — keep in one place so they can't drift.
+SNAP_SCALES = {"teff": 250.0, "logg": 0.5, "feh": 0.5, "vmicro": 2.0}
+
+# Per-process cache of scanned model directories, keyed by absolute path. The
+# atmosphere store is immutable during a run and each nearest-neighbour snap
+# previously re-globbed and re-parsed the full directory (~15k files) per row.
+# Read-only after first fill, so no state leaks across shards (each shard is a
+# separate process with its own cache).
+_MODEL_SCAN_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+
+
 class ModelInterpolator:
     def __init__(self, config: TurbospectrumConfig):
         self.config = config
@@ -1513,75 +1541,103 @@ class ModelInterpolator:
 
     def _scan_models(self):
         """Scans the model directory and parses filenames."""
-        pattern = os.path.join(self.config.model_atmosphere_path, "*.mod")
-        files = glob.glob(pattern)
-        
+        path = os.path.abspath(str(self.config.model_atmosphere_path or ""))
+        cached = _MODEL_SCAN_CACHE.get(path)
+        if cached is not None:
+            self.available_models = cached
+            return
+
+        files = glob.glob(os.path.join(path, "*.mod"))
+
         # Regex to parse filename
         # p2500_g+3.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod
-        # We need to extract Teff, logg, FeH, and keep track of other params (turb, alpha, etc) to match
-        # Assuming standard format
-        regex = re.compile(r"p(\d+)_g([+\-]\d+\.\d+)_m0\.0_t(\d+)_st_z([+\-]\d+\.\d+)_a([+\-]\d+\.\d+)_.*\.mod")
-        
-        self.available_models = []
+        # s5000_g+2.0_m1.0_t02_st_z-0.50_a+0.20_c+0.00_n+0.00_o+0.20_r+0.00_s+0.00.mod
+        # Both geometries must be scanned: logg < 3.0 exists only as spherical
+        # models, so a plane-parallel-only pool silently clamps giants to logg 3.0.
+        regex = re.compile(r"([ps])(\d+)_g([+\-]\d+\.\d+)_m([\d.]+)_t(\d+)_st_z([+\-]\d+\.\d+)_a([+\-]\d+\.\d+)_.*\.mod")
+
+        models = []
         for f in files:
             basename = os.path.basename(f)
             match = regex.match(basename)
             if match:
-                teff = int(match.group(1))
-                logg = float(match.group(2))
-                turb = match.group(3)
-                feh = float(match.group(4))
-                alpha = float(match.group(5))
-                
-                self.available_models.append({
-                    'teff': teff,
-                    'logg': logg,
-                    'feh': feh,
-                    'turb': turb,
-                    'alpha': alpha,
+                models.append({
+                    'geom': match.group(1),
+                    'teff': int(match.group(2)),
+                    'logg': float(match.group(3)),
+                    'mass': float(match.group(4)),
+                    'turb': match.group(5),
+                    'feh': float(match.group(6)),
+                    'alpha': float(match.group(7)),
                     'path': f,
                     'filename': basename
                 })
+        self.available_models = models
+        _MODEL_SCAN_CACHE[path] = models
 
     def find_nearest_model(self, target_teff, target_logg, target_feh, target_turb):
         """
-        Nearest-neighbor selection in (Teff, logg, [Fe/H]) space.
+        Nearest-neighbor selection in (Teff, logg, [Fe/H], vmicro) space.
 
-        Preference:
-        - Use only models with matching turbulence if any exist.
-        - Otherwise, fall back to any turbulence.
+        The atmosphere's t-label enters the distance as a weak axis rather than
+        a hard pre-filter: babsma applies the requested vmicro via XIFIX
+        regardless of the atmosphere's t-label, so a t-label mismatch only
+        perturbs the atmosphere structure (second-order), while a hard same-turb
+        filter could snap into a sparse t-subset and silently absorb multi-dex
+        Teff/logg/[Fe/H] errors. Ties prefer plane-parallel geometry (matching
+        bsyn's plane-parallel transfer), then the mass closest to 1 Msun among
+        spherical variants.
         """
         if not self.available_models:
             return None, f"No models found in {self.config.model_atmosphere_path}"
 
-        same_turb = [m for m in self.available_models if m["turb"] == str(target_turb)]
-        candidates = same_turb if same_turb else list(self.available_models)
-        turb_note = "" if same_turb else f" (no models with t={target_turb}; turbulence not matched)"
+        try:
+            target_vmicro = float(target_turb)
+        except (TypeError, ValueError):
+            target_vmicro = None
 
-        # Scale factors roughly matching common MARCS grid spacings
-        teff_scale = 250.0
-        logg_scale = 0.5
-        feh_scale = 0.5
+        teff_scale = SNAP_SCALES["teff"]
+        logg_scale = SNAP_SCALES["logg"]
+        feh_scale = SNAP_SCALES["feh"]
+        vmicro_scale = SNAP_SCALES["vmicro"]
 
         def dist2(m):
             dt = (m["teff"] - target_teff) / teff_scale
             dg = (m["logg"] - target_logg) / logg_scale
             dz = (m["feh"] - target_feh) / feh_scale
-            return dt * dt + dg * dg + dz * dz
+            d = dt * dt + dg * dg + dz * dz
+            if target_vmicro is not None:
+                dv = (float(m["turb"]) - target_vmicro) / vmicro_scale
+                d += dv * dv
+            return d
 
-        best = min(candidates, key=dist2)
+        best = min(
+            self.available_models,
+            key=lambda m: (dist2(m), 0 if m["geom"] == "p" else 1, abs(m["mass"] - 1.0)),
+        )
+
+        notes = []
+        if str(best["turb"]) != str(target_turb):
+            notes.append(f"t={best['turb']} substituted for requested t={target_turb}")
+        if best["geom"] == "s":
+            notes.append(f"spherical geometry, mass={best['mass']:g} Msun")
+        note_text = f" [{'; '.join(notes)}]" if notes else ""
         msg = (
-            f"Nearest neighbor selected{turb_note}: {best['filename']} "
+            f"Nearest neighbor selected: {best['filename']} "
             f"(Teff={best['teff']}, logg={best['logg']}, FeH={best['feh']}, t={best['turb']})"
+            f"{note_text}"
         )
         return best, msg
 
     def find_bracketing_models(self, target_teff, target_logg, target_feh, target_turb):
         """Finds the 8 bracketing models for interpolation."""
-        # Filter by turbulence (must match)
-        # We assume alpha is 0.0 for now or matches target if we had target alpha
-        candidates = [m for m in self.available_models if m['turb'] == target_turb]
-        
+        # Filter by turbulence (must match). Bracket within a single geometry:
+        # interpol_modeles expects a consistent set, so stick to plane-parallel.
+        candidates = [
+            m for m in self.available_models
+            if m['turb'] == target_turb and m.get('geom', 'p') == 'p'
+        ]
+
         if not candidates:
             return None, "No models found with matching turbulence"
 
@@ -1593,6 +1649,7 @@ class ModelInterpolator:
         # Helper to find bracket
         def get_bracket(values, target):
             values = sorted(values)
+            if len(values) == 1: return values[0], values[0]
             if target <= values[0]: return values[0], values[1]
             if target >= values[-1]: return values[-2], values[-1]
             for i in range(len(values)-1):

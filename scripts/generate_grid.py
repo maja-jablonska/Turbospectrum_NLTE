@@ -373,7 +373,10 @@ _REGULAR_SAMPLING_ALIASES = {"grid", "regular", "cartesian", "axes", "regular_gr
 # "warn_outside_marcs_bounds": false.
 MARCS_STANDARD_BOUNDS: Dict[str, Tuple[float, float]] = {
     "teff": (2500.0, 8000.0),
-    "logg": (-1.0, 5.5),
+    # logg < 3.0 exists only as spherical models; the nearest-atmosphere snap
+    # covers both geometries. The standard-composition store bottoms out at
+    # logg = -0.5 (not the -1.0 sometimes quoted for MARCS overall).
+    "logg": (-0.5, 5.5),
     "feh": (-5.0, 1.0),
     "vmicro": (0.0, 5.0),
 }
