@@ -1,0 +1,72 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+#
+# Built-in defaults already exclude: node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+# --- From .gitignore (uncomment to exclude) ---
+
+# .DS_Store
+# .claude/
+# *.d
+# *.slo
+# *.lo
+# *.o
+# *.obj
+# bsyn_lu
+# eqwidt_lu
+# babsma_lu
+# *.gch
+# *.pch
+# *.so
+# *.dylib
+# *.dll
+# *.mod
+# *.smod
+# *.lai
+# *.la
+# *.a
+# *.lib
+# *.exe
+# *.out
+# *.app
+# .pytest_cache/
+# *.py[cod]
+# *.zarr/
+# *.zarr
+# *.csv.zst
+# .ipynb_checkpoints/
+# */*.code-workspace
+# /environment.yml
+# spectra/
+# */*.dat
+# tmp/
+# logs/
+# runs/*
+# !runs/README.md
+# synth_shards/
+# reports/
+# input_files/
+# Users/
+# COM/contopac/*
+# /configs/**
+# *.pbs
+# !/configs/
+# !/configs/pipeline/
+# !/configs/**/_example*
+# !/configs/**/*.example.*
+# !*_example*.pbs
+# !/configs/pipeline/config_regular_grid_nlte_fe_tiny_gadi.json
+# !turbospectrum_regular_grid_nlte_tiny_gadi.pbs
+# !turbospectrum_regular_grid_nlte_tiny_array_gadi.pbs
+# !turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
+
+# --- Detected directories (uncomment to exclude) ---
+
+# tests/
+# scripts/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# *.test.*
+# *.spec.*
+# *.snap
