@@ -339,7 +339,7 @@ def _build_provenance_group(
             "attrs": {k: str(v) for k, v in r.attrs.items()},
         }
         if snap_stats is not None and snap_stats[i] is not None:
-            entry["snap_filter"] = {k: int(v) for k, v in snap_stats[i].items()}
+            entry["snap_filter"] = dict(snap_stats[i])
         per_run.append(entry)
     manifest = {
         "merge_tool": "scripts/merge_spectra_runs.py",
@@ -513,10 +513,17 @@ def main() -> None:
             snap_stats[i] = stats
             if args.rejects_csv:
                 all_rejects.extend(collect_rejects(src_root, r.path, keep, details))
+            floor_note = ""
+            if stats.get("n_below_pool_logg_floor"):
+                floor_note = (
+                    f"; {stats['n_below_pool_logg_floor']} rows below the pool logg floor "
+                    f"{stats['pool_logg_floor']:g} are NOT flaggable as wrong-snap -- "
+                    f"see the WARNING above"
+                )
             print(
                 f"Snap filter {r.path}: kept {stats['n_kept']}/{stats['n_rows']} "
                 f"(wrong snap {stats['n_wrong_snap']}, out of tolerance "
-                f"{stats['n_out_of_tolerance']}, NaN {stats['n_nan']})"
+                f"{stats['n_out_of_tolerance']}, NaN {stats['n_nan']}{floor_note})"
             )
         if args.rejects_csv:
             rejects_path = _norm(args.rejects_csv)

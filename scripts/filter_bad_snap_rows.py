@@ -168,6 +168,29 @@ def classify_rows(src, atmosphere_path: str, *, max_dteff=None, max_dlogg=None, 
     correct_teff, correct_logg, correct_feh = compute_correct_snap(
         model_arrays, cols["teff"], cols["logg"], cols["feh"], cols["t_value"]
     )
+
+    # Pool-coverage guard. If the requested logg extends below the pool's
+    # floor, the clamp to the floor IS the pool's true nearest model, so those
+    # rows can never be flagged as wrong-snap — the filter is structurally
+    # blind to them. A plane-parallel-only store (no s* files) is the usual
+    # cause: MARCS provides logg < 3.0 only as spherical models.
+    pool_logg_floor = float(model_arrays["logg"].min())
+    has_spherical = bool((model_arrays["geom_penalty"] > 0).any())
+    below_floor = ~np.isnan(cols["logg"]) & (cols["logg"] < pool_logg_floor - 0.26)
+    n_below_floor = int(below_floor.sum())
+    if n_below_floor:
+        geometry_note = (
+            "" if has_spherical
+            else " The pool contains NO spherical (s*) models -- MARCS covers logg < 3.0 "
+                 "only spherically, so the store is likely incomplete."
+        )
+        print(
+            f"WARNING: {n_below_floor}/{n} rows request logg below the atmosphere pool's floor "
+            f"({pool_logg_floor:g}); their clamped snap is the pool's true nearest, so they CANNOT "
+            f"be flagged as wrong-snap.{geometry_note} Use --max-dlogg (e.g. 0.25) to drop them, "
+            f"and add the spherical models before re-running the rejected parameter space.",
+            file=sys.stderr,
+        )
     rng = np.random.default_rng(0)
     finite = np.where(~np.isnan(correct_teff))[0]
     if len(finite):
@@ -200,6 +223,9 @@ def classify_rows(src, atmosphere_path: str, *, max_dteff=None, max_dlogg=None, 
         "n_wrong_snap": int(wrong_snap.sum()),
         "n_out_of_tolerance": int((out_of_tolerance & ~wrong_snap).sum()),
         "n_nan": int(nan_rows.sum()),
+        "n_below_pool_logg_floor": n_below_floor,
+        "pool_logg_floor": pool_logg_floor,
+        "pool_has_spherical": has_spherical,
     }
     reason = np.full(n, "", dtype=object)
     reason[out_of_tolerance] = "out_of_tolerance"

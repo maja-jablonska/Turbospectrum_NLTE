@@ -134,6 +134,40 @@ class FilterBadSnapRowsTests(unittest.TestCase):
         self.assertEqual(summary["n_unique_rejected_points_excl_mu"], 3)
         self.assertEqual(summary["rejected_request_axes"]["logg"]["min"], 1.5)
 
+    def test_plane_parallel_only_pool_cannot_flag_giants_and_warns(self):
+        # With no spherical models in the pool, the logg-3-clamped giant's
+        # recorded atmosphere IS the pool's true nearest, so it survives the
+        # wrong-snap check. The classifier must surface this blind spot loudly.
+        import contextlib
+        import io
+
+        p_only = os.path.join(self._tmp.name, "marcs_p_only")
+        os.makedirs(p_only)
+        for name in [
+            _model_name("p", 5000, 4.0, "0.0", "01", 0.0, 0.0),
+            _model_name("p", 5000, 4.0, "0.0", "02", -1.0, 0.4),
+        ]:
+            with open(os.path.join(p_only, name), "w", encoding="utf-8"):
+                pass
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            keep, stats, _details = classify_rows(self.src, p_only)
+        # The clamped giant (row 1) is KEPT — undetectable with this pool —
+        # while the t05 trap row and the NaN row are still dropped. Row 4's
+        # recorded spherical atmosphere is not in the pool -> wrong_snap.
+        self.assertEqual(keep.tolist(), [True, True, False, False, False])
+        self.assertEqual(stats["n_below_pool_logg_floor"], 2)
+        self.assertFalse(stats["pool_has_spherical"])
+        self.assertEqual(stats["pool_logg_floor"], 4.0)
+        self.assertIn("NO spherical", stderr.getvalue())
+        self.assertIn("--max-dlogg", stderr.getvalue())
+
+        # Tolerance flags are the remedy: the clamped giant goes too.
+        with contextlib.redirect_stderr(io.StringIO()):
+            keep_tol, _, _ = classify_rows(self.src, p_only, max_dlogg=0.25)
+        self.assertEqual(keep_tol.tolist(), [True, False, False, False, False])
+
     def test_refuses_existing_output(self):
         keep, stats, _details = classify_rows(self.src, self.atmo_dir)
         out_path = os.path.join(self._tmp.name, "exists.zarr")
