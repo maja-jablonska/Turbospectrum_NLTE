@@ -1,0 +1,170 @@
+#!/bin/bash
+#PBS -P mk27
+#PBS -q rsaa
+#PBS -N filtermerge
+#PBS -r y
+#PBS -l ncpus=4
+#PBS -l mem=32GB
+#PBS -l walltime=10:00:00
+#PBS -j oe
+#PBS -M maja.jablonska@anu.edu.au
+#PBS -m bae
+#PBS -l storage=scratch/mk27+scratch/y89+gdata/y89
+
+# Filter bad-snap rows out of per-run spectra stores and merge the survivors
+# into one consolidated store (scripts/merge_spectra_runs.py --filter-bad-snaps).
+# Rejected rows land in a CSV + parameter-space summary JSON so the re-run
+# grid can be planned from them.
+#
+# Usage:
+#   qsub -v RUN_DIR=/scratch/.../runs,OUTPUT_ZARR=/scratch/.../harps_clean.zarr,ATMOSPHERE_PATH=/g/data/.../marcs_standard_comp filter_merge_runs.pbs
+#
+#   # explicit store list instead of a directory (space-separated):
+#   qsub -v RUNS="/path/run1.zarr /path/run2.zarr",OUTPUT_ZARR=...,ATMOSPHERE_PATH=... filter_merge_runs.pbs
+#
+# Optional -v knobs:
+#   REJECTS_CSV=...            rejected-rows CSV (default: <OUTPUT_ZARR minus .zarr>_rejects.csv)
+#   MAX_DTEFF / MAX_DLOGG / MAX_DFEH
+#                              also drop correctly-snapped rows farther than this
+#                              from the request (MARCS coverage holes)
+#   DEDUP_BY_MODEL_ID=1        drop cross-run duplicate rows (first occurrence wins)
+#   STRICT_PARAMS=1            require identical param_names across runs
+#   ALLOW_INCOMPLETE_PROVENANCE=1
+#                              proceed when provenance contract fields are missing
+#   CHUNK_ROWS=128             output row chunking (matches merge default)
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+
+TAG="filtermerge"
+
+############################################
+# Thread caps
+############################################
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+
+unset PYTHONHOME || true
+unset PYTHONPATH || true
+
+############################################
+# Environment activation
+############################################
+
+PYTHON_BIN="${PYTHON_BIN:-}"
+MAMBA_ENV_NAME="${MAMBA_ENV_NAME:-astro}"
+
+activate_mamba() {
+    if [[ -n "${MAMBA_EXE:-}" && -x "${MAMBA_EXE}" ]]; then
+        eval "$("${MAMBA_EXE}" shell hook --shell bash)"
+    elif command -v mamba >/dev/null 2>&1; then
+        eval "$(mamba shell hook --shell bash)"
+    elif [[ -f "${HOME}/miniforge/etc/profile.d/conda.sh" ]]; then
+        source "${HOME}/miniforge/etc/profile.d/conda.sh"
+    else
+        return 1
+    fi
+
+    if command -v mamba >/dev/null 2>&1; then
+        mamba activate "${MAMBA_ENV_NAME}"
+    elif command -v conda >/dev/null 2>&1; then
+        conda activate "${MAMBA_ENV_NAME}"
+    else
+        return 1
+    fi
+}
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if activate_mamba; then
+        :
+    else
+        echo "[${TAG}] WARN: could not activate mamba env '${MAMBA_ENV_NAME}', falling back to PATH python." >&2
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    else
+        echo "[${TAG}] ERROR: no python executable found after env setup." >&2
+        exit 1
+    fi
+fi
+
+PYTHON="${PYTHON_BIN}"
+echo "[${TAG}] Python: ${PYTHON}"
+
+############################################
+# Variables
+############################################
+
+REPO="${REPO:-${PBS_O_WORKDIR}}"
+RUN_DIR="${RUN_DIR:-}"
+RUNS="${RUNS:-}"
+OUTPUT_ZARR="${OUTPUT_ZARR:-}"
+ATMOSPHERE_PATH="${ATMOSPHERE_PATH:-}"
+REJECTS_CSV="${REJECTS_CSV:-}"
+MAX_DTEFF="${MAX_DTEFF:-}"
+MAX_DLOGG="${MAX_DLOGG:-}"
+MAX_DFEH="${MAX_DFEH:-}"
+DEDUP_BY_MODEL_ID="${DEDUP_BY_MODEL_ID:-0}"
+STRICT_PARAMS="${STRICT_PARAMS:-0}"
+ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
+CHUNK_ROWS="${CHUNK_ROWS:-128}"
+
+if [[ -z "${OUTPUT_ZARR}" ]]; then
+    echo "[${TAG}] ERROR: OUTPUT_ZARR is required (qsub -v OUTPUT_ZARR=/path/combined.zarr)." >&2
+    exit 1
+fi
+if [[ -z "${ATMOSPHERE_PATH}" ]]; then
+    echo "[${TAG}] ERROR: ATMOSPHERE_PATH is required (the MARCS model directory the runs used)." >&2
+    exit 1
+fi
+if [[ -z "${RUN_DIR}" && -z "${RUNS}" ]]; then
+    echo "[${TAG}] ERROR: provide RUN_DIR=/path/to/runs or RUNS=\"a.zarr b.zarr ...\"." >&2
+    exit 1
+fi
+if [[ -e "${OUTPUT_ZARR}" ]]; then
+    echo "[${TAG}] ERROR: OUTPUT_ZARR already exists, refusing to overwrite: ${OUTPUT_ZARR}" >&2
+    exit 1
+fi
+
+if [[ -z "${REJECTS_CSV}" ]]; then
+    REJECTS_CSV="${OUTPUT_ZARR%.zarr}_rejects.csv"
+fi
+
+ARGS=(
+    "${REPO}/scripts/merge_spectra_runs.py"
+    --output-zarr "${OUTPUT_ZARR}"
+    --chunk-rows "${CHUNK_ROWS}"
+    --filter-bad-snaps
+    --atmosphere-path "${ATMOSPHERE_PATH}"
+    --rejects-csv "${REJECTS_CSV}"
+)
+
+if [[ -n "${RUN_DIR}" ]]; then
+    ARGS+=(--run-dir "${RUN_DIR}")
+else
+    for run_path in ${RUNS}; do
+        ARGS+=(--run "${run_path}")
+    done
+fi
+
+[[ -n "${MAX_DTEFF}" ]] && ARGS+=(--max-dteff "${MAX_DTEFF}")
+[[ -n "${MAX_DLOGG}" ]] && ARGS+=(--max-dlogg "${MAX_DLOGG}")
+[[ -n "${MAX_DFEH}" ]] && ARGS+=(--max-dfeh "${MAX_DFEH}")
+[[ "${DEDUP_BY_MODEL_ID}" == "1" ]] && ARGS+=(--dedup-by-model-id)
+[[ "${STRICT_PARAMS}" == "1" ]] && ARGS+=(--strict-params)
+[[ "${ALLOW_INCOMPLETE_PROVENANCE}" == "1" ]] && ARGS+=(--allow-incomplete-provenance)
+
+echo "[${TAG}] Command: ${PYTHON} ${ARGS[*]}"
+"${PYTHON}" "${ARGS[@]}"
+
+echo "[${TAG}] Done."
+echo "[${TAG}] Combined store: ${OUTPUT_ZARR}"
+echo "[${TAG}] Rejects: ${REJECTS_CSV}"
+echo "[${TAG}] Rejects summary: ${REJECTS_CSV%.csv}_summary.json"
