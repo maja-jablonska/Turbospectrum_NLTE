@@ -1130,6 +1130,7 @@ RESERVED_SYNTHESIS_KEYS = {
     "mu",
     "turb",
     "turbvel",
+    "vmicro",
     "t_value",
     "microturb",
     "microturb_str",

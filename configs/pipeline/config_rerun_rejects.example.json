@@ -1,0 +1,58 @@
+{
+  "_comment": "Re-run the parameter space a snap-filter pass rejected (scripts/filter_bad_snap_rows.py --rejects-csv). grid.sampling='rerun_csv' rebuilds the grid from the rejects CSV verbatim: every requested column (teff/logg/feh, turbvel, abundances, per-row mu) travels through; lineage and the old faulty marcs_*/correct_* columns are dropped. IMPORTANT: (1) the synthesis block below MUST match the runs the rejects came from (lam window, modes, resolution, NLTE settings) or the re-run will not merge with them; (2) the atmosphere store must contain the spherical (s*) MARCS models, or giants will clamp to logg 3.0 again -- run scripts/download_data.sh --atmospheres MARCS --force first and check `ls <dir> | grep -c '^s'`.",
+  "grid": {
+    "grid_version": "rerun-rejects-v1",
+    "sampling": "rerun_csv",
+    "rows_csv": "/g/data/y89/mj8805/harps_clean2_rejects.csv",
+    "dedupe_rows": false,
+    "synthesis": {
+      "lam_min": 5000.0,
+      "lam_max": 5020.0,
+      "lam_step": 0.01,
+      "output_mode": "Intensity",
+      "mode": "1D",
+      "calculation_mode": "NLTE"
+    },
+    "io": {
+      "csv_compression": "zstd",
+      "csv_compression_level": 5,
+      "zarr_chunks": 2048,
+      "zarr_compressor": {"cname": "zstd", "clevel": 5, "shuffle": true}
+    }
+  },
+  "turbospectrum": {
+    "compiler": "gf",
+    "force": false,
+    "max_workers": null,
+    "executables": {
+      "babsma_exec": "babsma_lu",
+      "bsyn_exec": "bsyn_lu",
+      "interpol_exec": "interpol_modeles"
+    },
+    "paths": {
+      "model_atmosphere_path": "",
+      "linelist_path": "input_files/linelists",
+      "linelist_files": ["nlte_ges_linelist_jmg16jan2026_I_II"],
+      "model_opac_dir": "COM/contopac"
+    },
+    "synthesis_parameters": {
+      "output_mode": "Intensity",
+      "resolution": 115000.0
+    },
+    "nlte": {
+      "enabled": true,
+      "nlte_info_file": ""
+    },
+    "provenance": {
+      "environment_capture": "pip_freeze"
+    }
+  },
+  "outputs": {
+    "run_root": "/scratch/mk27/USER/Turbospectrum_NLTE/rerun-rejects"
+  },
+  "runtime": {
+    "workers": 32,
+    "scratch": null,
+    "chunk_rows": 128
+  }
+}

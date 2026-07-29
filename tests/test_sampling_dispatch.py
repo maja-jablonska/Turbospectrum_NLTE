@@ -265,5 +265,140 @@ class StandaloneMLSamplerTests(unittest.TestCase):
             self.assertTrue(t_values.issubset({"00", "01", "02", "05"}))
 
 
+class SnapPrefilterTests(unittest.TestCase):
+    """grid.snap_prefilter: drop rows whose predicted atmosphere snap exceeds tolerance."""
+
+    _MODEL = "p5000_g+4.0_m0.0_t01_st_z+0.00_a+0.00_c+0.00_n+0.00_o+0.00_r+0.00_s+0.00.mod"
+
+    def _grid_cfg(self, atmo_dir, **prefilter):
+        return {
+            "sampling": "grid",
+            "axes": {"teff": "5000", "logg": "3.9:4.4:0.1", "feh": "0.0", "turbvel": "01"},
+            "abundances": {},
+            "synthesis": _SYNTH,
+            "snap_prefilter": {"atmosphere_path": atmo_dir, **prefilter},
+        }
+
+    def test_drops_rows_beyond_tolerance(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/{self._MODEL}", "w", encoding="utf-8"):
+                pass
+            # Only a logg=4.0 model exists: requested 3.9..4.2 snap within 0.25;
+            # 4.3 and 4.4 exceed it and must be dropped before synthesis.
+            cols = resolve_grid_columns(
+                self._grid_cfg(tmp, max_dlogg=0.25), rng=np.random.default_rng(0)
+            )
+            self.assertEqual(len(cols["logg"]), 4)
+            self.assertLessEqual(float(np.max(cols["logg"])), 4.21)
+
+    def test_no_prefilter_block_is_noop(self) -> None:
+        cfg = {
+            "sampling": "grid",
+            "axes": {"teff": "5000", "logg": "3.9:4.4:0.1", "feh": "0.0", "turbvel": "01"},
+            "abundances": {},
+            "synthesis": _SYNTH,
+        }
+        cols = resolve_grid_columns(cfg, rng=np.random.default_rng(0))
+        self.assertEqual(len(cols["logg"]), 6)
+
+    def test_all_rows_dropped_raises(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/{self._MODEL}", "w", encoding="utf-8"):
+                pass
+            cfg = self._grid_cfg(tmp, max_dteff=125.0)
+            cfg["axes"] = {"teff": "6000", "logg": "4.0", "feh": "0.0", "turbvel": "01"}
+            with self.assertRaisesRegex(ValueError, "every row"):
+                resolve_grid_columns(cfg, rng=np.random.default_rng(0))
+
+    def test_thresholdless_block_raises(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/{self._MODEL}", "w", encoding="utf-8"):
+                pass
+            with self.assertRaisesRegex(ValueError, "at least one"):
+                resolve_grid_columns(self._grid_cfg(tmp), rng=np.random.default_rng(0))
+
+
+class RerunCsvSamplingTests(unittest.TestCase):
+    """grid.sampling='rerun_csv': rebuild a grid from a snap-filter rejects CSV."""
+
+    _HEADER = [
+        "run_path", "source_row", "reason",
+        "correct_marcs_teff", "correct_marcs_logg", "correct_marcs_feh",
+        "teff", "logg", "feh", "vmicro", "turbvel", "t_value",
+        "a", "c", "n", "o", "r", "s", "mu",
+        "marcs_fe_h", "marcs_a_fe", "marcs_teff", "marcs_logg", "marcs_turb",
+    ]
+    _ROWS = [
+        ["/r/run1.zarr", "5", "wrong_snap", "4500", "1.5", "0.0",
+         "4483.2", "1.31", "-0.42", "2.1", "2.1", "2.0",
+         "0.1", "0.0", "0.0", "0.1", "0.0", "0.0", "0.35",
+         "0.0", "0.0", "5000", "3.0", "2.0"],
+        ["/r/run2.zarr", "9", "wrong_snap", "5000", "2.0", "-3.0",
+         "5012.7", "2.04", "-2.96", "4.4", "4.4", "5.0",
+         "0.2", "0.0", "0.0", "0.2", "0.0", "0.0", "0.71",
+         "0.0", "0.4", "5000", "3.0", "5.0"],
+    ]
+
+    def _write_csv(self, path, rows=None):
+        import csv
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(self._HEADER)
+            writer.writerows(rows if rows is not None else self._ROWS)
+
+    def _resolve(self, tmp, **grid_overrides):
+        path = f"{tmp}/rejects.csv"
+        if not __import__("os").path.exists(path):
+            self._write_csv(path)
+        cfg = {"sampling": "rerun_csv", "rows_csv": path, "grid_version": "rerun-v1",
+               "synthesis": _SYNTH, **grid_overrides}
+        return resolve_grid_columns(cfg, rng=np.random.default_rng(0))
+
+    def test_requested_columns_carried_and_faulty_snap_dropped(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            cols = self._resolve(tmp)
+            np.testing.assert_allclose(cols["teff"], [4483.2, 5012.7])
+            np.testing.assert_allclose(cols["logg"], [1.31, 2.04])
+            np.testing.assert_allclose(cols["mu"], [0.35, 0.71])
+            np.testing.assert_allclose(cols["a"], [0.1, 0.2])
+            self.assertEqual(list(cols["t_value"]), ["02", "05"])
+            for dropped in ("run_path", "source_row", "reason", "marcs_teff",
+                            "marcs_fe_h", "correct_marcs_logg"):
+                self.assertNotIn(dropped, cols)
+            # Synthesis settings come from the config, like the other modes.
+            np.testing.assert_allclose(cols["lam_min"], [_SYNTH["lam_min"]] * 2)
+            self.assertEqual(list(cols["grid_version"]), ["rerun-v1", "rerun-v1"])
+            self.assertEqual(list(cols["output_mode"]), [_SYNTH["output_mode"]] * 2)
+
+    def test_dedupe_rows_drops_exact_duplicates(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_csv(f"{tmp}/rejects.csv", rows=self._ROWS + [self._ROWS[0]])
+            cols = self._resolve(tmp, dedupe_rows=True)
+            self.assertEqual(len(cols["teff"]), 2)
+
+    def test_missing_required_column_raises(self) -> None:
+        import csv
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/rejects.csv"
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["teff", "logg"])
+                writer.writerow(["5000", "4.0"])
+            cfg = {"sampling": "rerun_csv", "rows_csv": path, "synthesis": _SYNTH}
+            with self.assertRaisesRegex(ValueError, "feh"):
+                resolve_grid_columns(cfg, rng=np.random.default_rng(0))
+
+    def test_missing_csv_raises(self) -> None:
+        cfg = {"sampling": "rerun_csv", "rows_csv": "/nonexistent/rejects.csv", "synthesis": _SYNTH}
+        with self.assertRaises(FileNotFoundError):
+            resolve_grid_columns(cfg, rng=np.random.default_rng(0))
+
+
 if __name__ == "__main__":
     unittest.main()

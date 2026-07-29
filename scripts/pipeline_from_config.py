@@ -149,6 +149,19 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
         grid_synthesis["mu_sampling"] = dict(ts_mu_sampling)
         grid_cfg["synthesis"] = grid_synthesis
 
+    # snap_prefilter predicts each row's atmosphere snap; hand it the same
+    # atmosphere store synthesis will use when the config sets one explicitly
+    # (an empty path auto-locates identically on both sides).
+    snap_prefilter = grid_cfg.get("snap_prefilter")
+    if isinstance(snap_prefilter, Mapping) and not snap_prefilter.get("atmosphere_path"):
+        ts_paths = dict(((pipeline_cfg.get("turbospectrum") or {}).get("paths")) or {})
+        atmosphere_path = str(ts_paths.get("model_atmosphere_path") or "").strip()
+        if atmosphere_path:
+            grid_cfg["snap_prefilter"] = {
+                **snap_prefilter,
+                "atmosphere_path": _abs_from(config_dir, atmosphere_path),
+            }
+
     run_root = _abs_from(config_dir, outputs.get("run_root")) or ""
     grid_csv = _abs_output_from(run_root, config_dir, outputs.get("grid_csv"))
     grid_zarr = _abs_output_from(run_root, config_dir, outputs.get("grid_zarr"))

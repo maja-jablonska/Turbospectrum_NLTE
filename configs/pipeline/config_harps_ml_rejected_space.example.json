@@ -1,0 +1,228 @@
+{
+  "_comment": "Re-cover the parameter space lost to the faulty MARCS snapping, by fresh LHS sampling (not by replaying rejected rows). The rejected region is L-shaped and MARCS coverage is a teff/logg staircase, so it is tiled by FIVE axis-aligned boxes, each its own run of this config shape; merge all five with harps_clean2 via merge_spectra_runs.py --filter-bad-snaps. This file is box A; the '_boxes' table lists the grid-block overrides (bounds, num_samples, grid_version, seed) for B-E. Everything OUTSIDE the grid block MUST stay identical to the original harps campaign config (synthesis window, Intensity + mu sampling, resolution, linelists) or the cross-run merge will refuse/misalign.",
+  "_boxes": {
+    "_sizing": "num_samples matches the original campaign density (~8.2 rows per K*dex over the 5500K x 6.5dex box; feh/vmicro sub-ranges scale box E). Box logg floors follow the MARCS coverage staircase (max teff at logg -0.5/0/0.5/1/1.5/2 = 4500/5250/6000/6750/7500/8000), shifted so every snap target exists within 0.25 dex / 125 K.",
+    "A_giants_cool": {
+      "teff": [
+        2500,
+        4500
+      ],
+      "logg": [
+        -0.5,
+        2.75
+      ],
+      "feh": [
+        -5.0,
+        1.0
+      ],
+      "vmicro": [
+        1.0,
+        5.0
+      ],
+      "num_samples": 60000
+    },
+    "B_giants_warm": {
+      "teff": [
+        4500,
+        6000
+      ],
+      "logg": [
+        0.5,
+        2.75
+      ],
+      "feh": [
+        -5.0,
+        1.0
+      ],
+      "vmicro": [
+        1.0,
+        5.0
+      ],
+      "num_samples": 31000
+    },
+    "C_giants_hot": {
+      "teff": [
+        6000,
+        7500
+      ],
+      "logg": [
+        1.5,
+        2.75
+      ],
+      "feh": [
+        -5.0,
+        1.0
+      ],
+      "vmicro": [
+        1.0,
+        5.0
+      ],
+      "num_samples": 17000
+    },
+    "D_giants_hottest": {
+      "teff": [
+        7500,
+        8000
+      ],
+      "logg": [
+        2.0,
+        2.75
+      ],
+      "feh": [
+        -5.0,
+        1.0
+      ],
+      "vmicro": [
+        1.0,
+        5.0
+      ],
+      "num_samples": 3500
+    },
+    "E_dwarfs_t05": {
+      "teff": [
+        2500,
+        8000
+      ],
+      "logg": [
+        2.75,
+        5.25
+      ],
+      "feh": [
+        -5.0,
+        -0.75
+      ],
+      "vmicro": [
+        3.5,
+        5.0
+      ],
+      "num_samples": 33000,
+      "_note": "The v1-filter (t05 solar trap) rejects never entered harps_clean, so they are absent from the harps_clean2 rejects summary -- this box restores that space."
+    },
+    "_unfixable": "Deliberately NOT re-sampled (no MARCS atmosphere exists within tolerance): logg < -0.5; teff > 3900 at logg > 5.25; and the near-solar high-vmicro dwarf band keeps its <=0.75 dex t05 structure mismatch by MARCS construction. For future full-box campaigns use logg -0.5..5.25, not -1.0..5.5."
+  },
+  "grid": {
+    "grid_version": "harps-ml-rejects-A-giants-cool-v1",
+    "sampling": "lhs",
+    "num_samples": 60000,
+    "seed": 202607281,
+    "bounds": {
+      "teff": {
+        "min": 2500,
+        "max": 4500
+      },
+      "logg": {
+        "min": -0.5,
+        "max": 2.75
+      },
+      "feh": {
+        "min": -5.0,
+        "max": 1.0
+      },
+      "vmicro": {
+        "min": 1.0,
+        "max": 5.0
+      }
+    },
+    "abundances": {
+      "a": {
+        "min": -0.4,
+        "max": 0.8
+      },
+      "c": {
+        "min": -1.0,
+        "max": 1.0
+      },
+      "n": {
+        "min": -0.5,
+        "max": 1.0
+      },
+      "o": {
+        "min": -0.4,
+        "max": 0.8
+      },
+      "r": {
+        "min": -0.4,
+        "max": 1.0
+      },
+      "s": {
+        "min": -0.5,
+        "max": 1.0
+      }
+    },
+    "synthesis": {
+      "lam_min": 3780.0,
+      "lam_max": 6910.0,
+      "lam_step": 0.01,
+      "output_mode": "Intensity"
+    },
+    "mode": "1D",
+    "calculation_mode": "LTE",
+    "io": {
+      "csv_compression": "zstd",
+      "csv_compression_level": 5,
+      "zarr_chunks": 4096,
+      "zarr_compressor": {
+        "cname": "zstd",
+        "clevel": 5,
+        "shuffle": true
+      }
+    },
+    "snap_prefilter": {
+      "_note": "Predicts each row's atmosphere snap at grid time (same selector as synthesis) and drops rows the post-merge acceptance filter would reject -- no wasted synthesis. Empty atmosphere_path auto-locates the MARCS store / inherits turbospectrum.paths.model_atmosphere_path.",
+      "atmosphere_path": "",
+      "max_dteff": 125,
+      "max_dlogg": 0.25,
+      "max_dfeh": null
+    }
+  },
+  "turbospectrum": {
+    "compiler": "gf",
+    "force": false,
+    "max_workers": null,
+    "executables": {
+      "babsma_exec": "babsma_lu",
+      "bsyn_exec": "bsyn_lu",
+      "interpol_exec": "interpol_modeles"
+    },
+    "paths": {
+      "_note": "model_atmosphere_path empty auto-locates input_files/model_atmospheres/1D/marcs_standard_comp. The store MUST contain the spherical (s*) models (ls <dir> | grep -c '^s' -> 9458) -- boxes A-D are giants and synthesize against them.",
+      "model_atmosphere_path": "",
+      "linelist_path": "input_files/linelists",
+      "linelist_files": [
+        "nlte_ges_linelist_jmg16jan2026_I_II",
+        "Hlinedata",
+        "vald-3700-3800-for-grid-nlte-16jan2026",
+        "vald-3800-4200-for-grid-nlte-16jan2026",
+        "molecules-420-920nm/*.bsyn"
+      ],
+      "model_opac_dir": "COM/contopac"
+    },
+    "synthesis_parameters": {
+      "mu_angles": [],
+      "mu_sampling": {
+        "mode": "exact",
+        "count": 1,
+        "seed": 0,
+        "min": 0.01,
+        "max": 1.0,
+        "reduce": "first"
+      },
+      "resolution": 115000.0
+    },
+    "nlte": {
+      "enabled": false,
+      "nlte_info_file": ""
+    },
+    "provenance": {
+      "environment_capture": "pip_freeze"
+    }
+  },
+  "outputs": {
+    "run_root": "../../runs/harps-ml-rejects-A-giants-cool"
+  },
+  "runtime": {
+    "workers": null,
+    "scratch": null,
+    "chunk_rows": 64
+  }
+}

@@ -361,6 +361,12 @@ def _resolve_ml_sampling(config: Mapping[str, Any], rng: np.random.Generator, ba
 
 _LHS_SAMPLING_ALIASES = {"lhs", "latin_hypercube", "latin-hypercube", "random", "ml", "sample"}
 _REGULAR_SAMPLING_ALIASES = {"grid", "regular", "cartesian", "axes", "regular_grid"}
+_RERUN_SAMPLING_ALIASES = {"rerun_csv", "rerun", "csv", "rows", "rejects"}
+
+# Lineage columns of a snap-filter rejects CSV (scripts/filter_bad_snap_rows.py)
+# that must not become grid parameters; marcs_*/correct_* columns are excluded
+# by prefix since they describe the OLD (faulty) snap, not the request.
+_RERUN_LINEAGE_COLUMNS = {"run_path", "source_row", "reason"}
 
 
 # Envelope of the MARCS standard-composition grid (Gustafsson et al. 2008).
@@ -447,17 +453,257 @@ def warn_outside_marcs_bounds(columns: Mapping[str, Any], config: Mapping[str, A
             )
 
 
+def _resolve_rerun_csv_sampling(config: Mapping[str, Any], base_dir: str | None = None) -> Dict[str, np.ndarray]:
+    """Rebuild grid columns from an explicit per-row CSV (``grid.rows_csv``).
+
+    Built for re-running the rows a snap-filter pass rejected
+    (``scripts/filter_bad_snap_rows.py --rejects-csv``): every requested
+    parameter column travels through verbatim (teff/logg/feh, turbvel/vmicro,
+    abundances, per-row mu, ...), while lineage (``run_path``/``source_row``/
+    ``reason``) and the old faulty snap's ``marcs_*``/``correct_*`` columns are
+    dropped. Synthesis settings (lam window, output/calculation mode) come from
+    the config exactly like the other sampling modes — they are per-run
+    constants, not CSV columns, and MUST match the runs the rejects came from.
+
+    ``t_value`` is normalised to the two-digit label form ("05"); when absent
+    it is re-derived from ``turbvel`` via the nearest available t-label.
+    ``grid.dedupe_rows: true`` drops exact duplicate rows (all carried columns
+    equal) while preserving first-seen order.
+    """
+    path = str(config.get("rows_csv", "") or "").strip()
+    if not path:
+        raise ValueError("grid.sampling='rerun_csv' requires grid.rows_csv (path to the rejects CSV)")
+    path = os.path.expanduser(os.path.expandvars(path))
+    if base_dir and not os.path.isabs(path):
+        path = os.path.join(base_dir, path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"grid.rows_csv does not exist: {path}")
+
+    with open(path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        raw_rows = list(reader)
+    if not raw_rows:
+        raise ValueError(f"grid.rows_csv has no data rows: {path}")
+
+    keep = [
+        c for c in fieldnames
+        if c not in _RERUN_LINEAGE_COLUMNS
+        and not c.startswith("marcs_")
+        and not c.startswith("correct_")
+    ]
+    n = len(raw_rows)
+    columns: Dict[str, np.ndarray] = {}
+    for name in keep:
+        values = [str(row.get(name, "") or "").strip() for row in raw_rows]
+        floats = np.empty(n, dtype=float)
+        numeric = True
+        for i, text in enumerate(values):
+            if text == "":
+                floats[i] = np.nan
+                continue
+            try:
+                floats[i] = float(text)
+            except ValueError:
+                numeric = False
+                break
+        if numeric:
+            if np.isnan(floats).all():
+                continue  # e.g. a mu column of a flux-mode dataset
+            columns[name] = floats
+        else:
+            columns[name] = np.array(values, dtype=object)
+
+    missing = [c for c in ("teff", "logg", "feh") if c not in columns]
+    if missing:
+        raise ValueError(f"grid.rows_csv lacks required columns: {', '.join(missing)} ({path})")
+
+    if "turbvel" not in columns and "vmicro" in columns:
+        columns["turbvel"] = columns["vmicro"]
+    # turbvel is the canonical microturbulence column; a duplicate vmicro column
+    # would be misread as an abundance by the synthesis stage.
+    columns.pop("vmicro", None)
+
+    if "t_value" in columns:
+        labels = []
+        for value in np.asarray(columns["t_value"]).ravel():
+            try:
+                labels.append(f"{int(round(float(value))):02d}")
+            except (TypeError, ValueError):
+                labels.append(str(value))
+        columns["t_value"] = np.array(labels, dtype=object)
+    elif "turbvel" in columns:
+        try:
+            from synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
+        except ImportError:
+            from .synthesize_regular_grid import nearest_t_value_for_turbvel  # type: ignore
+        columns["t_value"] = nearest_t_value_for_turbvel(
+            columns["turbvel"], config.get("t_value_options", ["01", "02", "05"])
+        )
+
+    if config.get("dedupe_rows", False):
+        seen: set = set()
+        order = []
+        names = sorted(columns)
+        for i in range(n):
+            key = tuple(str(columns[c][i]) for c in names)
+            if key not in seen:
+                seen.add(key)
+                order.append(i)
+        idx = np.asarray(order, dtype=int)
+        columns = {c: v[idx] for c, v in columns.items()}
+        n = len(idx)
+
+    synthesis_cfg = config.get("synthesis") or {}
+
+    def fill(name: str, value: Any, dtype=object) -> None:
+        if name not in columns:
+            columns[name] = np.full(n, value, dtype=dtype)
+
+    fill("grid_version", str(config.get("grid_version", "rerun-csv")))
+    fill("lam_min", float(synthesis_cfg.get("lam_min", 6000)), float)
+    fill("lam_max", float(synthesis_cfg.get("lam_max", 6100)), float)
+    fill("lam_step", float(synthesis_cfg.get("lam_step", 0.01)), float)
+    fill("output_mode", str(synthesis_cfg.get("output_mode", "Flux")))
+    fill("mode", str(synthesis_cfg.get("mode", config.get("mode", "1D"))))
+    fill("calculation_mode", str(synthesis_cfg.get("calculation_mode", config.get("calculation_mode", "LTE"))))
+
+    try:
+        from .nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+    except ImportError:
+        from nlte_ascii_departures import build_nlte_ascii_selector_columns, normalize_nlte_ascii_selector
+    nlte_ascii_cfg = config.get("nlte_ascii_departures") or {}
+    selector = normalize_nlte_ascii_selector(
+        directory=nlte_ascii_cfg.get("directory"),
+        species=nlte_ascii_cfg.get("species"),
+        abundance_column=nlte_ascii_cfg.get("abundance_column"),
+        abundance_scale=nlte_ascii_cfg.get("abundance_scale"),
+        solar_abundance=nlte_ascii_cfg.get("solar_abundance"),
+        match=nlte_ascii_cfg.get("match"),
+        base_dir=base_dir,
+    )
+    for name, values in build_nlte_ascii_selector_columns(n, selector).items():
+        if name not in columns:
+            columns[name] = values
+    return columns
+
+
+def apply_snap_prefilter(columns: Dict[str, np.ndarray], config: Mapping[str, Any], base_dir: str | None = None) -> Dict[str, np.ndarray]:
+    """Drop grid rows whose predicted atmosphere snap exceeds tolerance.
+
+    Enabled by a ``grid.snap_prefilter`` block::
+
+        "snap_prefilter": {"max_dlogg": 0.25, "max_dteff": 125, "max_dfeh": null,
+                           "atmosphere_path": ""}
+
+    For every row the nearest MARCS atmosphere is predicted with the SAME
+    selector production synthesis uses (via ``filter_bad_snap_rows``), and rows
+    whose |predicted - requested| exceeds any set threshold are removed BEFORE
+    synthesis — the same rows the post-merge acceptance filter would reject,
+    minus the wasted compute. An empty ``atmosphere_path`` auto-locates the
+    repo's MARCS store exactly like TurbospectrumConfig does;
+    ``pipeline_from_config`` injects the turbospectrum path when configured.
+
+    Note: this makes the generated grid depend on the atmosphere store contents
+    (rows kept = f(config, store)). The dropped count is logged; regenerating
+    against a different store may yield a different grid, so keep the store
+    fixed for a run — the same requirement synthesis already has.
+    """
+    spec = config.get("snap_prefilter")
+    if not isinstance(spec, Mapping):
+        return columns
+    thresholds = {
+        axis: (None if spec.get(key) is None else float(spec.get(key)))
+        for axis, key in (("teff", "max_dteff"), ("logg", "max_dlogg"), ("feh", "max_dfeh"))
+    }
+    if all(v is None for v in thresholds.values()):
+        raise ValueError("grid.snap_prefilter needs at least one of max_dteff/max_dlogg/max_dfeh")
+
+    atmosphere_path = str(spec.get("atmosphere_path", "") or "").strip()
+    if atmosphere_path:
+        atmosphere_path = os.path.expanduser(os.path.expandvars(atmosphere_path))
+        if base_dir and not os.path.isabs(atmosphere_path):
+            atmosphere_path = os.path.join(base_dir, atmosphere_path)
+    else:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(repo_root, "input_files", "model_atmospheres", "1D", "marcs_standard_comp")
+        nested = os.path.join(candidate, "marcs_standard_comp")
+        atmosphere_path = nested if os.path.isdir(nested) else candidate
+    if not os.path.isdir(atmosphere_path):
+        raise FileNotFoundError(f"grid.snap_prefilter atmosphere_path does not exist: {atmosphere_path}")
+
+    try:
+        from filter_bad_snap_rows import _model_arrays, compute_correct_snap
+    except ImportError:
+        from .filter_bad_snap_rows import _model_arrays, compute_correct_snap  # type: ignore
+
+    n = len(np.asarray(columns["teff"]).ravel())
+    t_numeric = np.empty(n, dtype=float)
+    t_source = columns.get("t_value", columns.get("turbvel"))
+    if t_source is None:
+        raise ValueError("grid.snap_prefilter needs a t_value or turbvel column")
+    for i, value in enumerate(np.asarray(t_source).ravel()):
+        try:
+            t_numeric[i] = float(value)
+        except (TypeError, ValueError):
+            t_numeric[i] = float("nan")
+
+    _lib, model_arrays = _model_arrays(atmosphere_path)
+    predicted = dict(zip(
+        ("teff", "logg", "feh"),
+        compute_correct_snap(
+            model_arrays,
+            np.asarray(columns["teff"], dtype=float),
+            np.asarray(columns["logg"], dtype=float),
+            np.asarray(columns["feh"], dtype=float),
+            t_numeric,
+        ),
+    ))
+
+    keep = np.ones(n, dtype=bool)
+    dropped_by_axis = {}
+    for axis, threshold in thresholds.items():
+        if threshold is None:
+            continue
+        bad = np.abs(predicted[axis] - np.asarray(columns[axis], dtype=float)) > threshold
+        bad |= np.isnan(predicted[axis])
+        dropped_by_axis[axis] = int(bad.sum())
+        keep &= ~bad
+
+    n_dropped = int((~keep).sum())
+    log = logging.getLogger("generate_grid")
+    if n_dropped:
+        log.warning(
+            "snap_prefilter: dropped %d/%d rows whose predicted atmosphere snap exceeds "
+            "tolerance (per-axis violations: %s; store: %s). These rows would have been "
+            "rejected by the post-merge acceptance filter after synthesis.",
+            n_dropped, n, dropped_by_axis, atmosphere_path,
+        )
+    else:
+        log.info("snap_prefilter: all %d rows within snap tolerance (store: %s)", n, atmosphere_path)
+    if not keep.any():
+        raise ValueError(
+            "grid.snap_prefilter dropped every row — the sampled region has no MARCS "
+            f"coverage within tolerance (store: {atmosphere_path})"
+        )
+    if n_dropped:
+        columns = {name: np.asarray(values)[keep] for name, values in columns.items()}
+    return columns
+
+
 def resolve_grid_columns(config: Mapping[str, Any], rng: np.random.Generator, base_dir: str | None = None) -> Dict[str, np.ndarray]:
     """Build grid columns from a grid config, choosing the sampling mode.
 
     ``grid.sampling`` selects how the parameter grid is built:
 
-    - ``"lhs"``  -> Latin-Hypercube sampling (``num_samples`` + ``bounds``)
-    - ``"grid"`` -> regular Cartesian product (``axes``)
+    - ``"lhs"``       -> Latin-Hypercube sampling (``num_samples`` + ``bounds``)
+    - ``"grid"``      -> regular Cartesian product (``axes``)
+    - ``"rerun_csv"`` -> explicit per-row list from ``rows_csv`` (e.g. a
+      snap-filter rejects CSV, for re-running the rejected parameter space)
 
     When ``grid.sampling`` is omitted it is auto-detected: an explicit ``axes``
     block means a regular grid, otherwise Latin-Hypercube (so every existing
-    config keeps working unchanged). Both modes return the same column schema,
+    config keeps working unchanged). All modes return the same column schema,
     so the synthesis stage downstream is identical either way.
     """
     sampling = str(config.get("sampling", "") or "").strip().lower()
@@ -472,12 +718,15 @@ def resolve_grid_columns(config: Mapping[str, Any], rng: np.random.Generator, ba
         except ImportError:
             from .synthesize_regular_grid import resolve_regular_sampling  # type: ignore
         columns = resolve_regular_sampling(config, rng=rng, base_dir=base_dir)
+    elif sampling in _RERUN_SAMPLING_ALIASES:
+        columns = _resolve_rerun_csv_sampling(config, base_dir=base_dir)
     else:
         raise ValueError(
-            f"grid.sampling must be 'lhs' or 'grid' (or an alias), got {sampling!r}"
+            f"grid.sampling must be 'lhs', 'grid', or 'rerun_csv' (or an alias), got {sampling!r}"
         )
 
     warn_outside_marcs_bounds(columns, config)
+    columns = apply_snap_prefilter(columns, config, base_dir=base_dir)
     return columns
 
 
