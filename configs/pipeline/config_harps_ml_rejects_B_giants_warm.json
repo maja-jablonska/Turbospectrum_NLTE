@@ -1,0 +1,128 @@
+{
+  "_comment": "HARPS ML rejected-space re-coverage, box B_giants_warm: fresh LHS over the parameter space lost to the faulty MARCS snapping. One of five boxes (A-E, see config_harps_ml_rejected_space.example.json for the tiling rationale); run each through turbospectrum_pipeline.pbs, then merge all five with harps_clean2 via merge_spectra_runs.py --filter-bad-snaps. Requires the spherical (s*) MARCS models in the atmosphere store. Synthesis settings match the original harps-ml campaign.",
+  "grid": {
+    "grid_version": "harps-ml-rejects-B-giants-warm-v1",
+    "sampling": "lhs",
+    "num_samples": 34500,
+    "seed": 202607282,
+    "bounds": {
+      "teff": {
+        "min": 4500,
+        "max": 6000
+      },
+      "logg": {
+        "min": 0.5,
+        "max": 2.75
+      },
+      "feh": {
+        "min": -5.0,
+        "max": 1.0
+      },
+      "vmicro": {
+        "min": 1.0,
+        "max": 5.0
+      }
+    },
+    "abundances": {
+      "a": {
+        "min": -0.4,
+        "max": 0.8
+      },
+      "c": {
+        "min": -1.0,
+        "max": 1.0
+      },
+      "n": {
+        "min": -0.5,
+        "max": 1.0
+      },
+      "o": {
+        "min": -0.4,
+        "max": 0.8
+      },
+      "r": {
+        "min": -0.4,
+        "max": 1.0
+      },
+      "s": {
+        "min": -0.5,
+        "max": 1.0
+      }
+    },
+    "synthesis": {
+      "lam_min": 3780.0,
+      "lam_max": 6910.0,
+      "lam_step": 0.01,
+      "output_mode": "Intensity"
+    },
+    "mode": "1D",
+    "calculation_mode": "LTE",
+    "io": {
+      "csv_compression": "zstd",
+      "csv_compression_level": 5,
+      "zarr_chunks": 4096,
+      "zarr_compressor": {
+        "cname": "zstd",
+        "clevel": 5,
+        "shuffle": true
+      }
+    },
+    "snap_prefilter": {
+      "atmosphere_path": "",
+      "max_dteff": 125,
+      "max_dlogg": 0.25,
+      "max_dfeh": null
+    },
+    "_num_samples_note": "Raised above the density target to compensate the snap_prefilter drop rate (measured on the full MARCS store); surviving rows land at the original campaign density. Synthesis cost is set by SURVIVING rows, not this number."
+  },
+  "turbospectrum": {
+    "compiler": "gf",
+    "force": false,
+    "max_workers": null,
+    "executables": {
+      "babsma_exec": "babsma_lu",
+      "bsyn_exec": "bsyn_lu",
+      "interpol_exec": "interpol_modeles"
+    },
+    "paths": {
+      "_note": "model_atmosphere_path empty auto-locates input_files/model_atmospheres/1D/marcs_standard_comp. The store MUST contain the spherical (s*) models (ls <dir> | grep -c '^s' -> 9458) -- boxes A-D are giants and synthesize against them.",
+      "model_atmosphere_path": "",
+      "linelist_path": "input_files/linelists",
+      "linelist_files": [
+        "nlte_ges_linelist_jmg16jan2026_I_II",
+        "Hlinedata",
+        "vald-3700-3800-for-grid-nlte-16jan2026",
+        "vald-3800-4200-for-grid-nlte-16jan2026",
+        "molecules-420-920nm/*.bsyn"
+      ],
+      "model_opac_dir": "COM/contopac"
+    },
+    "synthesis_parameters": {
+      "mu_angles": [],
+      "mu_sampling": {
+        "mode": "exact",
+        "count": 1,
+        "seed": 0,
+        "min": 0.01,
+        "max": 1.0,
+        "reduce": "first"
+      },
+      "resolution": 115000.0
+    },
+    "nlte": {
+      "enabled": false,
+      "nlte_info_file": ""
+    },
+    "provenance": {
+      "environment_capture": "pip_freeze"
+    }
+  },
+  "outputs": {
+    "run_root": "../../runs/harps-ml-rejects-B-giants-warm"
+  },
+  "runtime": {
+    "workers": null,
+    "scratch": null,
+    "chunk_rows": 64
+  }
+}

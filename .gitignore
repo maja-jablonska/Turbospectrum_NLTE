@@ -81,6 +81,8 @@ COM/contopac/*
 !/configs/**/*.example.*
 !*_example*.pbs
 !/configs/pipeline/config_regular_grid_nlte_fe_tiny_gadi.json
+# HARPS rejected-space re-coverage boxes (A-E): tracked so Gadi gets them via git pull.
+!/configs/pipeline/config_harps_ml_rejects_*.json
 !turbospectrum_regular_grid_nlte_tiny_gadi.pbs
 !turbospectrum_regular_grid_nlte_tiny_array_gadi.pbs
 !turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
