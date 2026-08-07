@@ -1216,8 +1216,14 @@ echo "[${TAG}] Merge complete: ${MERGED_ZARR}"
 ############################################
 
 if [[ "$(to_bool01 "${CLEANUP_SHARDS}")" == "1" ]]; then
-    echo "[${TAG}] Cleaning up shard directory: ${SHARDS_DIR}"
-    rm -rf "${SHARDS_DIR}"
+    if (( FINAL_MISSING > 0 )); then
+        # Partial merge: the remaining shards are still needed for a later full
+        # merge, so never delete them here regardless of CLEANUP_SHARDS.
+        echo "[${TAG}] Partial merge (${FINAL_MISSING} shards missing): keeping shard directory ${SHARDS_DIR}"
+    else
+        echo "[${TAG}] Cleaning up shard directory: ${SHARDS_DIR}"
+        rm -rf "${SHARDS_DIR}"
+    fi
 fi
 
 if [[ -d "${SCRATCH_TMP_ROOT}" ]]; then
