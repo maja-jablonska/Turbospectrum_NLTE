@@ -235,6 +235,9 @@ def main(argv=None) -> int:
                     help="RNG seed for the global shuffle (default 0); keep fixed across jobs")
     ap.add_argument("--split-index", type=int, default=None,
                     help="Write only this split (0-based); for one-split-per-job submission")
+    ap.add_argument("--split-stride", type=int, default=None,
+                    help="With --split-index K, write splits K, K+stride, K+2*stride, ... "
+                         "so T array tasks (stride=T) can cover more than T splits")
     ap.add_argument("--batch-rows", type=int, default=None,
                     help="Rows per streamed read batch (default: sized to ~512 MiB)")
     ap.add_argument("--chunk-rows", type=int, default=None,
@@ -291,10 +294,17 @@ def main(argv=None) -> int:
     perm = rng.permutation(n_rows).astype(np.int64)
     offsets = np.concatenate(([0], np.cumsum(sizes)))
 
-    targets = range(num_splits) if args.split_index is None else [args.split_index]
+    if args.split_index is None:
+        if args.split_stride is not None:
+            raise ValueError("--split-stride requires --split-index")
+        targets = range(num_splits)
+    else:
+        if not (0 <= args.split_index < num_splits):
+            raise ValueError(f"--split-index {args.split_index} out of range [0, {num_splits})")
+        if args.split_stride is not None and args.split_stride < 1:
+            raise ValueError(f"--split-stride must be >= 1, got {args.split_stride}")
+        targets = range(args.split_index, num_splits, args.split_stride or num_splits)
     for k in targets:
-        if not (0 <= k < num_splits):
-            raise ValueError(f"--split-index {k} out of range [0, {num_splits})")
         final_path = os.path.join(output_dir, f"{prefix}_{k:0{pad}d}.zarr")
         if os.path.exists(final_path):
             print(f"[{k}] exists, skipping: {final_path}")

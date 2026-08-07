@@ -20,9 +20,12 @@
 #      are skipped, so just resubmit if walltime runs out)
 #      qsub -v INPUT_ZARR=/scratch/.../train.zarr,OUTPUT_DIR=/scratch/.../splits split_training_zarr_example.pbs
 #
-#   2) Array job – one split per task (run --dry-run first to get the split
-#      count N, then submit -J 0-$((N-1)))
-#      qsub -J 0-11 -v INPUT_ZARR=...,OUTPUT_DIR=... split_training_zarr_example.pbs
+#   2) Array job – splits are dealt round-robin across the array tasks, so
+#      the array can be SMALLER than the split count (e.g. 34 splits over
+#      10 tasks: task k writes splits k, k+10, k+20, ...). Any range works:
+#      qsub -J 0-9 -v INPUT_ZARR=...,OUTPUT_DIR=... split_training_zarr_example.pbs
+#      The task count is inferred from the PBS array range; override with
+#      TASK_COUNT=N if needed.
 #
 # Useful -v knobs (all optional):
 #   TARGET_GB=10        target size per split in GiB (on-disk basis)
@@ -150,8 +153,25 @@ if [[ "${DRY_RUN:-0}" == "1" ]];   then CMD+=(--dry-run); fi
 ############################################
 
 if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
-    echo "[${TAG}] Mode: array task (split ${PBS_ARRAY_INDEX}, seed ${SEED})"
+    # Infer the number of array tasks from the range in PBS_JOBID
+    # (e.g. "12345[0-9].gadi-pbs" -> 10); TASK_COUNT env overrides.
+    TASK_COUNT="${TASK_COUNT:-}"
+    if [[ -z "${TASK_COUNT}" ]]; then
+        TASK_COUNT="$("${PYTHON}" -c "
+import re, sys
+m = re.search(r'\[(\d+)-(\d+)\]', sys.argv[1])
+print(int(m.group(2)) - int(m.group(1)) + 1 if m else '')
+" "${PBS_JOBID:-}" 2>/dev/null || echo "")"
+    fi
+    if ! [[ "${TASK_COUNT}" =~ ^[0-9]+$ ]] || (( TASK_COUNT < 1 )); then
+        echo "[${TAG}] WARN: could not infer TASK_COUNT from PBS_JOBID='${PBS_JOBID:-}'; task will write only split ${PBS_ARRAY_INDEX}." >&2
+        TASK_COUNT=""
+    fi
+    echo "[${TAG}] Mode: array task ${PBS_ARRAY_INDEX} of ${TASK_COUNT:-?} (seed ${SEED})"
     CMD+=(--split-index "${PBS_ARRAY_INDEX}")
+    if [[ -n "${TASK_COUNT}" ]]; then
+        CMD+=(--split-stride "${TASK_COUNT}")
+    fi
 else
     echo "[${TAG}] Mode: single job (all splits)"
 fi

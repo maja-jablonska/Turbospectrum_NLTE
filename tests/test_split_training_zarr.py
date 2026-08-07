@@ -146,6 +146,29 @@ def test_small_batch_streaming_matches(source_store, tmp_path):
         np.testing.assert_array_equal(grp["flux"][...], src["flux"][...][rows])
 
 
+def test_split_stride_partitions_all_splits(source_store, tmp_path):
+    # 4 splits over 3 strided "tasks" must together produce the same result
+    # as one full run: task k writes splits k, k+3, ...
+    out_dir = tmp_path / "out"
+    for task in range(3):
+        _run(source_store, out_dir, "--split-index", str(task), "--split-stride", "3")
+    names = sorted(p for p in os.listdir(out_dir) if p.endswith(".zarr"))
+    assert names == [f"train_test_split_{k:03d}.zarr" for k in range(4)]
+
+    full_dir = tmp_path / "full"
+    _run(source_store, full_dir)
+    for name in names:
+        a = open_root_group(os.path.join(str(out_dir), name))
+        b = open_root_group(os.path.join(str(full_dir), name))
+        np.testing.assert_array_equal(a["source_row_index"][...],
+                                      b["source_row_index"][...])
+
+
+def test_split_stride_requires_split_index(source_store, tmp_path):
+    with pytest.raises(ValueError, match="--split-stride requires --split-index"):
+        _run(source_store, tmp_path / "out", "--split-stride", "3")
+
+
 def test_never_deletes_source_or_foreign_files(source_store, tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
