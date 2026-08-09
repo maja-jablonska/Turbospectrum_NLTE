@@ -153,8 +153,11 @@ if [[ "${DRY_RUN:-0}" == "1" ]];   then CMD+=(--dry-run); fi
 ############################################
 
 if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
-    # Infer the number of array tasks from the range in PBS_JOBID
-    # (e.g. "12345[0-9].gadi-pbs" -> 10); TASK_COUNT env overrides.
+    # Infer the number of array tasks. Precedence: TASK_COUNT env, then the
+    # range in PBS_JOBID (present for the parent job, e.g. "12345[0-9]..."),
+    # then qstat on the parent array id — PBS Pro gives each SUBJOB a job id
+    # like "12345[9].gadi-pbs" (its own index, no range), so the regex alone
+    # is not enough on Gadi.
     TASK_COUNT="${TASK_COUNT:-}"
     if [[ -z "${TASK_COUNT}" ]]; then
         TASK_COUNT="$("${PYTHON}" -c "
@@ -163,8 +166,17 @@ m = re.search(r'\[(\d+)-(\d+)\]', sys.argv[1])
 print(int(m.group(2)) - int(m.group(1)) + 1 if m else '')
 " "${PBS_JOBID:-}" 2>/dev/null || echo "")"
     fi
+    if [[ -z "${TASK_COUNT}" && -n "${PBS_ARRAY_ID:-}" ]] && command -v qstat >/dev/null 2>&1; then
+        _range="$(qstat -f "${PBS_ARRAY_ID}" 2>/dev/null | sed -n 's/.*array_indices_submitted = \([0-9:-]*\).*/\1/p' | head -n 1)"
+        TASK_COUNT="$("${PYTHON}" -c "
+import re, sys
+m = re.match(r'^(\d+)-(\d+)(?::(\d+))?$', sys.argv[1])
+print((int(m.group(2)) - int(m.group(1))) // int(m.group(3) or 1) + 1 if m else '')
+" "${_range}" 2>/dev/null || echo "")"
+    fi
     if ! [[ "${TASK_COUNT}" =~ ^[0-9]+$ ]] || (( TASK_COUNT < 1 )); then
-        echo "[${TAG}] WARN: could not infer TASK_COUNT from PBS_JOBID='${PBS_JOBID:-}'; task will write only split ${PBS_ARRAY_INDEX}." >&2
+        echo "[${TAG}] WARN: could not infer TASK_COUNT (PBS_JOBID='${PBS_JOBID:-}'); task will write ONLY split ${PBS_ARRAY_INDEX}." >&2
+        echo "[${TAG}] WARN: pass TASK_COUNT explicitly, e.g. qsub -J 0-9 -v TASK_COUNT=10,... to cover all splits." >&2
         TASK_COUNT=""
     fi
     echo "[${TAG}] Mode: array task ${PBS_ARRAY_INDEX} of ${TASK_COUNT:-?} (seed ${SEED})"
