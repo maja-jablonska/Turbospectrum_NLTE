@@ -33,6 +33,7 @@
 #   NUM_SPLITS=N        override sizing: exact number of splits
 #   ROWS_PER_SPLIT=R    override sizing: exact rows per split
 #   SEED=0              shuffle seed — MUST match across array tasks
+#   SHUFFLE=global      global (row-level) | block (whole source chunks; far less I/O)
 #   PREFIX=name         output store name prefix
 #   BATCH_ROWS=N        rows per streamed read batch
 #   CHUNK_ROWS=N        output row chunking
@@ -146,6 +147,7 @@ if [[ -n "${ROWS_PER_SPLIT:-}" ]]; then CMD+=(--rows-per-split "${ROWS_PER_SPLIT
 if [[ -n "${PREFIX:-}" ]];         then CMD+=(--prefix "${PREFIX}"); fi
 if [[ -n "${BATCH_ROWS:-}" ]];     then CMD+=(--batch-rows "${BATCH_ROWS}"); fi
 if [[ -n "${CHUNK_ROWS:-}" ]];     then CMD+=(--chunk-rows "${CHUNK_ROWS}"); fi
+if [[ -n "${SHUFFLE:-}" ]];        then CMD+=(--shuffle "${SHUFFLE}"); fi
 if [[ "${DRY_RUN:-0}" == "1" ]];   then CMD+=(--dry-run); fi
 
 ############################################
@@ -153,37 +155,24 @@ if [[ "${DRY_RUN:-0}" == "1" ]];   then CMD+=(--dry-run); fi
 ############################################
 
 if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
-    # Infer the number of array tasks. Precedence: TASK_COUNT env, then the
-    # range in PBS_JOBID (present for the parent job, e.g. "12345[0-9]..."),
-    # then qstat on the parent array id — PBS Pro gives each SUBJOB a job id
-    # like "12345[9].gadi-pbs" (its own index, no range), so the regex alone
-    # is not enough on Gadi.
+    # Task k of T handles splits k, k+T, k+2T, ... where k is the task's
+    # ordinal within the submitted range (so -J 1-10 or -J 0-18:2 work too).
+    # PBS Pro subjob ids carry no range, hence scripts/pbs_array_range.py
+    # (qstat fallback). TASK_COUNT env overrides the count.
+    read -r _arr_start _arr_end _arr_step <<< "$("${PYTHON}" "${REPO}/scripts/pbs_array_range.py" 2>/dev/null || true)"
     TASK_COUNT="${TASK_COUNT:-}"
-    if [[ -z "${TASK_COUNT}" ]]; then
-        TASK_COUNT="$("${PYTHON}" -c "
-import re, sys
-m = re.search(r'\[(\d+)-(\d+)\]', sys.argv[1])
-print(int(m.group(2)) - int(m.group(1)) + 1 if m else '')
-" "${PBS_JOBID:-}" 2>/dev/null || echo "")"
-    fi
-    if [[ -z "${TASK_COUNT}" && -n "${PBS_ARRAY_ID:-}" ]] && command -v qstat >/dev/null 2>&1; then
-        _range="$(qstat -f "${PBS_ARRAY_ID}" 2>/dev/null | sed -n 's/.*array_indices_submitted = \([0-9:-]*\).*/\1/p' | head -n 1)"
-        TASK_COUNT="$("${PYTHON}" -c "
-import re, sys
-m = re.match(r'^(\d+)-(\d+)(?::(\d+))?$', sys.argv[1])
-print((int(m.group(2)) - int(m.group(1))) // int(m.group(3) or 1) + 1 if m else '')
-" "${_range}" 2>/dev/null || echo "")"
+    if [[ -n "${_arr_start:-}" ]]; then
+        TASK_ORDINAL=$(( (PBS_ARRAY_INDEX - _arr_start) / _arr_step ))
+        : "${TASK_COUNT:=$(( (_arr_end - _arr_start) / _arr_step + 1 ))}"
+    else
+        TASK_ORDINAL="${PBS_ARRAY_INDEX}"
     fi
     if ! [[ "${TASK_COUNT}" =~ ^[0-9]+$ ]] || (( TASK_COUNT < 1 )); then
-        echo "[${TAG}] WARN: could not infer TASK_COUNT (PBS_JOBID='${PBS_JOBID:-}'); task will write ONLY split ${PBS_ARRAY_INDEX}." >&2
-        echo "[${TAG}] WARN: pass TASK_COUNT explicitly, e.g. qsub -J 0-9 -v TASK_COUNT=10,... to cover all splits." >&2
-        TASK_COUNT=""
+        echo "[${TAG}] ERROR: could not determine the array size; pass TASK_COUNT (qsub -J 0-9 -v TASK_COUNT=10,...)." >&2
+        exit 1
     fi
-    echo "[${TAG}] Mode: array task ${PBS_ARRAY_INDEX} of ${TASK_COUNT:-?} (seed ${SEED})"
-    CMD+=(--split-index "${PBS_ARRAY_INDEX}")
-    if [[ -n "${TASK_COUNT}" ]]; then
-        CMD+=(--split-stride "${TASK_COUNT}")
-    fi
+    echo "[${TAG}] Mode: array task ordinal ${TASK_ORDINAL} of ${TASK_COUNT} (PBS index ${PBS_ARRAY_INDEX}, seed ${SEED})"
+    CMD+=(--split-index "${TASK_ORDINAL}" --split-stride "${TASK_COUNT}")
 else
     echo "[${TAG}] Mode: single job (all splits)"
 fi

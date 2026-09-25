@@ -89,11 +89,8 @@ class FilterBadSnapRowsTests(unittest.TestCase):
     def test_write_filtered_store(self):
         keep, stats, _details = classify_rows(self.src, self.atmo_dir)
         out_path = os.path.join(self._tmp.name, "clean.zarr")
-        write_filtered(
-            self.src, out_path, out_path + ".tmp", keep, stats,
-            self.atmo_dir, {"max_dlogg": None},
-        )
-        self.assertFalse(os.path.exists(out_path + ".tmp"))
+        write_filtered(self.src, out_path, keep, stats, self.atmo_dir, {"max_dlogg": None})
+        self.assertEqual([n for n in os.listdir(self._tmp.name) if ".tmp" in n], [])
         dst = open_root_group(out_path, mode="r")
         self.assertEqual(dst["flux"].shape, (2, 4))
         np.testing.assert_array_equal(dst["flux"][0], np.arange(4, dtype=np.float32))
@@ -173,7 +170,7 @@ class FilterBadSnapRowsTests(unittest.TestCase):
         out_path = os.path.join(self._tmp.name, "exists.zarr")
         os.makedirs(out_path)
         with self.assertRaises(FileExistsError):
-            write_filtered(self.src, out_path, out_path + ".tmp", keep, stats, self.atmo_dir, {})
+            write_filtered(self.src, out_path, keep, stats, self.atmo_dir, {})
 
 
 if __name__ == "__main__":

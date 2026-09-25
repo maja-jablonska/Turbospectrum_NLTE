@@ -18,8 +18,8 @@ hot low-logg corners where no model exists).
 Without ``--output`` it only reports counts. With ``--output`` it writes a new
 schema-compliant store containing the kept rows (streamed in row blocks; the
 row-aligned arrays are sliced, everything else copied verbatim, provenance
-subgroups preserved). The write is atomic: data lands in ``--output-tmp`` (same
-filesystem) and is renamed into place.
+subgroups preserved). The write is atomic (built beside ``--output``, then
+renamed) and the output's ``n_models``/``lineage`` attrs are updated.
 
 Usage:
     python3 scripts/filter_bad_snap_rows.py -i spectra.zarr -a /path/to/marcs_dir
@@ -38,15 +38,9 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from run_turbospectrum import ModelInterpolator, SNAP_SCALES  # noqa: E402
-from subsample_spectra import _copy_group_attrs, _copy_subgroups, _norm  # noqa: E402
-from zarr_compat import (  # noqa: E402
-    zarr_store,
-    open_root_group,
-    create_root_group,
-    create_array,
-    compression_kwargs,
-    write_string_array,
-)
+from subsample_spectra import _norm  # noqa: E402
+from zarr_compat import open_root_group  # noqa: E402
+from zarr_rowstore import write_row_subset  # noqa: E402
 
 # Recorded params are float32; every MARCS grid value (integer teff, multiples
 # of 0.25/0.5) is exactly representable, so a small epsilon suffices.
@@ -349,72 +343,26 @@ def write_rejects(csv_path: str, reject_rows, total_rows: int) -> str:
     return summary_path
 
 
-def write_filtered(src, dst_path: str, tmp_path: str, keep: np.ndarray, stats: dict,
-                   atmosphere_path: str, thresholds: dict) -> None:
+def write_filtered(src, dst_path: str, keep: np.ndarray, stats: dict,
+                   atmosphere_path: str, thresholds: dict, *, source_path: str = "") -> None:
+    """Write the kept rows atomically (see zarr_rowstore.write_row_subset)."""
     if os.path.exists(dst_path):
         raise FileExistsError(f"Output already exists, refusing to overwrite: {dst_path}")
-    if os.path.exists(tmp_path):
-        raise FileExistsError(f"Temp output already exists (stale run?): {tmp_path}")
-
-    n_rows = len(keep)
     rows = np.where(keep)[0].astype(np.int64)
-    comp = compression_kwargs()
-    dst = create_root_group(zarr_store(tmp_path), overwrite=False)
-    _copy_group_attrs(src, dst)
-
-    def _write_small(name, arr, data):
-        """Write a fully-materialised array; strings go through the vlen writer."""
-        if data.dtype.kind in "USO":
-            if data.ndim != 1:
-                raise ValueError(f"Unsupported multi-dimensional string array: {name}")
-            return write_string_array(dst, name, [str(v) for v in data], compression_kw=comp)
-        return create_array(dst, name, data=data, chunks=arr.chunks, **comp)
-
-    sliced, copied = [], []
-    for name in src.array_keys():
-        arr = src[name]
-        row_aligned = bool(arr.shape) and arr.shape[0] == n_rows
-        if row_aligned and arr.dtype.kind not in "USO":
-            chunks = None
-            if arr.chunks is not None:
-                chunks = (min(len(rows), arr.chunks[0]) or 1,) + tuple(arr.chunks[1:])
-            new = create_array(
-                dst, name, shape=(len(rows),) + tuple(arr.shape[1:]),
-                dtype=arr.dtype, chunks=chunks, **comp,
-            )
-            # Stream in source-chunk-aligned row blocks so a 300k x 300k-lambda
-            # flux array is never materialised in memory.
-            block = arr.chunks[0] if arr.chunks else 4096
-            cursor = 0
-            for lo in range(0, n_rows, block):
-                hi = min(lo + block, n_rows)
-                local = rows[(rows >= lo) & (rows < hi)] - lo
-                if len(local):
-                    data = arr[lo:hi]
-                    new[cursor:cursor + len(local)] = data[local]
-                    cursor += len(local)
-            sliced.append(name)
-        elif row_aligned:
-            new = _write_small(name, arr, arr[...][rows])
-            sliced.append(name)
-        else:
-            new = _write_small(name, arr, arr[...])
-            copied.append(name)
-        _copy_group_attrs(arr, new)
-
-    create_array(dst, "source_row_index", data=rows, chunks=(max(len(rows), 1),))
-    _copy_subgroups(src, dst)
-    meta = dst.create_group("snap_filter")
-    meta.attrs["atmosphere_path"] = atmosphere_path
-    meta.attrs["criteria"] = "recorded marcs_(teff|logg|fe_h) must equal the re-derived nearest atmosphere"
-    meta.attrs["thresholds"] = {k: v for k, v in thresholds.items() if v is not None}
-    for key, value in stats.items():
-        meta.attrs[key] = value
-
-    os.rename(tmp_path, dst_path)
+    stage_attrs = {
+        "atmosphere_path": atmosphere_path,
+        "criteria": "recorded marcs_(teff|logg|fe_h) must equal the re-derived nearest atmosphere",
+        "thresholds": {k: v for k, v in thresholds.items() if v is not None},
+        **stats,
+    }
+    written = write_row_subset(
+        src, dst_path, rows,
+        stage="snap_filter", source_path=source_path or getattr(src.store, "root", "") or "",
+        stage_attrs=stage_attrs,
+    )
     print(f"Wrote {len(rows)} rows -> {dst_path}")
-    print(f"  sliced arrays ({len(sliced)}): {', '.join(sorted(sliced))}")
-    print(f"  copied arrays ({len(copied)}): {', '.join(sorted(copied))}")
+    print(f"  sliced arrays ({len(written['sliced'])}): {', '.join(written['sliced'])}")
+    print(f"  copied arrays ({len(written['copied'])}): {', '.join(written['copied'])}")
 
 
 def main(argv=None) -> int:
@@ -423,7 +371,6 @@ def main(argv=None) -> int:
     ap.add_argument("-a", "--atmosphere-path", required=True,
                     help="MARCS model directory the dataset was synthesised against")
     ap.add_argument("-o", "--output", help="Destination .zarr store for kept rows (omit to only report)")
-    ap.add_argument("--output-tmp", help="Temp path for the atomic write (default: <output>.tmp, same filesystem)")
     ap.add_argument("--mask-output", help="Optional .npy path for the boolean keep-mask")
     ap.add_argument("--rejects-csv", help="Optional CSV path for rejected rows (a *_summary.json lands next to it)")
     ap.add_argument("--max-dteff", type=float, help="Also drop rows with |marcs_teff - teff| above this (K)")
@@ -456,9 +403,8 @@ def main(argv=None) -> int:
 
     if args.output:
         output_path = _norm(args.output)
-        tmp_path = _norm(args.output_tmp) if args.output_tmp else output_path + ".tmp"
         thresholds = {"max_dteff": args.max_dteff, "max_dlogg": args.max_dlogg, "max_dfeh": args.max_dfeh}
-        write_filtered(src, output_path, tmp_path, keep, stats, atmosphere_path, thresholds)
+        write_filtered(src, output_path, keep, stats, atmosphere_path, thresholds, source_path=input_path)
     elif not args.mask_output and not args.rejects_csv:
         print("(report only; pass --output to write the filtered store)")
     return 0

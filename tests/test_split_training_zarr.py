@@ -194,3 +194,35 @@ def test_dry_run_writes_nothing(source_store, tmp_path):
     out_dir = tmp_path / "out"
     assert _run(source_store, out_dir, "--dry-run") == 0
     assert not out_dir.exists()
+
+
+def test_rerun_with_different_settings_refuses(source_store, tmp_path):
+    out_dir = tmp_path / "out"
+    _run(source_store, out_dir)
+    with pytest.raises(ValueError, match="different split settings"):
+        _run(source_store, out_dir, "--seed", "99")
+
+
+def test_spare_array_task_exits_cleanly(source_store, tmp_path):
+    assert split_main(["-i", str(source_store), "-o", str(tmp_path / "o"),
+                                     "--num-splits", "4", "--split-index", "7"]) == 0
+
+
+def test_block_shuffle_covers_all_rows(source_store, tmp_path):
+    out_dir = tmp_path / "out"
+    _run(source_store, out_dir, "--shuffle", "block")
+    src = open_root_group(source_store)
+    seen = []
+    for grp in _open_splits(out_dir):
+        rows = grp["source_row_index"][...]
+        np.testing.assert_array_equal(grp["flux"][...], src["flux"][...][rows])
+        seen.extend(rows.tolist())
+    assert sorted(seen) == list(range(src["flux"].shape[0]))
+
+
+def test_split_updates_lineage_and_counts(source_store, tmp_path):
+    out_dir = tmp_path / "out"
+    _run(source_store, out_dir)
+    for grp in _open_splits(out_dir):
+        assert grp.attrs["n_models"] == grp["flux"].shape[0]
+        assert grp.attrs["lineage"][-1]["stage"] == "split"
