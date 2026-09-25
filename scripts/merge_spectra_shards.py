@@ -46,6 +46,7 @@ from provenance_contract import (
 )
 from spectrum_output import infer_flux_metadata
 from synthesis_validation import SUCCESS_STATUSES
+from zarr_rowstore import atomic_output, decode_statuses
 try:
     from nlte_ascii_departures import NLTE_ASCII_CONTROL_KEYS
 except ImportError:
@@ -154,11 +155,7 @@ def _validate_shard_structure(path: str, *, drop_failed_rows: bool = False) -> n
     if message.ndim != 1 or message.shape[0] != global_index.size:
         raise ValueError(f"Shard {path} message shape {message.shape} does not match rows={global_index.size}")
 
-    statuses = []
-    for item in status.tolist():
-        if isinstance(item, (bytes, bytearray)):
-            item = item.decode("utf-8", errors="ignore")
-        statuses.append(str(item).strip().lower())
+    statuses = decode_statuses(status)
 
     if drop_failed_rows:
         # Only check finite flux for rows with success status.
@@ -240,9 +237,6 @@ def _filter_nonexistent_shards(shards: Sequence[str], *, skip_nonexistent: bool)
 def _filter_invalid_shards(
     shards: Sequence[str], *, skip_invalid: bool, drop_failed_rows: bool = False,
 ) -> tuple[List[str], List[str], Optional[np.ndarray], Optional[str]]:
-    if not skip_invalid:
-        return list(shards), [], None, None
-
     kept: List[str] = []
     skipped_messages: List[str] = []
     reference_wavelengths: Optional[np.ndarray] = None
@@ -260,6 +254,11 @@ def _filter_invalid_shards(
             ):
                 raise ValueError(f"Wavelength mismatch vs {reference_path}")
         except Exception as exc:
+            if not skip_invalid:
+                raise ValueError(
+                    f"Invalid shard {path}: {exc}. Re-synthesize it, or pass "
+                    "--skip-invalid-shards / --drop-failed-rows for a partial merge."
+                ) from exc
             skipped_messages.append(f"{path}: {exc}")
             continue
         kept.append(path)
@@ -946,12 +945,7 @@ def main() -> None:
 
         # When --drop-failed-rows, only register success rows in the preflight.
         if drop_failed_rows:
-            shard_status = np.asarray(shard["status"][:])
-            _statuses = []
-            for _item in shard_status.tolist():
-                if isinstance(_item, (bytes, bytearray)):
-                    _item = _item.decode("utf-8", errors="ignore")
-                _statuses.append(str(_item).strip().lower())
+            _statuses = decode_statuses(shard["status"][:])
             success_mask = np.array([s in SUCCESS_STATUSES for s in _statuses], dtype=bool)
             gidx = gidx[success_mask]
             if gidx.size == 0:
@@ -1011,537 +1005,531 @@ def main() -> None:
     global_to_out = np.full(row_count, -1, dtype=np.int64)
     global_to_out[selected_global_indices] = np.arange(out_row_count, dtype=np.int64)
 
-    # Create output store and base datasets.
-    store = _zarr_store(out_path)
-    root_out = _create_root_group(store, overwrite=True)
-    chunk_shape = (min(int(args.chunk_rows), out_row_count), wl_count)
-    _zc_create_array(root_out, "wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
-    _zc_create_array(
-        root_out, "global_index",
-        data=selected_global_indices.astype(np.int64, copy=False),
-        chunks=(min(int(args.chunk_rows), out_row_count),),
-        **compression_kwargs,
-    )
-    flux_out = _zc_create_array(root_out, "flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
-    continuum_out = _zc_create_array(root_out, "continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
-    mu_chunk = (min(int(args.chunk_rows), out_row_count) if out_row_count else 1,)
-    mu_selected_out = _zc_create_array(root_out, "mu_selected", shape=(out_row_count,), dtype=np.float32, chunks=mu_chunk, **compression_kwargs)
-    mu_selected_index_out = _zc_create_array(root_out, "mu_selected_index", shape=(out_row_count,), dtype=np.int16, chunks=mu_chunk, **compression_kwargs)
+    # Build the store at a sibling tmp path; atomic_output renames it over
+    # out_path only after everything (incl. attrs) is written.
+    with atomic_output(out_path) as write_path:
+        # Create output store and base datasets.
+        store = _zarr_store(write_path)
+        root_out = _create_root_group(store, overwrite=True)
+        chunk_shape = (min(int(args.chunk_rows), out_row_count), wl_count)
+        _zc_create_array(root_out, "wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
+        _zc_create_array(
+            root_out, "global_index",
+            data=selected_global_indices.astype(np.int64, copy=False),
+            chunks=(min(int(args.chunk_rows), out_row_count),),
+            **compression_kwargs,
+        )
+        # fill_value (not an explicit prefill) marks unwritten rows, so the full
+        # dataset is written once rather than twice.
+        flux_out = _zc_create_array(root_out, "flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, fill_value=np.nan, **compression_kwargs)
+        continuum_out = _zc_create_array(root_out, "continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, fill_value=np.nan, **compression_kwargs)
+        mu_chunk = (min(int(args.chunk_rows), out_row_count) if out_row_count else 1,)
+        mu_selected_out = _zc_create_array(root_out, "mu_selected", shape=(out_row_count,), dtype=np.float32, chunks=mu_chunk, fill_value=np.nan, **compression_kwargs)
+        mu_selected_index_out = _zc_create_array(root_out, "mu_selected_index", shape=(out_row_count,), dtype=np.int16, chunks=mu_chunk, fill_value=-1, **compression_kwargs)
 
-    # Initialize to NaNs for missing rows.
-    flux_out[:] = np.nan
-    continuum_out[:] = np.nan
-    mu_selected_out[:] = np.nan
-    mu_selected_index_out[:] = np.int16(-1)
+        statuses = ["missing"] * out_row_count
+        messages = [""] * out_row_count
+        saw_continuum = False
+        saw_mu_selected = False
+        saw_mu_selected_index = False
 
-    statuses = ["missing"] * out_row_count
-    messages = [""] * out_row_count
-    saw_continuum = False
-    saw_mu_selected = False
-    saw_mu_selected_index = False
+        # Collect parameter metadata columns for schema-compliant params matrix.
+        param_candidate_cols = [
+            "teff",
+            "logg",
+            "feh",
+            "turb",
+            "turbvel",
+            "t_value",
+            "a",
+            "c",
+            "n",
+            "o",
+            "r",
+            "s",
+            *_MARCS_SHARD_COLS,
+            "output_mode",
+            "calculation_mode",
+        ]
+        if grid_root is not None:
+            _extra_skip = {
+                "teff", "logg", "feh", "turb", "turbvel", "t_value",
+                "a", "c", "n", "o", "r", "s",
+                "mu", "lam_min", "lam_max", "lam_step",
+                "output_mode", "mode", "calculation_mode", "grid_version",
+                *NLTE_ASCII_CONTROL_KEYS,
+            }
+            extra_grid_cols = sorted(
+                name
+                for name in grid_root.keys()
+                if name not in _extra_skip
+            )
+            param_candidate_cols.extend(extra_grid_cols)
+        merged_meta: Dict[str, np.ndarray] = {}
+        merged_meta_is_str: Dict[str, bool] = {}
+        for name in param_candidate_cols:
+            if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"} or name in _MARCS_SHARD_COLS or name.isalpha():
+                merged_meta[name] = np.full(out_row_count, np.nan, dtype=np.float32)
+                merged_meta_is_str[name] = False
+            else:
+                merged_meta[name] = np.array([""] * out_row_count, dtype=object)
+                merged_meta_is_str[name] = True
 
-    # Collect parameter metadata columns for schema-compliant params matrix.
-    param_candidate_cols = [
-        "teff",
-        "logg",
-        "feh",
-        "turb",
-        "turbvel",
-        "t_value",
-        "a",
-        "c",
-        "n",
-        "o",
-        "r",
-        "s",
-        *_MARCS_SHARD_COLS,
-        "output_mode",
-        "calculation_mode",
-    ]
-    if grid_root is not None:
-        _extra_skip = {
-            "teff", "logg", "feh", "turb", "turbvel", "t_value",
-            "a", "c", "n", "o", "r", "s",
-            "mu", "lam_min", "lam_max", "lam_step",
-            "output_mode", "mode", "calculation_mode", "grid_version",
+        for p in shards:
+            try:
+                shard = _open_shard(p)
+                _require_arrays(shard, ["global_index", "flux", "status", "message"])
+            except Exception as exc:
+                if effective_allow_missing:
+                    print(f"WARNING: skipping shard during write: {p}: {exc}", file=sys.stderr)
+                    continue
+                raise
+            gidx_all = np.asarray(shard["global_index"][:], dtype=np.int64)
+            if gidx_all.size == 0:
+                continue
+
+            # When --drop-failed-rows, keep only success rows from this shard.
+            if drop_failed_rows:
+                _shard_statuses = decode_statuses(shard["status"][:])
+                _success_mask = np.array([s in SUCCESS_STATUSES for s in _shard_statuses], dtype=bool)
+            else:
+                _success_mask = np.ones(gidx_all.size, dtype=bool)
+
+            gidx = gidx_all[_success_mask]
+            if gidx.size == 0:
+                continue
+
+            flux_raw = np.asarray(shard["flux"][:], dtype=np.float32)
+            if flux_raw.shape != (gidx_all.size, wl_count):
+                raise ValueError(f"Shard {p} has unexpected flux shape: {flux_raw.shape}")
+            flux = flux_raw[_success_mask]
+
+            local_idx = global_to_out[gidx]
+            if np.any(local_idx < 0):
+                bad = gidx[local_idx < 0][:20].tolist()
+                raise ValueError(f"Shard {p} maps to rows excluded from partial merge: {bad}")
+
+            # Write shard rows into the consolidated arrays.
+            # Use oindex when available for correct fancy indexing.
+            try:
+                flux_out.oindex[local_idx, :] = flux  # type: ignore[attr-defined]
+            except Exception:
+                for i, li in enumerate(local_idx.tolist()):
+                    flux_out[int(li), :] = flux[i]
+
+            if "continuum" in shard:
+                continuum_raw = np.asarray(shard["continuum"][:], dtype=np.float32)
+                if continuum_raw.shape != (gidx_all.size, wl_count):
+                    raise ValueError(f"Shard {p} has unexpected continuum shape: {continuum_raw.shape}")
+                continuum = continuum_raw[_success_mask]
+                try:
+                    continuum_out.oindex[local_idx, :] = continuum  # type: ignore[attr-defined]
+                except Exception:
+                    for i, li in enumerate(local_idx.tolist()):
+                        continuum_out[int(li), :] = continuum[i]
+                saw_continuum = True
+
+            shard_status_raw = np.asarray(shard["status"][:])
+            shard_msg_raw = np.asarray(shard["message"][:])
+            shard_status = [str(x) for x in shard_status_raw[_success_mask].tolist()]
+            shard_msg = [str(x) for x in shard_msg_raw[_success_mask].tolist()]
+            if len(shard_status) != gidx.size or len(shard_msg) != gidx.size:
+                raise ValueError(
+                    f"Shard {p} has inconsistent status/message lengths: "
+                    f"status={len(shard_status)} message={len(shard_msg)} rows={gidx.size}"
+                )
+            for i, li in enumerate(local_idx.tolist()):
+                statuses[int(li)] = shard_status[i]
+                messages[int(li)] = shard_msg[i]
+
+            if "mu_selected" in shard:
+                shard_mu_raw = np.asarray(shard["mu_selected"][:], dtype=np.float32)
+                shard_mu = shard_mu_raw[_success_mask]
+                if shard_mu.ndim != 1 or shard_mu.shape[0] != gidx.size:
+                    raise ValueError(
+                        f"Shard {p} mu_selected shape mismatch: expected ({gidx.size},), got {shard_mu.shape}"
+                    )
+                try:
+                    mu_selected_out.oindex[local_idx] = shard_mu  # type: ignore[attr-defined]
+                except Exception:
+                    for i, li in enumerate(local_idx.tolist()):
+                        mu_selected_out[int(li)] = shard_mu[i]
+                saw_mu_selected = True
+
+            if "mu_selected_index" in shard:
+                shard_mu_idx_raw = np.asarray(shard["mu_selected_index"][:], dtype=np.int16)
+                shard_mu_idx = shard_mu_idx_raw[_success_mask]
+                if shard_mu_idx.ndim != 1 or shard_mu_idx.shape[0] != gidx.size:
+                    raise ValueError(
+                        f"Shard {p} mu_selected_index shape mismatch: expected ({gidx.size},), got {shard_mu_idx.shape}"
+                    )
+                try:
+                    mu_selected_index_out.oindex[local_idx] = shard_mu_idx  # type: ignore[attr-defined]
+                except Exception:
+                    for i, li in enumerate(local_idx.tolist()):
+                        mu_selected_index_out[int(li)] = shard_mu_idx[i]
+                saw_mu_selected_index = True
+
+            # Merge metadata columns if present.
+            for name in param_candidate_cols:
+                if name not in shard:
+                    continue
+                arr_raw = np.asarray(shard[name][:])
+                arr = arr_raw[_success_mask]
+                if arr.ndim != 1 or arr.shape[0] != gidx.size:
+                    raise ValueError(
+                        f"Shard {p} metadata column '{name}' shape mismatch: "
+                        f"expected ({gidx.size},), got {arr.shape}"
+                    )
+
+                if merged_meta_is_str[name]:
+                    # NumPy 2 may use StringDType, which can fail on astype(str).
+                    vals = [str(x) for x in np.asarray(arr).tolist()]
+                    for i, li in enumerate(local_idx.tolist()):
+                        merged_meta[name][int(li)] = vals[i]
+                else:
+                    vals = _to_float32(np.asarray(arr))
+                    for i, li in enumerate(local_idx.tolist()):
+                        merged_meta[name][int(li)] = vals[i]
+
+        missing_status_rows = [i for i, s in enumerate(statuses) if s == "missing"]
+        if missing_status_rows:
+            preview = missing_status_rows[:20]
+            suffix = " (truncated)" if len(missing_status_rows) > 20 else ""
+            if effective_allow_missing:
+                print(
+                    f"WARNING: leaving {len(missing_status_rows)} merged row(s) with missing status "
+                    f"after shard skips, examples={preview}{suffix}",
+                    file=sys.stderr,
+                )
+            else:
+                raise ValueError(
+                    f"Merged status vector is incomplete: {len(missing_status_rows)} row(s) still missing, "
+                    f"examples={preview}{suffix}"
+                )
+
+        # Build params matrix from original grid when available; otherwise fall back to merged shard metadata.
+        # Exclude the grid's target "mu" column — use mu_selected (the actual
+        # value used for calculations) instead.
+        _GRID_SKIP = {
+            "lam_min", "lam_max", "lam_step", "output_mode", "mode",
+            "calculation_mode", "grid_version", "mu",
             *NLTE_ASCII_CONTROL_KEYS,
         }
-        extra_grid_cols = sorted(
-            name
-            for name in grid_root.keys()
-            if name not in _extra_skip
-        )
-        param_candidate_cols.extend(extra_grid_cols)
-    merged_meta: Dict[str, np.ndarray] = {}
-    merged_meta_is_str: Dict[str, bool] = {}
-    for name in param_candidate_cols:
-        if name in {"teff", "logg", "feh", "a", "c", "n", "o", "r", "s"} or name in _MARCS_SHARD_COLS or name.isalpha():
-            merged_meta[name] = np.full(out_row_count, np.nan, dtype=np.float32)
-            merged_meta_is_str[name] = False
-        else:
-            merged_meta[name] = np.array([""] * out_row_count, dtype=object)
-            merged_meta_is_str[name] = True
-
-    for p in shards:
-        try:
-            shard = _open_shard(p)
-            _require_arrays(shard, ["global_index", "flux", "status", "message"])
-        except Exception as exc:
-            if effective_allow_missing:
-                print(f"WARNING: skipping shard during write: {p}: {exc}", file=sys.stderr)
-                continue
-            raise
-        gidx_all = np.asarray(shard["global_index"][:], dtype=np.int64)
-        if gidx_all.size == 0:
-            continue
-
-        # When --drop-failed-rows, keep only success rows from this shard.
-        if drop_failed_rows:
-            _shard_status_raw = np.asarray(shard["status"][:])
-            _shard_statuses = []
-            for _item in _shard_status_raw.tolist():
-                if isinstance(_item, (bytes, bytearray)):
-                    _item = _item.decode("utf-8", errors="ignore")
-                _shard_statuses.append(str(_item).strip().lower())
-            _success_mask = np.array([s in SUCCESS_STATUSES for s in _shard_statuses], dtype=bool)
-        else:
-            _success_mask = np.ones(gidx_all.size, dtype=bool)
-
-        gidx = gidx_all[_success_mask]
-        if gidx.size == 0:
-            continue
-
-        flux_raw = np.asarray(shard["flux"][:], dtype=np.float32)
-        if flux_raw.shape != (gidx_all.size, wl_count):
-            raise ValueError(f"Shard {p} has unexpected flux shape: {flux_raw.shape}")
-        flux = flux_raw[_success_mask]
-
-        local_idx = global_to_out[gidx]
-        if np.any(local_idx < 0):
-            bad = gidx[local_idx < 0][:20].tolist()
-            raise ValueError(f"Shard {p} maps to rows excluded from partial merge: {bad}")
-
-        # Write shard rows into the consolidated arrays.
-        # Use oindex when available for correct fancy indexing.
-        try:
-            flux_out.oindex[local_idx, :] = flux  # type: ignore[attr-defined]
-        except Exception:
-            for i, li in enumerate(local_idx.tolist()):
-                flux_out[int(li), :] = flux[i]
-
-        if "continuum" in shard:
-            continuum_raw = np.asarray(shard["continuum"][:], dtype=np.float32)
-            if continuum_raw.shape != (gidx_all.size, wl_count):
-                raise ValueError(f"Shard {p} has unexpected continuum shape: {continuum_raw.shape}")
-            continuum = continuum_raw[_success_mask]
-            try:
-                continuum_out.oindex[local_idx, :] = continuum  # type: ignore[attr-defined]
-            except Exception:
-                for i, li in enumerate(local_idx.tolist()):
-                    continuum_out[int(li), :] = continuum[i]
-            saw_continuum = True
-
-        shard_status_raw = np.asarray(shard["status"][:])
-        shard_msg_raw = np.asarray(shard["message"][:])
-        shard_status = [str(x) for x in shard_status_raw[_success_mask].tolist()]
-        shard_msg = [str(x) for x in shard_msg_raw[_success_mask].tolist()]
-        if len(shard_status) != gidx.size or len(shard_msg) != gidx.size:
-            raise ValueError(
-                f"Shard {p} has inconsistent status/message lengths: "
-                f"status={len(shard_status)} message={len(shard_msg)} rows={gidx.size}"
-            )
-        for i, li in enumerate(local_idx.tolist()):
-            statuses[int(li)] = shard_status[i]
-            messages[int(li)] = shard_msg[i]
-
-        if "mu_selected" in shard:
-            shard_mu_raw = np.asarray(shard["mu_selected"][:], dtype=np.float32)
-            shard_mu = shard_mu_raw[_success_mask]
-            if shard_mu.ndim != 1 or shard_mu.shape[0] != gidx.size:
-                raise ValueError(
-                    f"Shard {p} mu_selected shape mismatch: expected ({gidx.size},), got {shard_mu.shape}"
-                )
-            try:
-                mu_selected_out.oindex[local_idx] = shard_mu  # type: ignore[attr-defined]
-            except Exception:
-                for i, li in enumerate(local_idx.tolist()):
-                    mu_selected_out[int(li)] = shard_mu[i]
-            saw_mu_selected = True
-
-        if "mu_selected_index" in shard:
-            shard_mu_idx_raw = np.asarray(shard["mu_selected_index"][:], dtype=np.int16)
-            shard_mu_idx = shard_mu_idx_raw[_success_mask]
-            if shard_mu_idx.ndim != 1 or shard_mu_idx.shape[0] != gidx.size:
-                raise ValueError(
-                    f"Shard {p} mu_selected_index shape mismatch: expected ({gidx.size},), got {shard_mu_idx.shape}"
-                )
-            try:
-                mu_selected_index_out.oindex[local_idx] = shard_mu_idx  # type: ignore[attr-defined]
-            except Exception:
-                for i, li in enumerate(local_idx.tolist()):
-                    mu_selected_index_out[int(li)] = shard_mu_idx[i]
-            saw_mu_selected_index = True
-
-        # Merge metadata columns if present.
-        for name in param_candidate_cols:
-            if name not in shard:
-                continue
-            arr_raw = np.asarray(shard[name][:])
-            arr = arr_raw[_success_mask]
-            if arr.ndim != 1 or arr.shape[0] != gidx.size:
-                raise ValueError(
-                    f"Shard {p} metadata column '{name}' shape mismatch: "
-                    f"expected ({gidx.size},), got {arr.shape}"
-                )
-
-            if merged_meta_is_str[name]:
-                # NumPy 2 may use StringDType, which can fail on astype(str).
-                vals = [str(x) for x in np.asarray(arr).tolist()]
-                for i, li in enumerate(local_idx.tolist()):
-                    merged_meta[name][int(li)] = vals[i]
-            else:
-                vals = _to_float32(np.asarray(arr))
-                for i, li in enumerate(local_idx.tolist()):
-                    merged_meta[name][int(li)] = vals[i]
-
-    missing_status_rows = [i for i, s in enumerate(statuses) if s == "missing"]
-    if missing_status_rows:
-        preview = missing_status_rows[:20]
-        suffix = " (truncated)" if len(missing_status_rows) > 20 else ""
-        if effective_allow_missing:
-            print(
-                f"WARNING: leaving {len(missing_status_rows)} merged row(s) with missing status "
-                f"after shard skips, examples={preview}{suffix}",
-                file=sys.stderr,
-            )
-        else:
-            raise ValueError(
-                f"Merged status vector is incomplete: {len(missing_status_rows)} row(s) still missing, "
-                f"examples={preview}{suffix}"
-            )
-
-    # Build params matrix from original grid when available; otherwise fall back to merged shard metadata.
-    # Exclude the grid's target "mu" column — use mu_selected (the actual
-    # value used for calculations) instead.
-    _GRID_SKIP = {
-        "lam_min", "lam_max", "lam_step", "output_mode", "mode",
-        "calculation_mode", "grid_version", "mu",
-        *NLTE_ASCII_CONTROL_KEYS,
-    }
-    if grid_root is not None:
-        grid_cols: Dict[str, np.ndarray] = {}
-        for name in grid_root.keys():
-            if name in grid_root:
-                if name in _GRID_SKIP:
-                    continue
-                values = np.asarray(grid_root[name][:])
+        if grid_root is not None:
+            grid_cols: Dict[str, np.ndarray] = {}
+            for name in grid_root.keys():
+                if name in grid_root:
+                    if name in _GRID_SKIP:
+                        continue
+                    values = np.asarray(grid_root[name][:])
+                    if effective_allow_missing:
+                        values = values[selected_global_indices]
+                    grid_cols[name] = values
+            if "turbvel" in grid_root:
+                turb_vals = np.asarray(grid_root["turbvel"][:])
                 if effective_allow_missing:
-                    values = values[selected_global_indices]
-                grid_cols[name] = values
-        if "turbvel" in grid_root:
-            turb_vals = np.asarray(grid_root["turbvel"][:])
+                    turb_vals = turb_vals[selected_global_indices]
+                grid_cols["turb"] = turb_vals
+            elif "t_value" in grid_root:
+                turb_vals = np.asarray(grid_root["t_value"][:])
+                if effective_allow_missing:
+                    turb_vals = turb_vals[selected_global_indices]
+                grid_cols["turb"] = turb_vals
+            # Inject mu_selected as the "mu" param — it's the angle actually used.
+            if saw_mu_selected:
+                mu_sel_data = np.asarray(mu_selected_out[:], dtype=np.float32)
+                if not np.all(np.isnan(mu_sel_data)):
+                    grid_cols["mu"] = mu_sel_data
+            # The MARCS atmosphere composition is a per-row synthesis output (it lives
+            # in the shards, not the grid), so fold it in from the merged metadata.
+            for _marcs_key in _MARCS_SHARD_COLS:
+                _marcs_data = merged_meta.get(_marcs_key)
+                if _marcs_data is not None and not np.all(np.isnan(_marcs_data)):
+                    grid_cols[_marcs_key] = np.asarray(_marcs_data, dtype=np.float32)
+            params, param_names = _build_params_matrix(grid_cols)
+        else:
+            params_source: Dict[str, np.ndarray] = {}
+            for name in merged_meta.keys():
+                if name in merged_meta:
+                    params_source[name] = np.asarray(merged_meta[name])
+            if "turb" in merged_meta and any(str(x).strip() for x in merged_meta["turb"].tolist()):
+                params_source["turb"] = np.asarray(merged_meta["turb"])
+            elif "turbvel" in merged_meta and any(str(x).strip() for x in merged_meta["turbvel"].tolist()):
+                params_source["turb"] = np.asarray(merged_meta["turbvel"])
+            elif "t_value" in merged_meta and any(str(x).strip() for x in merged_meta["t_value"].tolist()):
+                params_source["turb"] = np.asarray(merged_meta["t_value"])
+            # Same mu_selected injection for shard-only merges.
+            if saw_mu_selected:
+                mu_sel_data = np.asarray(mu_selected_out[:], dtype=np.float32)
+                if not np.all(np.isnan(mu_sel_data)):
+                    params_source["mu"] = mu_sel_data
+            params, param_names = _build_params_matrix(params_source)
+
+        model_id = _compute_model_ids(params)
+        param_name_list = [str(x) for x in param_names.tolist()]
+
+        # When mu is already a column in the params matrix, the standalone
+        # mu_selected / mu_selected_index arrays are redundant — remove them
+        # to avoid duplicating the information.
+        if "mu" in param_name_list:
+            for _mu_key in ("mu_selected", "mu_selected_index"):
+                if _mu_key in root_out:
+                    del root_out[_mu_key]
+
+        if grid_root is not None and "output_mode" in grid_root:
+            output_mode_data = np.asarray(grid_root["output_mode"][:])
             if effective_allow_missing:
-                turb_vals = turb_vals[selected_global_indices]
-            grid_cols["turb"] = turb_vals
-        elif "t_value" in grid_root:
-            turb_vals = np.asarray(grid_root["t_value"][:])
+                output_mode_data = output_mode_data[selected_global_indices]
+            output_mode_values = _collect_unique_strings(output_mode_data)
+        else:
+            output_mode_values = _collect_unique_strings(np.asarray(merged_meta["output_mode"]))
+
+        if grid_root is not None and "calculation_mode" in grid_root:
+            calculation_mode_data = np.asarray(grid_root["calculation_mode"][:])
             if effective_allow_missing:
-                turb_vals = turb_vals[selected_global_indices]
-            grid_cols["turb"] = turb_vals
-        # Inject mu_selected as the "mu" param — it's the angle actually used.
-        if saw_mu_selected:
-            mu_sel_data = np.asarray(mu_selected_out[:], dtype=np.float32)
-            if not np.all(np.isnan(mu_sel_data)):
-                grid_cols["mu"] = mu_sel_data
-        # The MARCS atmosphere composition is a per-row synthesis output (it lives
-        # in the shards, not the grid), so fold it in from the merged metadata.
-        for _marcs_key in _MARCS_SHARD_COLS:
-            _marcs_data = merged_meta.get(_marcs_key)
-            if _marcs_data is not None and not np.all(np.isnan(_marcs_data)):
-                grid_cols[_marcs_key] = np.asarray(_marcs_data, dtype=np.float32)
-        params, param_names = _build_params_matrix(grid_cols)
-    else:
-        params_source: Dict[str, np.ndarray] = {}
-        for name in merged_meta.keys():
-            if name in merged_meta:
-                params_source[name] = np.asarray(merged_meta[name])
-        if "turb" in merged_meta and any(str(x).strip() for x in merged_meta["turb"].tolist()):
-            params_source["turb"] = np.asarray(merged_meta["turb"])
-        elif "turbvel" in merged_meta and any(str(x).strip() for x in merged_meta["turbvel"].tolist()):
-            params_source["turb"] = np.asarray(merged_meta["turbvel"])
-        elif "t_value" in merged_meta and any(str(x).strip() for x in merged_meta["t_value"].tolist()):
-            params_source["turb"] = np.asarray(merged_meta["t_value"])
-        # Same mu_selected injection for shard-only merges.
-        if saw_mu_selected:
-            mu_sel_data = np.asarray(mu_selected_out[:], dtype=np.float32)
-            if not np.all(np.isnan(mu_sel_data)):
-                params_source["mu"] = mu_sel_data
-        params, param_names = _build_params_matrix(params_source)
+                calculation_mode_data = calculation_mode_data[selected_global_indices]
+            calculation_mode_values = _collect_unique_strings(calculation_mode_data)
+        else:
+            calculation_mode_values = _collect_unique_strings(np.asarray(merged_meta["calculation_mode"]))
 
-    model_id = _compute_model_ids(params)
-    param_name_list = [str(x) for x in param_names.tolist()]
+        if args.physics_hash:
+            physics_hash = args.physics_hash
+            physics_payload: Dict[str, Any] = {"hash_basis": "cli-override", "physics_hash": physics_hash}
+        else:
+            physics_hash, physics_payload = _compute_merge_physics_hash(
+                wavelengths=wavelengths,
+                params=params,
+                param_names=param_name_list,
+                output_mode_values=output_mode_values,
+                calculation_mode_values=calculation_mode_values,
+                mu_sampling_values=sorted(mu_sampling_values),
+                grid_attrs=grid_attrs,
+            )
+        git_commit = _git_commit(project_root)
+        created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    # When mu is already a column in the params matrix, the standalone
-    # mu_selected / mu_selected_index arrays are redundant — remove them
-    # to avoid duplicating the information.
-    if "mu" in param_name_list:
-        for _mu_key in ("mu_selected", "mu_selected_index"):
-            if _mu_key in root_out:
-                del root_out[_mu_key]
+        param_names_u32 = _to_u32_param_names(param_name_list)
+        _zc_create_array(
+            root_out, "param_names",
+            data=param_names_u32,
+            chunks=(min(max(1, params.shape[1]), len(param_names_u32)) if len(param_names_u32) else 1,),
+            **compression_kwargs,
+        )
+        _zc_create_array(
+            root_out, "params",
+            data=params.astype(np.float32, copy=False),
+            chunks=(min(int(args.chunk_rows), out_row_count), params.shape[1]),
+            **compression_kwargs,
+        )
+        _zc_create_array(
+            root_out, "model_id",
+            data=model_id.astype(np.uint64, copy=False),
+            chunks=(min(int(args.chunk_rows), len(model_id)) if len(model_id) else 1,),
+            **compression_kwargs,
+        )
+        _write_fixed_string_scalar(root_out, "physics_hash", physics_hash, min_width=64, compression_kwargs=compression_kwargs)
+        _write_fixed_string_scalar(root_out, "schema_version", args.schema_version, min_width=16, compression_kwargs=compression_kwargs)
 
-    if grid_root is not None and "output_mode" in grid_root:
-        output_mode_data = np.asarray(grid_root["output_mode"][:])
-        if effective_allow_missing:
-            output_mode_data = output_mode_data[selected_global_indices]
-        output_mode_values = _collect_unique_strings(output_mode_data)
-    else:
-        output_mode_values = _collect_unique_strings(np.asarray(merged_meta["output_mode"]))
-
-    if grid_root is not None and "calculation_mode" in grid_root:
-        calculation_mode_data = np.asarray(grid_root["calculation_mode"][:])
-        if effective_allow_missing:
-            calculation_mode_data = calculation_mode_data[selected_global_indices]
-        calculation_mode_values = _collect_unique_strings(calculation_mode_data)
-    else:
-        calculation_mode_values = _collect_unique_strings(np.asarray(merged_meta["calculation_mode"]))
-
-    if args.physics_hash:
-        physics_hash = args.physics_hash
-        physics_payload: Dict[str, Any] = {"hash_basis": "cli-override", "physics_hash": physics_hash}
-    else:
-        physics_hash, physics_payload = _compute_merge_physics_hash(
-            wavelengths=wavelengths,
-            params=params,
-            param_names=param_name_list,
+        provenance_payload = _build_merge_provenance_payload(
+            shard_paths=shards,
+            grid_zarr=args.grid_zarr,
+            args_generator=args.generator,
+            chunk_rows=int(args.chunk_rows),
+            compressor_cfg=compressor_cfg,
+            allow_missing=bool(effective_allow_missing),
+            expected_models=int(row_count),
+            merged_models=int(out_row_count),
+            physics_hash=physics_hash,
+            physics_payload=physics_payload,
             output_mode_values=output_mode_values,
             calculation_mode_values=calculation_mode_values,
             mu_sampling_values=sorted(mu_sampling_values),
             grid_attrs=grid_attrs,
+            grid_provenance=grid_provenance,
+            shard_attrs=shard_attr_snapshots,
+            shard_provenance=shard_provenance_candidates,
+            git_commit=git_commit,
         )
-    git_commit = _git_commit(project_root)
-    created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        prov = root_out.create_group("provenance") if hasattr(root_out, "create_group") else root_out.require_group("provenance")
+        for name in PROVENANCE_FILENAMES:
+            _write_string_scalar(
+                prov,
+                name,
+                provenance_payload[name],
+                compression_kwargs=compression_kwargs,
+            )
 
-    param_names_u32 = _to_u32_param_names(param_name_list)
-    _zc_create_array(
-        root_out, "param_names",
-        data=param_names_u32,
-        chunks=(min(max(1, params.shape[1]), len(param_names_u32)) if len(param_names_u32) else 1,),
-        **compression_kwargs,
-    )
-    _zc_create_array(
-        root_out, "params",
-        data=params.astype(np.float32, copy=False),
-        chunks=(min(int(args.chunk_rows), out_row_count), params.shape[1]),
-        **compression_kwargs,
-    )
-    _zc_create_array(
-        root_out, "model_id",
-        data=model_id.astype(np.uint64, copy=False),
-        chunks=(min(int(args.chunk_rows), len(model_id)) if len(model_id) else 1,),
-        **compression_kwargs,
-    )
-    _write_fixed_string_scalar(root_out, "physics_hash", physics_hash, min_width=64, compression_kwargs=compression_kwargs)
-    _write_fixed_string_scalar(root_out, "schema_version", args.schema_version, min_width=16, compression_kwargs=compression_kwargs)
-
-    provenance_payload = _build_merge_provenance_payload(
-        shard_paths=shards,
-        grid_zarr=args.grid_zarr,
-        args_generator=args.generator,
-        chunk_rows=int(args.chunk_rows),
-        compressor_cfg=compressor_cfg,
-        allow_missing=bool(effective_allow_missing),
-        expected_models=int(row_count),
-        merged_models=int(out_row_count),
-        physics_hash=physics_hash,
-        physics_payload=physics_payload,
-        output_mode_values=output_mode_values,
-        calculation_mode_values=calculation_mode_values,
-        mu_sampling_values=sorted(mu_sampling_values),
-        grid_attrs=grid_attrs,
-        grid_provenance=grid_provenance,
-        shard_attrs=shard_attr_snapshots,
-        shard_provenance=shard_provenance_candidates,
-        git_commit=git_commit,
-    )
-    prov = root_out.create_group("provenance") if hasattr(root_out, "create_group") else root_out.require_group("provenance")
-    for name in PROVENANCE_FILENAMES:
-        _write_string_scalar(
-            prov,
-            name,
-            provenance_payload[name],
-            compression_kwargs=compression_kwargs,
+        attr_sources: List[Mapping[str, Any]] = [grid_attrs]
+        attr_sources.extend(shard_attr_snapshots)
+        resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(
+            output_mode_values,
+            explicit_definition=args.flux_definition,
+            inherited_definition=_first_attr_value(attr_sources, keys=("flux_definition",)),
+            inherited_unit=_first_attr_value(attr_sources, keys=("flux_unit",)),
         )
+        try:
+            linelist_manifest = json.loads(provenance_payload.get("linelist_manifest.json", "{}"))
+        except Exception:
+            linelist_manifest = {}
+        try:
+            atmosphere_manifest = json.loads(provenance_payload.get("atmosphere_manifest.json", "{}"))
+        except Exception:
+            atmosphere_manifest = {}
+        try:
+            software_manifest = json.loads(provenance_payload.get("software_manifest.json", "{}"))
+        except Exception:
+            software_manifest = {}
 
-    attr_sources: List[Mapping[str, Any]] = [grid_attrs]
-    attr_sources.extend(shard_attr_snapshots)
-    resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(
-        output_mode_values,
-        explicit_definition=args.flux_definition,
-        inherited_definition=_first_attr_value(attr_sources, keys=("flux_definition",)),
-        inherited_unit=_first_attr_value(attr_sources, keys=("flux_unit",)),
-    )
-    try:
-        linelist_manifest = json.loads(provenance_payload.get("linelist_manifest.json", "{}"))
-    except Exception:
-        linelist_manifest = {}
-    try:
-        atmosphere_manifest = json.loads(provenance_payload.get("atmosphere_manifest.json", "{}"))
-    except Exception:
-        atmosphere_manifest = {}
-    try:
-        software_manifest = json.loads(provenance_payload.get("software_manifest.json", "{}"))
-    except Exception:
-        software_manifest = {}
+        config_hash = _first_attr_value(attr_sources, keys=("config_hash",))
+        if not is_meaningful_provenance_value(config_hash):
+            config_hash = canonical_json_sha256({"synthesis_config.yaml": provenance_payload.get("synthesis_config.yaml", "")})
 
-    config_hash = _first_attr_value(attr_sources, keys=("config_hash",))
-    if not is_meaningful_provenance_value(config_hash):
-        config_hash = canonical_json_sha256({"synthesis_config.yaml": provenance_payload.get("synthesis_config.yaml", "")})
+        grid_definition_hash = _first_attr_value(attr_sources, keys=("grid_definition_hash",))
+        if (not is_meaningful_provenance_value(grid_definition_hash)) and grid_root is not None:
+            grid_definition_hash = compute_grid_definition_hash(_grid_columns_for_hash(grid_root))
+        if not is_meaningful_provenance_value(grid_definition_hash):
+            grid_definition_hash = canonical_json_sha256(
+                {
+                    "grid_reference": args.grid_zarr or "not_provided",
+                    "row_count": int(row_count),
+                    "physics_hash": physics_hash,
+                }
+            )
 
-    grid_definition_hash = _first_attr_value(attr_sources, keys=("grid_definition_hash",))
-    if (not is_meaningful_provenance_value(grid_definition_hash)) and grid_root is not None:
-        grid_definition_hash = compute_grid_definition_hash(_grid_columns_for_hash(grid_root))
-    if not is_meaningful_provenance_value(grid_definition_hash):
-        grid_definition_hash = canonical_json_sha256(
-            {
-                "grid_reference": args.grid_zarr or "not_provided",
-                "row_count": int(row_count),
-                "physics_hash": physics_hash,
-            }
+        turbospectrum_version = _first_attr_value(attr_sources, keys=("turbospectrum_version", "synthesis_code_version"))
+        if not is_meaningful_provenance_value(turbospectrum_version):
+            turbospectrum_version = str(software_manifest.get("synthesis_code_version", "")).strip()
+
+        linelist_identifier = _first_attr_value(
+            attr_sources,
+            keys=("linelist_identifier", "linelist_path", "linelist_files", "linelist"),
         )
+        if not is_meaningful_provenance_value(linelist_identifier):
+            linelist_identifier = str(linelist_manifest.get("source", "")).strip()
 
-    turbospectrum_version = _first_attr_value(attr_sources, keys=("turbospectrum_version", "synthesis_code_version"))
-    if not is_meaningful_provenance_value(turbospectrum_version):
-        turbospectrum_version = str(software_manifest.get("synthesis_code_version", "")).strip()
+        linelist_version = _first_attr_value(attr_sources, keys=("linelist_version", "line_version", "linelist_rev"))
+        if not is_meaningful_provenance_value(linelist_version):
+            linelist_version = str(linelist_manifest.get("version", "")).strip()
 
-    linelist_identifier = _first_attr_value(
-        attr_sources,
-        keys=("linelist_identifier", "linelist_path", "linelist_files", "linelist"),
-    )
-    if not is_meaningful_provenance_value(linelist_identifier):
-        linelist_identifier = str(linelist_manifest.get("source", "")).strip()
-
-    linelist_version = _first_attr_value(attr_sources, keys=("linelist_version", "line_version", "linelist_rev"))
-    if not is_meaningful_provenance_value(linelist_version):
-        linelist_version = str(linelist_manifest.get("version", "")).strip()
-
-    atmosphere_model_identifier = _first_attr_value(
-        attr_sources,
-        keys=("atmosphere_model_identifier", "model_atmosphere_path", "atmosphere_path", "atmosphere_grid", "atmosphere"),
-    )
-    if not is_meaningful_provenance_value(atmosphere_model_identifier):
-        atmosphere_model_identifier = str(
-            atmosphere_manifest.get("path") or atmosphere_manifest.get("source") or ""
-        ).strip()
-
-    pipeline_version = _first_attr_value(attr_sources, keys=("pipeline_version", "spice_version"))
-    if not is_meaningful_provenance_value(pipeline_version):
-        pipeline_version = str(software_manifest.get("pipeline_version") or software_manifest.get("spice_version") or "").strip()
-    if (not is_meaningful_provenance_value(pipeline_version)) and is_meaningful_provenance_value(git_commit):
-        pipeline_version = f"git:{git_commit[:12]}"
-
-    contract_provenance: Dict[str, str] = {
-        "config_hash": str(config_hash or ""),
-        "grid_definition_hash": str(grid_definition_hash or ""),
-        "git_commit": str(git_commit or ""),
-        "turbospectrum_version": str(turbospectrum_version or ""),
-        "linelist_identifier": str(linelist_identifier or ""),
-        "linelist_version": str(linelist_version or ""),
-        "atmosphere_model_identifier": str(atmosphere_model_identifier or ""),
-        "synthesis_timestamp": created_utc,
-        "pipeline_version": str(pipeline_version or ""),
-    }
-    if not args.allow_incomplete_provenance:
-        assert_required_provenance_fields(contract_provenance, context="merge_spectra_shards.py")
-
-    status_counts: Dict[str, int] = {}
-    for s in statuses:
-        status_counts[s] = status_counts.get(s, 0) + 1
-
-    # Aggregate the per-shard out-of-memory verdict (stamped by
-    # run_turbospectrum_shard.py) so the merged store records whether the run
-    # was degraded by memory pressure rather than bad input data.
-    mem_shards_suspected = 0
-    mem_counts_total = {"explicit_oom": 0, "truncated_or_empty_output": 0, "other": 0}
-    for snapshot in shard_attr_snapshots:
-        if str(snapshot.get("memory_pressure_suspected", "")).lower() in ("1", "true"):
-            mem_shards_suspected += 1
-        raw_counts = snapshot.get("memory_pressure_counts")
-        if raw_counts:
-            try:
-                parsed = json.loads(raw_counts) if isinstance(raw_counts, str) else dict(raw_counts)
-                for key in mem_counts_total:
-                    mem_counts_total[key] += int(parsed.get(key, 0))
-            except (ValueError, TypeError):
-                pass
-    memory_pressure_suspected = mem_shards_suspected > 0
-    if memory_pressure_suspected:
-        print(
-            f"WARNING: memory pressure suspected in {mem_shards_suspected}/{len(shards)} "
-            f"merged shard(s) (explicit_oom={mem_counts_total['explicit_oom']}, "
-            f"truncated_or_empty_output={mem_counts_total['truncated_or_empty_output']}). "
-            "Affected rows were most likely killed mid-write by the kernel OOM killer; "
-            "re-run them with fewer workers per node or more memory to recover."
+        atmosphere_model_identifier = _first_attr_value(
+            attr_sources,
+            keys=("atmosphere_model_identifier", "model_atmosphere_path", "atmosphere_path", "atmosphere_grid", "atmosphere"),
         )
+        if not is_meaningful_provenance_value(atmosphere_model_identifier):
+            atmosphere_model_identifier = str(
+                atmosphere_manifest.get("path") or atmosphere_manifest.get("source") or ""
+            ).strip()
 
-    param_units: Dict[str, str] = {}
-    for name in param_name_list:
-        if name in {"teff", "marcs_teff"}:
-            param_units[name] = "K"
-        elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"} or name in _MARCS_PARAM_COLS or name == "marcs_logg":
-            param_units[name] = "dex"
-        elif name in {"vmicro", "marcs_turb"}:
-            param_units[name] = "km/s"
-        else:
-            param_units[name] = ""
+        pipeline_version = _first_attr_value(attr_sources, keys=("pipeline_version", "spice_version"))
+        if not is_meaningful_provenance_value(pipeline_version):
+            pipeline_version = str(software_manifest.get("pipeline_version") or software_manifest.get("spice_version") or "").strip()
+        if (not is_meaningful_provenance_value(pipeline_version)) and is_meaningful_provenance_value(git_commit):
+            pipeline_version = f"git:{git_commit[:12]}"
 
-    attrs_payload: Dict[str, Any] = {
-        "title": "SPICE Synthetic Spectral Grid",
-        "generator": args.generator,
-        "created_utc": created_utc,
-        "synthesis_timestamp": created_utc,
-        "flux_definition": resolved_flux_definition,
-        "wavelength_unit": "angstrom",
-        "flux_unit": resolved_flux_unit,
-        "parameter_units": param_units,
-        "physics_hash": physics_hash,
-        "git_commit": git_commit,
-        "git_sha": git_commit,
-        "contact": args.contact,
-        "schema_version": args.schema_version,
-        "n_models": int(out_row_count),
-        "n_lambda": int(wl_count),
-        "n_params": int(params.shape[1]),
-        "shards_merged": len(shards),
-        "status_counts": status_counts,
-        "memory_pressure_suspected": bool(memory_pressure_suspected),
-        "memory_pressure_shards": int(mem_shards_suspected),
-        "memory_pressure_counts": json.dumps(mem_counts_total, sort_keys=True),
-        "continuum_present": bool(saw_continuum),
-        "output_mode_values": output_mode_values,
-        "calculation_mode_values": calculation_mode_values,
-        "mu_sampling_values": sorted(mu_sampling_values),
-        "mu_in_params": "mu" in param_name_list,
-        "mu_selected_present": bool(saw_mu_selected) and "mu" not in param_name_list,
-        "mu_selected_index_present": bool(saw_mu_selected_index) and "mu" not in param_name_list,
-        "allow_missing": bool(effective_allow_missing),
-        "allow_missing_requested": bool(args.allow_missing),
-        "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
-        "skip_invalid_shards": bool(args.skip_invalid_shards),
-        "skip_invalid_shards_effective": bool(effective_skip_invalid_shards),
-        "drop_failed_rows": bool(drop_failed_rows),
-        "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
-        "skipped_invalid_shards": int(len(skipped_invalid_shards)),
-        "expected_models": int(row_count),
-        "missing_models": int(row_count - out_row_count),
-    }
-    attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
-    root_out.attrs.update(attrs_payload)
+        contract_provenance: Dict[str, str] = {
+            "config_hash": str(config_hash or ""),
+            "grid_definition_hash": str(grid_definition_hash or ""),
+            "git_commit": str(git_commit or ""),
+            "turbospectrum_version": str(turbospectrum_version or ""),
+            "linelist_identifier": str(linelist_identifier or ""),
+            "linelist_version": str(linelist_version or ""),
+            "atmosphere_model_identifier": str(atmosphere_model_identifier or ""),
+            "synthesis_timestamp": created_utc,
+            "pipeline_version": str(pipeline_version or ""),
+        }
+        if not args.allow_incomplete_provenance:
+            assert_required_provenance_fields(contract_provenance, context="merge_spectra_shards.py")
 
-    try:
-        zarr.consolidate_metadata(store)
-        print(f"Consolidated Zarr metadata: {out_path}")
-    except Exception as exc:
-        print(f"WARN: zarr.consolidate_metadata failed (non-fatal): {exc}")
+        status_counts: Dict[str, int] = {}
+        for s in statuses:
+            status_counts[s] = status_counts.get(s, 0) + 1
+
+        # Aggregate the per-shard out-of-memory verdict (stamped by
+        # run_turbospectrum_shard.py) so the merged store records whether the run
+        # was degraded by memory pressure rather than bad input data.
+        mem_shards_suspected = 0
+        mem_counts_total = {"explicit_oom": 0, "truncated_or_empty_output": 0, "other": 0}
+        for snapshot in shard_attr_snapshots:
+            if str(snapshot.get("memory_pressure_suspected", "")).lower() in ("1", "true"):
+                mem_shards_suspected += 1
+            raw_counts = snapshot.get("memory_pressure_counts")
+            if raw_counts:
+                try:
+                    parsed = json.loads(raw_counts) if isinstance(raw_counts, str) else dict(raw_counts)
+                    for key in mem_counts_total:
+                        mem_counts_total[key] += int(parsed.get(key, 0))
+                except (ValueError, TypeError):
+                    pass
+        memory_pressure_suspected = mem_shards_suspected > 0
+        if memory_pressure_suspected:
+            print(
+                f"WARNING: memory pressure suspected in {mem_shards_suspected}/{len(shards)} "
+                f"merged shard(s) (explicit_oom={mem_counts_total['explicit_oom']}, "
+                f"truncated_or_empty_output={mem_counts_total['truncated_or_empty_output']}). "
+                "Affected rows were most likely killed mid-write by the kernel OOM killer; "
+                "re-run them with fewer workers per node or more memory to recover."
+            )
+
+        param_units: Dict[str, str] = {}
+        for name in param_name_list:
+            if name in {"teff", "marcs_teff"}:
+                param_units[name] = "K"
+            elif name in {"logg", "feh", "a", "c", "n", "o", "r", "s"} or name in _MARCS_PARAM_COLS or name == "marcs_logg":
+                param_units[name] = "dex"
+            elif name in {"vmicro", "marcs_turb"}:
+                param_units[name] = "km/s"
+            else:
+                param_units[name] = ""
+
+        attrs_payload: Dict[str, Any] = {
+            "title": "SPICE Synthetic Spectral Grid",
+            "generator": args.generator,
+            "created_utc": created_utc,
+            "synthesis_timestamp": created_utc,
+            "flux_definition": resolved_flux_definition,
+            "wavelength_unit": "angstrom",
+            "flux_unit": resolved_flux_unit,
+            "parameter_units": param_units,
+            "physics_hash": physics_hash,
+            "git_commit": git_commit,
+            "git_sha": git_commit,
+            "contact": args.contact,
+            "schema_version": args.schema_version,
+            "n_models": int(out_row_count),
+            "n_lambda": int(wl_count),
+            "n_params": int(params.shape[1]),
+            "shards_merged": len(shards),
+            "status_counts": status_counts,
+            "memory_pressure_suspected": bool(memory_pressure_suspected),
+            "memory_pressure_shards": int(mem_shards_suspected),
+            "memory_pressure_counts": json.dumps(mem_counts_total, sort_keys=True),
+            "continuum_present": bool(saw_continuum),
+            "output_mode_values": output_mode_values,
+            "calculation_mode_values": calculation_mode_values,
+            "mu_sampling_values": sorted(mu_sampling_values),
+            "mu_in_params": "mu" in param_name_list,
+            "mu_selected_present": bool(saw_mu_selected) and "mu" not in param_name_list,
+            "mu_selected_index_present": bool(saw_mu_selected_index) and "mu" not in param_name_list,
+            "allow_missing": bool(effective_allow_missing),
+            "allow_missing_requested": bool(args.allow_missing),
+            "skip_nonexistent_shards": bool(args.skip_nonexistent_shards),
+            "skip_invalid_shards": bool(args.skip_invalid_shards),
+            "skip_invalid_shards_effective": bool(effective_skip_invalid_shards),
+            "drop_failed_rows": bool(drop_failed_rows),
+            "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
+            "skipped_invalid_shards": int(len(skipped_invalid_shards)),
+            "expected_models": int(row_count),
+            "missing_models": int(row_count - out_row_count),
+        }
+        attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
+        root_out.attrs.update(attrs_payload)
+
+        try:
+            zarr.consolidate_metadata(store)
+            print(f"Consolidated Zarr metadata: {out_path}")
+        except Exception as exc:
+            print(f"WARN: zarr.consolidate_metadata failed (non-fatal): {exc}")
 
     print(f"Wrote merged spectra Zarr: {out_path}")
 

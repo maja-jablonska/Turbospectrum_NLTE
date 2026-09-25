@@ -217,6 +217,74 @@ class MergeSpectraShardsTests(unittest.TestCase):
             self.assertEqual(int(merged.attrs["skipped_invalid_shards"]), 1)
             self.assertTrue(bool(merged.attrs["skip_invalid_shards_effective"]))
 
+    def _run_merge(self, output_path: str, grid_path: str, shards: list[str], *extra: str):
+        cmd = [sys.executable, MERGE_SCRIPT, "--output-zarr", output_path, "--grid-zarr", grid_path]
+        for shard in shards:
+            cmd += ["--shard", shard]
+        cmd += ["--allow-incomplete-provenance", *extra]
+        return subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+
+    def _write_two_row_run(self, tmpdir: str, *, bad_flux: np.ndarray | None = None, bad_status: str = "success"):
+        grid_path = os.path.join(tmpdir, "grid.zarr")
+        self._write_grid(grid_path, row_count=2)
+        wl = np.asarray([5000.0, 5000.2], dtype=np.float32)
+        good = os.path.join(tmpdir, "spectra_shard_0.zarr")
+        other = os.path.join(tmpdir, "spectra_shard_1.zarr")
+        self._write_shard(good, wavelengths=wl, global_index=np.asarray([0]),
+                          flux=np.asarray([[1.0, 0.95]]), statuses=["success"], messages=["ok"])
+        self._write_shard(other, wavelengths=wl, global_index=np.asarray([1]),
+                          flux=np.asarray([[0.9, 0.85]]) if bad_flux is None else bad_flux,
+                          statuses=[bad_status], messages=["x"])
+        return grid_path, [good, other]
+
+    def test_strict_merge_rejects_nan_flux(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(tmpdir, bad_flux=np.asarray([[np.nan, np.nan]]))
+            output_path = os.path.join(tmpdir, "merged.zarr")
+            result = self._run_merge(output_path, grid_path, shards)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("non-finite flux", result.stderr)
+            self.assertFalse(os.path.exists(output_path))
+
+    def test_strict_merge_rejects_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(tmpdir, bad_status="failed")
+            result = self._run_merge(os.path.join(tmpdir, "merged.zarr"), grid_path, shards)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("non-success statuses", result.stderr)
+
+    def test_failed_remerge_keeps_previous_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(tmpdir)
+            output_path = os.path.join(tmpdir, "merged.zarr")
+            first = self._run_merge(output_path, grid_path, shards)
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            self.assertEqual(int(zarr.open_group(output_path, mode="r").attrs["missing_models"]), 0)
+
+            # Enforcing provenance fails *after* the arrays are written (the
+            # shards carry none), i.e. mid-write; the earlier store must survive.
+            cmd = [sys.executable, MERGE_SCRIPT, "--output-zarr", output_path, "--grid-zarr", grid_path,
+                   "--shard", shards[0], "--shard", shards[1]]
+            second = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, check=False)
+            self.assertIn("provenance", second.stderr.lower())
+            self.assertNotEqual(second.returncode, 0)
+            merged = zarr.open_group(output_path, mode="r")
+            np.testing.assert_array_equal(np.asarray(merged["global_index"][:]), [0, 1])
+            self.assertEqual(int(merged.attrs["missing_models"]), 0)
+            leftovers = [n for n in os.listdir(tmpdir) if ".tmp-" in n or ".old-" in n]
+            self.assertEqual(leftovers, [])
+
+    def test_merge_marks_unwritten_rows_with_nan_fill_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(tmpdir)
+            output_path = os.path.join(tmpdir, "merged.zarr")
+            result = self._run_merge(output_path, grid_path, shards)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            merged = zarr.open_group(output_path, mode="r")
+            flux = np.asarray(merged["flux"][:])
+            self.assertTrue(np.all(np.isfinite(flux)))
+            self.assertTrue(np.isnan(merged["flux"].fill_value))
+
     def _write_shard_provenance(self, path: str, input_config_text: str) -> None:
         """Attach a full provenance group to an existing shard zarr."""
         root = zarr.open_group(path, mode="a")

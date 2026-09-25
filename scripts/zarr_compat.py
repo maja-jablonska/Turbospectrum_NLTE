@@ -114,6 +114,9 @@ def create_array(group, name: str, *, data=None, shape=None, dtype=None,
     # zarr v2
     if data is not None:
         return group.array(name, data, chunks=chunks, dtype=dtype, **kwargs)
+    if "fill_value" in kwargs:
+        fill_value = kwargs.pop("fill_value")
+        return group.full(name, fill_value=fill_value, shape=shape, dtype=dtype, chunks=chunks, **kwargs)
     return group.empty(name, shape=shape, dtype=dtype, chunks=chunks, **kwargs)
 
 
