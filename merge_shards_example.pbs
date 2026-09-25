@@ -219,7 +219,18 @@ fi
 
 echo "[merge] Running shard merge..."
 "${MERGE_CMD[@]}"
-echo "[merge] Merge complete: ${MERGED_ZARR}"
+
+MERGED_MISSING_MODELS="$("${PYTHON}" -c "
+import sys, zarr
+print(int(zarr.open_group(sys.argv[1], mode='r').attrs.get('missing_models', -1)))
+" "${MERGED_ZARR}")"
+MERGE_COMPLETE=0
+if [[ "${MERGED_MISSING_MODELS}" == "0" ]]; then
+    MERGE_COMPLETE=1
+    echo "[merge] Merge complete: ${MERGED_ZARR}"
+else
+    echo "[merge] WARN: PARTIAL merge written to ${MERGED_ZARR}: missing_models=${MERGED_MISSING_MODELS}." >&2
+fi
 
 ############################################
 # Post-merge cleanup
@@ -229,11 +240,20 @@ CLEANUP_SHARDS="${CLEANUP_SHARDS:-1}"
 CLEANUP_TMP="${CLEANUP_TMP:-1}"
 
 if [[ "${CLEANUP_SHARDS}" == "1" ]]; then
-    echo "[merge] Cleaning up shard directory to reclaim inodes: ${SHARDS_DIR}"
-    rm -rf "${SHARDS_DIR}"
+    if (( MERGE_COMPLETE == 1 )); then
+        echo "[merge] Cleaning up shard directory to reclaim inodes: ${SHARDS_DIR}"
+        rm -rf "${SHARDS_DIR}"
+    else
+        # Skipped/missing shards must be re-synthesized; keep the rest for the re-merge.
+        echo "[merge] Partial merge: keeping shard directory ${SHARDS_DIR}"
+    fi
 fi
 
 if [[ "${CLEANUP_TMP}" == "1" && -d "${TMP_SYSTEM_DIR}" ]]; then
     echo "[merge] Cleaning up tmp directory: ${TMP_SYSTEM_DIR}"
     rm -rf "${TMP_SYSTEM_DIR}"
+fi
+
+if (( MERGE_COMPLETE == 0 )); then
+    exit 3
 fi

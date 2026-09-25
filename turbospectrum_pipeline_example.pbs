@@ -34,6 +34,15 @@
 #   SKIP_SYNTHESIS=1          generate the grid only, then stop (no synthesis/merge)
 #   AUTO_PRUNE_STALE_SHARDS=1 drop shards whose layout no longer matches SHARD_COUNT
 #                             before resuming (opt-in; off by default)
+#   FORCE_RESTART=1           wipe grid, shards and merged zarr once (lock winner
+#                             only in array mode), then regenerate
+#   ALLOW_PARTIAL_MERGE=0     abort instead of merging when shards are missing/invalid
+#
+# Array jobs must use -J 0-(N-1) (shard index = PBS_ARRAY_INDEX). SHARD_COUNT is
+# inferred from the submitted range (qstat) and the task fails if it cannot be.
+#
+# Exit status: 0 = complete merge; 3 = partial merge written (missing_models > 0,
+# shards kept for the next resume); 1 = error.
 
 set -euo pipefail
 cd "${PBS_O_WORKDIR}"
@@ -168,49 +177,18 @@ print_log_excerpt() {
     fi
 }
 
-# Remove shard stores whose global_index no longer matches the current
-# (SHARD_COUNT, ROW_COUNT) stride — e.g. left over from a run with a different
-# shard layout. Gated by AUTO_PRUNE_STALE_SHARDS; never runs in array-task mode.
-prune_incompatible_shards() {
-    "${PYTHON}" - <<PY
-import re
-import shutil
-from pathlib import Path
-
-import numpy as np
-import zarr
-
-shard_dir = Path(r"${SHARDS_DIR}")
-expected_shards = int(r"${SHARD_COUNT}")
-row_count = int(r"${ROW_COUNT}")
-pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
-removed: list[str] = []
-
-for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
-    match = pattern.match(shard_path.name)
-    if match is None:
-        continue
-    shard_idx = int(match.group(1))
-    remove_reason = None
-    if shard_idx < 0 or shard_idx >= expected_shards:
-        remove_reason = "outside_expected_range"
-    else:
-        try:
-            root = zarr.open_group(str(shard_path), mode="r")
-            expected_indices = np.arange(shard_idx, row_count, expected_shards, dtype=np.int64)
-            gidx = np.asarray(root["global_index"][:], dtype=np.int64)
-            if gidx.shape != expected_indices.shape or not np.array_equal(gidx, expected_indices):
-                remove_reason = "layout_mismatch"
-        except Exception:
-            remove_reason = "unreadable_or_missing_global_index"
-    if remove_reason is not None:
-        shutil.rmtree(shard_path, ignore_errors=True)
-        removed.append(f"{shard_path.name}:{remove_reason}")
-
-preview = removed[:10]
-suffix = " (truncated)" if len(removed) > 10 else ""
-print(f"[${TAG} prune] removed={len(removed)} preview={preview}{suffix}")
-PY
+# Missing/invalid shard report: same validity predicate the shard runner uses
+# to decide skip vs recompute (scripts/zarr_rowstore.check_shard).
+write_missing_shards_file() {
+    local extra=()
+    if [[ "$(to_bool01 "${DROP_FAILED_ROWS:-0}")" == "1" ]]; then extra+=(--drop-failed-rows); fi
+    if [[ "${1:-}" == "--prune-stale" ]]; then extra+=(--prune-stale); fi
+    "${PYTHON}" "${REPO}/scripts/shard_status.py" \
+        --shard-dir "${SHARDS_DIR}" \
+        --shard-count "${SHARD_COUNT}" \
+        --row-count "${ROW_COUNT}" \
+        --missing-out "${MISSING_FILE}" \
+        ${extra[@]+"${extra[@]}"}
 }
 
 FINALIZE_ONLY_EFFECTIVE="$(to_bool01 "${FINALIZE_ONLY}")"
@@ -366,6 +344,8 @@ if [[ "${SHARDS_DIR}" != /* ]]; then SHARDS_DIR="${REPO}/${SHARDS_DIR}"; fi
 if [[ "${MERGED_ZARR}" != /* ]]; then MERGED_ZARR="${REPO}/${MERGED_ZARR}"; fi
 
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
+SCRATCH_TMP_ROOT_IS_DEFAULT=0
+[[ -z "${SCRATCH_TMP_ROOT:-}" ]] && SCRATCH_TMP_ROOT_IS_DEFAULT=1
 SCRATCH_TMP_ROOT="${SCRATCH_TMP_ROOT:-${RUN_ROOT}/tmp/pbs_${PBS_JOBID}}"
 TMP_SYSTEM_DIR="${TMP_SYSTEM_DIR:-${SCRATCH_TMP_ROOT}/system_tmp}"
 TMP_WORK_DIR="${TMP_WORK_DIR:-${SCRATCH_TMP_ROOT}/workers}"
@@ -495,12 +475,19 @@ generate_grid_locked() {
         --skip-synthesis
 }
 
-if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" && "${FINALIZE_ONLY_EFFECTIVE}" != "1" ]]; then
-    # FORCE_RESTART drops the grid readiness marker in every task so no one short-circuits
-    # on a stale grid. The actual grid zarr wipe happens in the lock-winner path (array
-    # mode) or the single-job path below, so only one task deletes the directory.
-    rm -f "${GRID_PREP_MARKER}" "${GRID_PREP_FAILURE}"
-fi
+# FORCE_RESTART wipes previous outputs exactly once per job. The readiness
+# marker is keyed on the job id, so a fresh submission never sees an old
+# marker; tasks must NOT delete it themselves, or a late-starting array task
+# would win the (released) lock again and rm -rf the grid under running tasks.
+force_restart_wipe() {
+    echo "[${TAG}] FORCE_RESTART: removing grid zarr, shard outputs and merged zarr."
+    rm -rf "${GRID_ZARR}"
+    if [[ -n "${SHARDS_DIR}" && "${SHARDS_DIR}" != "/" && -d "${SHARDS_DIR}" ]]; then
+        find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
+    fi
+    rm -f "${MISSING_FILE}" "${PENDING_SHARDS_FILE}" "${NEXT_WORK_ITEM}"
+    rm -rf "${MERGED_ZARR}"
+}
 
 if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
     # Finalize mode: grid must already exist.
@@ -526,8 +513,7 @@ elif (( ARRAY_TASK_MODE == 1 )); then
             echo "[${TAG}] Array task ${PBS_ARRAY_INDEX:-?} acquired grid-preparation lock."
             rm -f "${GRID_PREP_FAILURE}"
             if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
-                echo "[${TAG}] FORCE_RESTART: removing existing grid zarr to force regeneration."
-                rm -rf "${GRID_ZARR}"
+                force_restart_wipe
             fi
             _prep_rc=0
             if ! is_valid_grid_zarr "${GRID_ZARR}"; then
@@ -566,8 +552,7 @@ elif (( ARRAY_TASK_MODE == 1 )); then
 else
     # Single-job mode: generate directly.
     if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
-        echo "[${TAG}] FORCE_RESTART: removing existing grid zarr to force regeneration."
-        rm -rf "${GRID_ZARR}"
+        force_restart_wipe
     fi
     if ! is_valid_grid_zarr "${GRID_ZARR}"; then
         generate_grid_locked
@@ -591,18 +576,28 @@ fi
 ROWS_PER_SHARD_RAW="${ROWS_PER_SHARD_OVERRIDE:-${CFG_ROWS_PER_SHARD:-}}"
 SHARD_COUNT_RAW="${SHARD_COUNT_OVERRIDE:-${CFG_SHARD_COUNT:-}}"
 
-# For array jobs: infer SHARD_COUNT from the PBS array range when not
-# explicitly set.  PBS Pro on Gadi exposes PBS_ARRAY_INDEX per task but
-# not the total range, so we parse it from PBS_JOBID (e.g. "12345[0-99].gadi-pbs").
-if (( ARRAY_TASK_MODE == 1 )) && [[ -z "${SHARD_COUNT_RAW}" ]]; then
-    _array_max="$("${PYTHON}" -c "
-import re, sys
-m = re.search(r'\[(\d+)-(\d+)\]', sys.argv[1])
-print(int(m.group(2)) + 1 if m else '')
-" "${PBS_JOBID:-}" 2>/dev/null || echo "")"
-    if [[ -n "${_array_max}" && "${_array_max}" =~ ^[0-9]+$ ]] && (( _array_max > 0 )); then
-        SHARD_COUNT_RAW="${_array_max}"
-        echo "[${TAG}] Inferred SHARD_COUNT=${_array_max} from PBS array range in PBS_JOBID."
+# Array jobs: shard index == PBS_ARRAY_INDEX, so the array must be 0..N-1 with
+# step 1 and SHARD_COUNT must equal N. Infer N from the submitted range when
+# not given (a subjob's PBS_JOBID carries no range on PBS Pro, hence qstat),
+# and refuse to run if it cannot be determined: silently falling back to the
+# default rows-per-shard layout would leave rows unsynthesized.
+if (( ARRAY_TASK_MODE == 1 )); then
+    read -r _arr_start _arr_end _arr_step <<< "$("${PYTHON}" "${REPO}/scripts/pbs_array_range.py" 2>/dev/null || true)"
+    if [[ -n "${_arr_start:-}" ]]; then
+        if (( _arr_start != 0 || _arr_step != 1 )); then
+            echo "[${TAG}] ERROR: array range ${_arr_start}-${_arr_end}:${_arr_step} must be 0-(N-1) with step 1 (shard index = PBS_ARRAY_INDEX)." >&2
+            exit 1
+        fi
+        _arr_count=$(( _arr_end + 1 ))
+        if [[ -z "${SHARD_COUNT_RAW}" ]]; then
+            SHARD_COUNT_RAW="${_arr_count}"
+            echo "[${TAG}] Inferred SHARD_COUNT=${_arr_count} from PBS array range."
+        elif (( SHARD_COUNT_RAW != _arr_count )); then
+            echo "[${TAG}] WARN: SHARD_COUNT=${SHARD_COUNT_RAW} but array has ${_arr_count} tasks; shards >= ${_arr_count} will not run in this job." >&2
+        fi
+    elif [[ -z "${SHARD_COUNT_RAW}" && -z "${ROWS_PER_SHARD_RAW}" ]]; then
+        echo "[${TAG}] ERROR: could not determine the PBS array range; pass SHARD_COUNT explicitly (qsub -J 0-99 -v SHARD_COUNT=100,...)." >&2
+        exit 1
     fi
 fi
 
@@ -701,6 +696,9 @@ fi
 if (( SHARD_COUNT > ROW_COUNT )); then
     SHARD_COUNT="${ROW_COUNT}"
 fi
+if (( ARRAY_TASK_MODE == 1 )) && [[ -n "${_arr_count:-}" ]] && (( _arr_count < SHARD_COUNT )); then
+    echo "[${TAG}] WARN: layout needs ${SHARD_COUNT} shards but the array has ${_arr_count} tasks; shards ${_arr_count}..$((SHARD_COUNT - 1)) will be missing (finalize will report them)." >&2
+fi
 
 # Persist layout so FINALIZE_ONLY can restore it later.
 if [[ "${FINALIZE_ONLY_EFFECTIVE}" != "1" ]]; then
@@ -713,7 +711,7 @@ if (( ARRAY_TASK_MODE == 0 )) \
     && [[ "$(to_bool01 "${AUTO_PRUNE_STALE_SHARDS}")" == "1" ]] \
     && [[ -n "${SHARDS_DIR}" && "${SHARDS_DIR}" != "/" ]]; then
     echo "[${TAG}] AUTO_PRUNE_STALE_SHARDS=1: pruning layout-incompatible shards in ${SHARDS_DIR}..."
-    prune_incompatible_shards || echo "[${TAG}] WARN: shard pruning encountered an error (continuing)." >&2
+    write_missing_shards_file --prune-stale || echo "[${TAG}] WARN: shard pruning encountered an error (continuing)." >&2
 fi
 
 echo "[${TAG}] Repo: ${REPO}"
@@ -768,6 +766,11 @@ if (( ARRAY_TASK_MODE == 1 )); then
         2>&1 | tee "${LOG_FILE}" || _array_synth_rc=$?
 
     rm -rf "${SCRATCH}"
+    # The default tmp root is per subjob (PBS_JOBID carries the index); a
+    # user-supplied one may be shared across tasks, so leave that alone.
+    if (( SCRATCH_TMP_ROOT_IS_DEFAULT == 1 )); then
+        rm -rf "${SCRATCH_TMP_ROOT}"
+    fi
     if (( _array_synth_rc != 0 )); then
         print_log_excerpt "${LOG_FILE}" "Array shard ${SHARD_INDEX} failed; log excerpt"
         echo "[${TAG}] ERROR: array shard ${SHARD_INDEX} synthesis failed (rc=${_array_synth_rc})." >&2
@@ -780,91 +783,6 @@ fi
 ############################################
 # SINGLE-JOB MODE – worker pool
 ############################################
-
-########################################
-# Missing-shards helper (defined before
-# FINALIZE_ONLY branch so finalize can
-# use it)
-########################################
-
-write_missing_shards_file() {
-    "${PYTHON}" - <<PY
-import re
-import sys
-from pathlib import Path
-
-import numpy as np
-import zarr
-
-shard_dir = Path(r"${SHARDS_DIR}")
-expected_shards = int(r"${SHARD_COUNT}")
-row_count = int(r"${ROW_COUNT}")
-drop_failed = r"${DROP_FAILED_ROWS:-0}" in ("1", "true", "True", "yes")
-out_path = Path(r"${MISSING_FILE}")
-out_path.parent.mkdir(parents=True, exist_ok=True)
-
-pattern = re.compile(r"^spectra_shard_(\d+)\.zarr$")
-seen: set[int] = set()
-for shard_path in sorted(shard_dir.glob("spectra_shard_*.zarr")):
-    match = pattern.match(shard_path.name)
-    if match is None:
-        continue
-    shard_idx = int(match.group(1))
-    if shard_idx < 0 or shard_idx >= expected_shards:
-        continue
-    try:
-        root = zarr.open_group(str(shard_path), mode="r")
-    except Exception:
-        continue
-    for key in ("global_index", "flux", "status", "message"):
-        if key not in root:
-            root = None
-            break
-    if root is None:
-        continue
-    try:
-        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
-        flux = np.asarray(root["flux"][:], dtype=np.float32)
-        status = np.asarray(root["status"][:])
-    except Exception:
-        continue
-    if gidx.ndim != 1 or gidx.size == 0:
-        continue
-    if flux.ndim != 2 or flux.shape[0] != gidx.size:
-        continue
-    if status.ndim != 1 or status.shape[0] != gidx.size:
-        continue
-    if np.any(gidx < 0) or np.any(gidx >= row_count):
-        continue
-    if np.unique(gidx).size != gidx.size:
-        continue
-    # When drop_failed is active, only require success rows to have finite flux.
-    statuses = []
-    for item in status.tolist():
-        if isinstance(item, (bytes, bytearray)):
-            item = item.decode("utf-8", errors="ignore")
-        statuses.append(str(item).strip().lower())
-    success_statuses = {"success", "skipped"}
-    if drop_failed:
-        success_mask = np.array([s in success_statuses for s in statuses], dtype=bool)
-        if success_mask.any() and not np.all(np.isfinite(flux[success_mask])):
-            continue
-    else:
-        if not np.all(np.isfinite(flux)):
-            continue
-        if any(s not in success_statuses for s in statuses):
-            continue
-    seen.add(shard_idx)
-
-missing = sorted(set(range(expected_shards)) - seen)
-text = "\n".join(str(x) for x in missing)
-out_path.write_text(f"{text}\n" if text else "", encoding="utf-8")
-print(
-    f"[missing-shards] expected={expected_shards} valid={len(seen)} missing={len(missing)} stores={len(list(shard_dir.glob('spectra_shard_*.zarr')))}",
-    file=sys.stderr,
-)
-PY
-}
 
 if [[ "${FINALIZE_ONLY_EFFECTIVE}" == "1" ]]; then
     echo "[${TAG}] FINALIZE_ONLY=1: skipping synthesis."
@@ -1008,15 +926,6 @@ else
         exit 1
     fi
 
-    if [[ "${FORCE_RESTART_EFFECTIVE}" == "1" ]]; then
-        echo "[${TAG}] FORCE_RESTART: clearing previous shard outputs and merged zarr."
-        find "${SHARDS_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'spectra_shard_*.zarr' -exec rm -rf {} +
-        rm -f "${MISSING_FILE}" "${PENDING_SHARDS_FILE}" "${NEXT_WORK_ITEM}"
-        if [[ -d "${MERGED_ZARR}" ]]; then
-            rm -rf "${MERGED_ZARR}"
-        fi
-    fi
-
     write_missing_shards_file 2>> "${LOG_DIR}/missing.log"
     cp "${MISSING_FILE}" "${PENDING_SHARDS_FILE}"
     PENDING_COUNT=$(wc -l < "${PENDING_SHARDS_FILE}" | tr -d '[:space:]')
@@ -1124,8 +1033,11 @@ fi  # end of synthesis (single-job or finalize skip)
 
 echo "[${TAG}] Validating shard outputs..."
 
-# Recount missing shards (needed for both single-job and finalize paths).
-write_missing_shards_file 2>> "${LOG_DIR}/missing.log" || true
+# Recount missing/invalid shards (needed for both single-job and finalize paths).
+if ! write_missing_shards_file 2>> "${LOG_DIR}/missing.log"; then
+    echo "[${TAG}] ERROR: shard status check failed; see ${LOG_DIR}/missing.log" >&2
+    exit 1
+fi
 FINAL_MISSING="$(wc -l < "${MISSING_FILE}" 2>/dev/null | tr -d '[:space:]')"
 FINAL_MISSING="${FINAL_MISSING:-0}"
 
@@ -1148,8 +1060,14 @@ set +e
 "${VALIDATE_CMD[@]}"
 VALIDATE_RC=$?
 set -e
+ALLOW_PARTIAL_MERGE_EFFECTIVE="$(to_bool01 "${ALLOW_PARTIAL_MERGE}")"
 if (( VALIDATE_RC != 0 )); then
-    echo "[${TAG}] WARN: validation exited with code ${VALIDATE_RC}; continuing with merge policy."
+    if [[ "${ALLOW_PARTIAL_MERGE_EFFECTIVE}" == "1" ]]; then
+        echo "[${TAG}] WARN: validation exited with code ${VALIDATE_RC}; ALLOW_PARTIAL_MERGE=1 so invalid shards will be skipped." >&2
+    else
+        echo "[${TAG}] ERROR: validation failed (rc=${VALIDATE_RC}) and ALLOW_PARTIAL_MERGE=0; merge aborted." >&2
+        exit 1
+    fi
 fi
 
 ############################################
@@ -1197,10 +1115,10 @@ if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
     MERGE_CMD+=(--allow-incomplete-provenance)
 fi
 
-if (( FINAL_MISSING > 0 )); then
-    if [[ "$(to_bool01 "${ALLOW_PARTIAL_MERGE}")" == "1" ]]; then
-        echo "[${TAG}] WARN: missing shards detected; enabling partial merge."
-        MERGE_CMD+=(--allow-missing --skip-nonexistent-shards)
+if (( FINAL_MISSING > 0 || VALIDATE_RC != 0 )); then
+    if [[ "${ALLOW_PARTIAL_MERGE_EFFECTIVE}" == "1" ]]; then
+        echo "[${TAG}] WARN: missing/invalid shards detected; enabling partial merge."
+        MERGE_CMD+=(--allow-missing --skip-nonexistent-shards --skip-invalid-shards)
     else
         echo "[${TAG}] ERROR: ${FINAL_MISSING} shards still missing; merge aborted." >&2
         exit 1
@@ -1209,17 +1127,31 @@ fi
 
 echo "[${TAG}] Merging shard outputs..."
 "${MERGE_CMD[@]}"
-echo "[${TAG}] Merge complete: ${MERGED_ZARR}"
+
+# Completeness is judged from what the merge actually wrote, not from the
+# pre-merge shard count: --skip-invalid-shards / --drop-failed-rows can drop
+# rows from shards that exist.
+MERGED_MISSING_MODELS="$("${PYTHON}" -c "
+import sys, zarr
+print(int(zarr.open_group(sys.argv[1], mode='r').attrs.get('missing_models', -1)))
+" "${MERGED_ZARR}")"
+if [[ "${MERGED_MISSING_MODELS}" == "0" ]]; then
+    MERGE_COMPLETE=1
+    echo "[${TAG}] Merge complete: ${MERGED_ZARR}"
+else
+    MERGE_COMPLETE=0
+    echo "[${TAG}] WARN: PARTIAL merge written to ${MERGED_ZARR}: missing_models=${MERGED_MISSING_MODELS} of ${ROW_COUNT}." >&2
+fi
 
 ############################################
 # Cleanup
 ############################################
 
 if [[ "$(to_bool01 "${CLEANUP_SHARDS}")" == "1" ]]; then
-    if (( FINAL_MISSING > 0 )); then
+    if (( MERGE_COMPLETE == 0 )); then
         # Partial merge: the remaining shards are still needed for a later full
         # merge, so never delete them here regardless of CLEANUP_SHARDS.
-        echo "[${TAG}] Partial merge (${FINAL_MISSING} shards missing): keeping shard directory ${SHARDS_DIR}"
+        echo "[${TAG}] Partial merge: keeping shard directory ${SHARDS_DIR}"
     else
         echo "[${TAG}] Cleaning up shard directory: ${SHARDS_DIR}"
         rm -rf "${SHARDS_DIR}"
@@ -1229,4 +1161,10 @@ fi
 if [[ -d "${SCRATCH_TMP_ROOT}" ]]; then
     echo "[${TAG}] Cleaning up scratch tmp: ${SCRATCH_TMP_ROOT}"
     rm -rf "${SCRATCH_TMP_ROOT}"
+fi
+
+if (( MERGE_COMPLETE == 0 )); then
+    # Non-zero so PBS mail / afterok dependencies see an incomplete dataset.
+    echo "[${TAG}] Exiting with status 3 (partial merge). Resubmit to fill missing shards, then FINALIZE_ONLY=1." >&2
+    exit 3
 fi
