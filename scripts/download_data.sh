@@ -318,7 +318,7 @@ download_linelists() {
 }
 
 # Download gold sample dataset.
-# Note: use download_gold_sample.py for ESO archive spectra;
+# Note: use scripts/download_gold_sample.py for ESO archive spectra;
 # this option is for pre-packaged gold sample bundles if hosted on Keeper.
 download_gold_sample() {
     if [ -d "$GOLD_SAMPLE_PATH" ] && [ "$(ls -A "$GOLD_SAMPLE_PATH" 2>/dev/null)" ]; then
@@ -326,8 +326,8 @@ download_gold_sample() {
             return 0
         fi
     fi
-    echo "Gold sample: use download_gold_sample.py for ESO archive spectra."
-    echo "  python download_gold_sample.py --output $GOLD_SAMPLE_PATH"
+    echo "Gold sample: use scripts/download_gold_sample.py for ESO archive spectra."
+    echo "  python scripts/download_gold_sample.py --output $GOLD_SAMPLE_PATH"
     return 0
 }
 
