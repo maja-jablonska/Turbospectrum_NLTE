@@ -86,3 +86,7 @@ COM/contopac/*
 !turbospectrum_regular_grid_nlte_tiny_gadi.pbs
 !turbospectrum_regular_grid_nlte_tiny_array_gadi.pbs
 !turbospectrum_regular_grid_nlte_tiny_finalize_gadi.pbs
+
+# Credentials (never commit)
+.env
+*.env
