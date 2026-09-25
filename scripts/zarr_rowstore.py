@@ -8,7 +8,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
-from typing import Iterator, List
+from typing import Iterator, List, Mapping, Optional
 
 import numpy as np
 
@@ -59,3 +59,77 @@ def atomic_output(final_path: str) -> Iterator[str]:
     os.rename(tmp_path, final_path)
     if old_path is not None:
         shutil.rmtree(old_path, ignore_errors=True)
+
+
+def expected_shard_indices(shard_index: int, shard_count: int, row_count: int) -> np.ndarray:
+    """Global rows owned by one shard under the strided ``index::count`` layout."""
+    return np.arange(shard_index, row_count, shard_count, dtype=np.int64)
+
+
+def check_shard(
+    path: str,
+    *,
+    expected_global_indices: Optional[np.ndarray] = None,
+    expected_wavelengths: Optional[np.ndarray] = None,
+    expected_attrs: Optional[Mapping[str, str]] = None,
+    drop_failed_rows: bool = False,
+) -> Optional[str]:
+    """Return None if the shard store is complete and usable, else a reason.
+
+    This is the single definition of "valid shard" used by resume (skip or
+    recompute), the PBS missing-shard report, and stale-layout pruning.
+    ``drop_failed_rows`` accepts non-success rows as long as success rows
+    have finite flux (mirrors merge --drop-failed-rows).
+    """
+    import zarr
+
+    try:
+        root = zarr.open_group(path, mode="r")
+    except Exception as exc:
+        return f"unreadable: {exc}"
+    missing = [n for n in ("wavelength", "global_index", "flux", "status", "message") if n not in root]
+    if missing:
+        return f"missing arrays {missing}"
+    try:
+        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
+        flux = np.asarray(root["flux"][:], dtype=np.float32)
+        statuses = decode_statuses(root["status"][:])
+    except Exception as exc:
+        return f"unreadable arrays: {exc}"
+    if gidx.ndim != 1 or gidx.size == 0:
+        return f"bad global_index shape {gidx.shape}"
+    if flux.ndim != 2 or flux.shape[0] != gidx.size:
+        return f"flux shape {flux.shape} does not match rows={gidx.size}"
+    if len(statuses) != gidx.size:
+        return "status length does not match rows"
+    if expected_global_indices is not None and not np.array_equal(gidx, expected_global_indices):
+        return "layout_mismatch"
+    if np.unique(gidx).size != gidx.size:
+        return "duplicate global_index"
+    if expected_wavelengths is not None:
+        wl = np.asarray(root["wavelength"][:], dtype=np.float64)
+        if wl.size != expected_wavelengths.size or not np.allclose(wl, expected_wavelengths, atol=1e-4):
+            return "wavelength_mismatch"
+    if expected_attrs:
+        for key, want in expected_attrs.items():
+            have = str(root.attrs.get(key, "") or "")
+            if have != str(want):
+                return f"{key}_mismatch"
+
+    ok = np.array([s in SUCCESS_STATUSES for s in statuses], dtype=bool)
+    if drop_failed_rows:
+        rows = ok
+    else:
+        if not ok.all():
+            return f"non-success statuses {sorted(set(np.asarray(statuses)[~ok].tolist()))}"
+        rows = slice(None)
+    if not np.all(np.isfinite(flux[rows])):
+        return "non-finite flux"
+    if "continuum" in root:
+        continuum = np.asarray(root["continuum"][:], dtype=np.float32)
+        if continuum.shape != flux.shape:
+            return "continuum shape mismatch"
+        cont = continuum[rows]
+        if cont.size and not np.all(np.any(np.isfinite(cont), axis=1)):
+            return "rows without finite continuum"
+    return None

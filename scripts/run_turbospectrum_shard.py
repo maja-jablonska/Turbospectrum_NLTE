@@ -50,6 +50,7 @@ from provenance_contract import (  # noqa: E402
     is_meaningful_provenance_value,
 )
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
+from zarr_rowstore import check_shard
 from synthesis_validation import (
     SUCCESS_STATUSES,
     FailFastTracker,
@@ -277,64 +278,14 @@ def _existing_shard_is_usable(
     *,
     expected_wavelengths: np.ndarray | None = None,
 ) -> bool:
-    try:
-        root = _open_shard(path)
-    except Exception:
-        return False
-
-    required = ("wavelength", "global_index", "flux", "status", "message")
-    if any(name not in root for name in required):
-        return False
-
-    try:
-        gidx = np.asarray(root["global_index"][:], dtype=np.int64)
-        flux = np.asarray(root["flux"][:], dtype=np.float32)
-    except Exception:
-        return False
-
-    if gidx.ndim != 1 or flux.ndim != 2 or flux.shape[0] != gidx.size:
-        return False
-
-    if not np.array_equal(gidx, expected_global_indices.astype(np.int64, copy=False)):
-        return False
-
-    # Validate that the stored wavelength grid matches the current request.
-    # Without this check, shards from a previous run with a different wavelength
-    # range at the same file path would be silently reused.
-    if expected_wavelengths is not None:
-        try:
-            wl = np.asarray(root["wavelength"][:], dtype=np.float64)
-        except Exception:
-            return False
-        if wl.size != expected_wavelengths.size:
-            return False
-        if not np.allclose(wl, expected_wavelengths, atol=1e-4):
-            return False
-
-    try:
-        statuses = [str(x).strip().lower() for x in np.asarray(root["status"][:]).tolist()]
-    except Exception:
-        return False
-
-    if len(statuses) != gidx.size:
-        return False
-    if any(status not in SUCCESS_STATUSES for status in statuses):
-        return False
-
-    if not np.all(np.isfinite(flux)):
-        return False
-
-    if "continuum" in root:
-        try:
-            continuum = np.asarray(root["continuum"][:], dtype=np.float32)
-        except Exception:
-            return False
-        if continuum.shape != flux.shape:
-            return False
-        if not np.all(np.any(np.isfinite(continuum), axis=1)):
-            return False
-
-    return True
+    reason = check_shard(
+        path,
+        expected_global_indices=expected_global_indices.astype(np.int64, copy=False),
+        expected_wavelengths=expected_wavelengths,
+    )
+    if reason is not None:
+        logging.getLogger(__name__).info("Existing shard %s not reusable: %s", path, reason)
+    return reason is None
 
 
 def _finalize_zarr_store(write_path: str, final_path: str, *, logger: logging.Logger, label: str) -> None:
