@@ -1919,7 +1919,27 @@ def run_single_synthesis(args):
             "log_path": log_path,
         }
     
-    # Check if output exists and skip if force is False
+    # If exact model doesn't exist, pick a nearest-neighbor MARCS atmosphere (no interpolation).
+    model_input_path = model_path
+    fallback_model_message = ""
+    if not os.path.exists(model_path):
+        model_lib = ModelInterpolator(config)
+        nearest, message = model_lib.find_nearest_model(teff, logg, feh, model_turb_str)
+        if not nearest:
+            return build_result("error", f"Model missing and nearest-neighbor selection failed: {message}")
+        model_input_path = nearest["path"]
+        fallback_model_message = message
+
+    # Record the composition and stellar params of the MARCS atmosphere actually
+    # used (the resolved model file, whether exact or nearest-neighbour) so they
+    # travel with the row. For exact matches these equal the requested params; for
+    # snapped rows they are the grid point the selection was clamped to.
+    marcs_composition = parse_marcs_composition(model_input_path)
+    marcs_atm = parse_marcs_atmosphere_params(model_input_path)
+
+    # Check if output exists and skip if force is False. This runs after the
+    # atmosphere is resolved so a reused spectrum (e.g. the other mu-rows of
+    # a shared-mu Intensity point) still reports its MARCS columns.
     expected_outputs = []
     if is_intensity:
         expected_outputs.append(os.path.join(config.output_dir, f"{base_name}.intensity.spec"))
@@ -1939,24 +1959,6 @@ def run_single_synthesis(args):
                 output_path=expected_outputs[0],
                 log_path=log_file,
             )
-    
-    # If exact model doesn't exist, pick a nearest-neighbor MARCS atmosphere (no interpolation).
-    model_input_path = model_path
-    fallback_model_message = ""
-    if not os.path.exists(model_path):
-        model_lib = ModelInterpolator(config)
-        nearest, message = model_lib.find_nearest_model(teff, logg, feh, model_turb_str)
-        if not nearest:
-            return build_result("error", f"Model missing and nearest-neighbor selection failed: {message}")
-        model_input_path = nearest["path"]
-        fallback_model_message = message
-
-    # Record the composition and stellar params of the MARCS atmosphere actually
-    # used (the resolved model file, whether exact or nearest-neighbour) so they
-    # travel with the row. For exact matches these equal the requested params; for
-    # snapped rows they are the grid point the selection was clamped to.
-    marcs_composition = parse_marcs_composition(model_input_path)
-    marcs_atm = parse_marcs_atmosphere_params(model_input_path)
 
     nlte_info_file_for_run = (
         os.path.abspath(str(config.nlte_info_file))

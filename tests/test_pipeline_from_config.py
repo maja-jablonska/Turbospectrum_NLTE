@@ -93,3 +93,37 @@ class GridGenerationSafetyTests(unittest.TestCase):
             root = zarr.open_group(path, mode="r")
             np.testing.assert_array_equal(root["teff"][:], np.arange(3.0))  # previous grid intact
             self.assertEqual(sorted(os.listdir(os.path.dirname(path))), ["grid.zarr"])
+
+
+class SharedMuPointsTests(unittest.TestCase):
+    def _grid(self, tmpdir, mu, mode="Intensity"):
+        import os
+
+        import numpy as np
+        import zarr
+
+        from scripts.zarr_compat import create_array, write_string_array
+
+        path = os.path.join(tmpdir, "grid.zarr")
+        root = zarr.open_group(path, mode="w")
+        create_array(root, "mu", data=np.asarray(mu, dtype=np.float64))
+        write_string_array(root, "output_mode", [mode] * len(mu))
+        return path
+
+    def test_regular_intensity_grid_gets_shared_axis(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._grid(tmpdir, [0.15, 0.45, 0.75, 0.15, 0.45, 0.75])
+            self.assertEqual(pipeline_from_config._shared_mu_points(path), [0.15, 0.45, 0.75])
+
+    def test_flux_or_continuous_mu_keeps_per_row_path(self) -> None:
+        import tempfile
+
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertIsNone(pipeline_from_config._shared_mu_points(self._grid(tmpdir, [0.5, 0.6], mode="Flux")))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertIsNone(pipeline_from_config._shared_mu_points(self._grid(tmpdir, np.linspace(0.1, 1, 31))))
+        self.assertIsNone(pipeline_from_config._shared_mu_points(None))

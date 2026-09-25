@@ -968,6 +968,13 @@ def main():
         }
     )
 
+    # run_single_synthesis reuses any existing .spec with a matching stem, and
+    # the stem does not encode linelist/atmosphere/NLTE identity. Keying the
+    # spectra dir on input_hash means a shared output_dir (--no-scratch) can
+    # never hand back a spectrum computed from different inputs.
+    config.output_dir = os.path.join(str(config.output_dir), f"inputs_{input_hash[:16]}")
+    os.makedirs(config.output_dir, exist_ok=True)
+
     contract_provenance: Dict[str, str] = {
         "config_hash": config_hash,
         "input_hash": input_hash,

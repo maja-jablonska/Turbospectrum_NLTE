@@ -219,7 +219,43 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
     }
 
 
-def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir: str, scratch: Optional[str]) -> str:
+# bsyn accepts at most 30 MU-POINTS per synthesis (muoutp(30) in source/input.f).
+_MAX_BSYN_MU_POINTS = 30
+
+
+def _shared_mu_points(grid_zarr: Optional[str]) -> Optional[list[float]]:
+    """Distinct mu values of an Intensity grid, if few enough for one bsyn call.
+
+    With these as mu_sampling.points every row of a physical point shares one
+    .intensity.spec (one bsyn call instead of one per mu row); each row still
+    reads its own exact mu column. Grids with more distinct mu (e.g. LHS with
+    continuous mu) keep the per-row MU-POINTS path.
+    """
+    if not grid_zarr or not os.path.isdir(grid_zarr):
+        return None
+    import zarr
+
+    root = zarr.open_group(grid_zarr, mode="r")
+    if "mu" not in root:
+        return None
+    if "output_mode" in root:
+        modes = {str(v).strip().lower() for v in np.asarray(root["output_mode"][:]).tolist()}
+        if modes != {"intensity"}:
+            return None
+    mu = np.asarray(root["mu"][:], dtype=np.float64)
+    mu = mu[np.isfinite(mu)]
+    unique_mu = sorted({round(float(m), 9) for m in mu})
+    if not unique_mu or len(unique_mu) > _MAX_BSYN_MU_POINTS:
+        return None
+    return unique_mu
+
+
+def _write_temp_turbospectrum_config(
+    pipeline_cfg: Mapping[str, Any],
+    config_dir: str,
+    scratch: Optional[str],
+    grid_zarr: Optional[str] = None,
+) -> str:
     """Write a Turbospectrum config JSON file derived from pipeline_cfg."""
     ts_cfg = dict(pipeline_cfg.get("turbospectrum") or {})
     ts_cfg = _strip_private_keys(ts_cfg)
@@ -269,6 +305,19 @@ def _write_temp_turbospectrum_config(pipeline_cfg: Mapping[str, Any], config_dir
                 file=sys.stderr,
             )
         synth_params["output_mode"] = str(grid_output_mode)
+
+    synth_params = ts_cfg.get("synthesis_parameters")
+    mu_sampling = synth_params.get("mu_sampling") if isinstance(synth_params, dict) else None
+    has_points = isinstance(mu_sampling, dict) and bool(mu_sampling.get("points"))
+    if not has_points and not ts_cfg.get("mu_points_file"):
+        points = _shared_mu_points(grid_zarr)
+        if points:
+            synth_params = ts_cfg.setdefault("synthesis_parameters", {})
+            ms = synth_params.setdefault("mu_sampling", {})
+            ms["points"] = points
+            if str(ms.get("mode", "")).strip().lower() in {"", "none"}:
+                ms["mode"] = "nearest"  # each row reads its own mu column
+            print(f"[pipeline] Shared mu axis ({len(points)} points): one bsyn call per physical point.")
 
     # Place the temp config next to scratch if provided (good for HPC), else in config dir.
     base = scratch or os.path.join(config_dir, ".pipeline_tmp")
@@ -445,7 +494,7 @@ def main() -> None:
     if not args.skip_nlte_preflight:
         _nlte_preflight_or_exit(pipeline_cfg, config_dir=cfg_dir)
 
-    ts_cfg_path = _write_temp_turbospectrum_config(pipeline_cfg, config_dir=cfg_dir, scratch=scratch)
+    ts_cfg_path = _write_temp_turbospectrum_config(pipeline_cfg, config_dir=cfg_dir, scratch=scratch, grid_zarr=grid_zarr)
 
     if args.synthesis_mode == "full":
         out_zarr = _abs_output_from(run_root, cfg_dir, outputs.get("spectra_zarr"))
