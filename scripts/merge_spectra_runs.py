@@ -71,6 +71,7 @@ try:
         is_meaningful_provenance_value,
     )
     from spectrum_output import infer_flux_metadata
+    from zarr_rowstore import atomic_output
     from zarr_compat import (
         zarr_store as _zarr_store,
         compression_kwargs as _zarr_compression_kwargs,
@@ -93,6 +94,7 @@ except ImportError:  # pragma: no cover - package-relative fallback
         is_meaningful_provenance_value,
     )
     from .spectrum_output import infer_flux_metadata  # type: ignore
+    from .zarr_rowstore import atomic_output  # type: ignore
     from .zarr_compat import (  # type: ignore
         zarr_store as _zarr_store,
         compression_kwargs as _zarr_compression_kwargs,
@@ -458,6 +460,9 @@ def main() -> None:
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     run_paths = _list_runs(args.run, args.run_dir)
+    _out_abs = _norm(args.output_zarr)
+    if any(os.path.abspath(p) == _out_abs for p in run_paths):
+        raise ValueError(f"--output-zarr {_out_abs} is also an input run; write to a new path")
     print(f"Merging {len(run_paths)} run(s):")
     for p in run_paths:
         print(f"  - {p}")
@@ -542,164 +547,176 @@ def main() -> None:
     out_path = _norm(args.output_zarr)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-    # ---- Create output store ----------------------------------------------
-    store = _zarr_store(out_path)
-    root_out = _create_root_group(store, overwrite=True)
-    chunk_rows = max(1, min(int(args.chunk_rows), out_row_count))
-    chunk_shape = (chunk_rows, wl_count)
+    # Built at a sibling tmp path and renamed into place only when complete.
+    with atomic_output(out_path) as write_path:
+        # ---- Create output store ----------------------------------------------
+        store = _zarr_store(write_path)
+        root_out = _create_root_group(store, overwrite=True)
+        chunk_rows = max(1, min(int(args.chunk_rows), out_row_count))
+        chunk_shape = (chunk_rows, wl_count)
 
-    _zc_create_array(root_out, "wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
-    flux_out = _zc_create_array(root_out, "flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
-    continuum_out = None
-    if any_continuum:
-        continuum_out = _zc_create_array(root_out, "continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
-        continuum_out[:] = np.nan
-    params_out = _zc_create_array(root_out, "params", shape=(out_row_count, len(union_names)), dtype=np.float32, chunks=(chunk_rows, len(union_names)), **compression_kwargs)
-    model_id_out = _zc_create_array(root_out, "model_id", shape=(out_row_count,), dtype=np.uint64, chunks=(chunk_rows,), **compression_kwargs)
-    run_index_out = _zc_create_array(root_out, "run_index", shape=(out_row_count,), dtype=np.uint16, chunks=(chunk_rows,), **compression_kwargs)
+        _zc_create_array(root_out, "wavelength", data=wavelengths, chunks=wavelengths.shape, **compression_kwargs)
+        flux_out = _zc_create_array(root_out, "flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, **compression_kwargs)
+        continuum_out = None
+        if any_continuum:
+            continuum_out = _zc_create_array(root_out, "continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, fill_value=np.nan, **compression_kwargs)
+        params_out = _zc_create_array(root_out, "params", shape=(out_row_count, len(union_names)), dtype=np.float32, chunks=(chunk_rows, len(union_names)), **compression_kwargs)
+        model_id_out = _zc_create_array(root_out, "model_id", shape=(out_row_count,), dtype=np.uint64, chunks=(chunk_rows,), **compression_kwargs)
+        run_index_out = _zc_create_array(root_out, "run_index", shape=(out_row_count,), dtype=np.uint16, chunks=(chunk_rows,), **compression_kwargs)
 
-    source_hashes = np.empty(out_row_count, dtype=object)
+        source_hashes = np.empty(out_row_count, dtype=object)
 
-    # ---- Pass 2: stream rows into the output ------------------------------
-    offset = 0
-    for run_idx, (r, mask) in enumerate(zip(runs, run_masks)):
-        n_kept = int(mask.sum())
-        if n_kept == 0:
-            continue
-        root_in = _open_run(r.path)
+        # ---- Pass 2: stream rows into the output ------------------------------
+        offset = 0
+        for run_idx, (r, mask) in enumerate(zip(runs, run_masks)):
+            n_kept = int(mask.sum())
+            if n_kept == 0:
+                continue
+            root_in = _open_run(r.path)
 
-        _copy_block(flux_out, root_in["flux"], offset, mask, chunk_rows=chunk_rows)
-        if continuum_out is not None:
-            if r.has_continuum:
-                _copy_block(continuum_out, root_in["continuum"], offset, mask, chunk_rows=chunk_rows)
-            # else: leave the NaN-initialised block as-is.
+            _copy_block(flux_out, root_in["flux"], offset, mask, chunk_rows=chunk_rows)
+            if continuum_out is not None:
+                if r.has_continuum:
+                    _copy_block(continuum_out, root_in["continuum"], offset, mask, chunk_rows=chunk_rows)
+                # else: unwritten rows read back as the NaN fill_value.
 
-        params_aligned = _aligned_params(root_in, r.param_names, union_names)
-        if not mask.all():
-            params_aligned = params_aligned[mask]
-        params_out[offset : offset + n_kept] = params_aligned
-        model_id_out[offset : offset + n_kept] = _compute_model_ids(params_aligned)
-        run_index_out[offset : offset + n_kept] = np.uint16(run_idx)
-        source_hashes[offset : offset + n_kept] = r.physics_hash or ""
+            params_aligned = _aligned_params(root_in, r.param_names, union_names)
+            if not mask.all():
+                params_aligned = params_aligned[mask]
+            params_out[offset : offset + n_kept] = params_aligned
+            model_id_out[offset : offset + n_kept] = _compute_model_ids(params_aligned)
+            run_index_out[offset : offset + n_kept] = np.uint16(run_idx)
+            source_hashes[offset : offset + n_kept] = r.physics_hash or ""
 
-        offset += n_kept
+            offset += n_kept
 
-    assert offset == out_row_count, f"row bookkeeping mismatch: wrote {offset}, expected {out_row_count}"
+        assert offset == out_row_count, f"row bookkeeping mismatch: wrote {offset}, expected {out_row_count}"
 
-    # ---- Names / ids / scalars --------------------------------------------
-    param_names_u32 = _to_u32_param_names(union_names)
-    _zc_create_array(
-        root_out, "param_names", data=param_names_u32,
-        chunks=(len(param_names_u32) if len(param_names_u32) else 1,),
-        **compression_kwargs,
-    )
-    _zc_write_string_array(
-        root_out, "source_physics_hash", [str(x) for x in source_hashes.tolist()],
-        chunks=chunk_rows, compression_kw=compression_kwargs,
-    )
+        # ---- Names / ids / scalars --------------------------------------------
+        param_names_u32 = _to_u32_param_names(union_names)
+        _zc_create_array(
+            root_out, "param_names", data=param_names_u32,
+            chunks=(len(param_names_u32) if len(param_names_u32) else 1,),
+            **compression_kwargs,
+        )
+        _zc_write_string_array(
+            root_out, "source_physics_hash", [str(x) for x in source_hashes.tolist()],
+            chunks=chunk_rows, compression_kw=compression_kwargs,
+        )
 
-    # Combined physics hash: deterministic over the multiset of source hashes,
-    # the wavelength grid and the param columns. Distinct from any single run.
-    combined_basis = {
-        "hash_basis": "merge-runs-v1",
-        "source_physics_hashes": sorted(r.physics_hash for r in runs),
-        "param_names": list(union_names),
-        "n_lambda": wl_count,
-        "wavelength_endpoints": [float(wavelengths[0]), float(wavelengths[-1])],
-    }
-    combined_physics_hash = hashlib.sha256(
-        json.dumps(combined_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-    _zc_write_fixed_string_scalar(root_out, "physics_hash", combined_physics_hash, min_width=64, compression_kw=compression_kwargs)
-    _zc_write_fixed_string_scalar(root_out, "schema_version", args.schema_version, min_width=16, compression_kw=compression_kwargs)
-
-    _build_provenance_group(
-        root_out, runs, run_masks=run_masks, compression_kwargs=compression_kwargs,
-        snap_stats=snap_stats if args.filter_bad_snaps else None,
-    )
-
-    # ---- Attributes / provenance contract ---------------------------------
-    git_commit = _git_commit(project_root)
-    created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    output_mode_values = sorted(
-        {
-            str(v)
-            for r in runs
-            for v in (r.attrs.get("output_mode_values") or [])
+        # Combined physics hash: deterministic over the multiset of source hashes,
+        # the wavelength grid and the param columns. Distinct from any single run.
+        combined_basis = {
+            "hash_basis": "merge-runs-v1",
+            "source_physics_hashes": sorted(r.physics_hash for r in runs),
+            "param_names": list(union_names),
+            "n_lambda": wl_count,
+            "wavelength_endpoints": [float(wavelengths[0]), float(wavelengths[-1])],
         }
-    )
-    resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(
-        output_mode_values,
-        explicit_definition=args.flux_definition,
-        inherited_definition=_first_meaningful_attr(runs, ("flux_definition",)) or None,
-        inherited_unit=_first_meaningful_attr(runs, ("flux_unit",)) or None,
-    )
+        combined_physics_hash = hashlib.sha256(
+            json.dumps(combined_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
-    contract_provenance = {
-        "config_hash": _first_meaningful_attr(runs, ("config_hash",)) or combined_physics_hash,
-        "grid_definition_hash": _first_meaningful_attr(runs, ("grid_definition_hash",)) or combined_physics_hash,
-        "git_commit": git_commit or _first_meaningful_attr(runs, ("git_commit", "git_sha")),
-        "turbospectrum_version": _first_meaningful_attr(runs, ("turbospectrum_version", "synthesis_code_version")),
-        "linelist_identifier": _first_meaningful_attr(runs, ("linelist_identifier", "linelist_path", "linelist")),
-        "linelist_version": _first_meaningful_attr(runs, ("linelist_version",)),
-        "atmosphere_model_identifier": _first_meaningful_attr(runs, ("atmosphere_model_identifier", "model_atmosphere_path", "atmosphere")),
-        "synthesis_timestamp": created_utc,
-        "pipeline_version": _first_meaningful_attr(runs, ("pipeline_version",)) or (f"git:{git_commit[:12]}" if git_commit else ""),
-    }
-    if not args.allow_incomplete_provenance:
-        assert_required_provenance_fields(contract_provenance, context="merge_spectra_runs.py")
+        _zc_write_fixed_string_scalar(root_out, "physics_hash", combined_physics_hash, min_width=64, compression_kw=compression_kwargs)
+        _zc_write_fixed_string_scalar(root_out, "schema_version", args.schema_version, min_width=16, compression_kw=compression_kwargs)
 
-    attrs_payload: Dict[str, Any] = {
-        "title": "SPICE Synthetic Spectral Grid (multi-run merge)",
-        "generator": args.generator,
-        "created_utc": created_utc,
-        "synthesis_timestamp": created_utc,
-        "flux_definition": resolved_flux_definition,
-        "wavelength_unit": "angstrom",
-        "flux_unit": resolved_flux_unit,
-        "physics_hash": combined_physics_hash,
-        "git_commit": git_commit,
-        "git_sha": git_commit,
-        "contact": args.contact,
-        "schema_version": args.schema_version,
-        "n_models": int(out_row_count),
-        "n_lambda": int(wl_count),
-        "n_params": int(len(union_names)),
-        "continuum_present": bool(any_continuum),
-        "runs_merged": len(runs),
-        "source_runs": [r.path for r in runs],
-        "source_physics_hashes": [r.physics_hash for r in runs],
-        "run_rows": [int(r.n_rows) for r in runs],
-        "run_rows_kept": [int(m.sum()) for m in run_masks],
-        "param_names": list(union_names),
-        "strict_params": bool(args.strict_params),
-        "dedup_by_model_id": bool(args.dedup_by_model_id),
-        "total_input_rows": int(total_input_rows),
-        "output_mode_values": output_mode_values,
-        "snap_filter_applied": bool(args.filter_bad_snaps),
-    }
-    if args.filter_bad_snaps:
-        attrs_payload["snap_filter_atmosphere_path"] = _norm(args.atmosphere_path)
-        attrs_payload["snap_filter_thresholds"] = {
-            k: v for k, v in (
-                ("max_dteff", args.max_dteff),
-                ("max_dlogg", args.max_dlogg),
-                ("max_dfeh", args.max_dfeh),
-            ) if v is not None
+        _build_provenance_group(
+            root_out, runs, run_masks=run_masks, compression_kwargs=compression_kwargs,
+            snap_stats=snap_stats if args.filter_bad_snaps else None,
+        )
+
+        # ---- Attributes / provenance contract ---------------------------------
+        git_commit = _git_commit(project_root)
+        created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        output_mode_values = sorted(
+            {
+                str(v)
+                for r in runs
+                for v in (r.attrs.get("output_mode_values") or [])
+            }
+        )
+        resolved_flux_definition, resolved_flux_unit = infer_flux_metadata(
+            output_mode_values,
+            explicit_definition=args.flux_definition,
+            inherited_definition=_first_meaningful_attr(runs, ("flux_definition",)) or None,
+            inherited_unit=_first_meaningful_attr(runs, ("flux_unit",)) or None,
+        )
+
+        # Runs from different configs/grids must not be labelled as one of them.
+        def _combined(key: str) -> str:
+            values = sorted({str(r.attrs.get(key) or "") for r in runs} - {""})
+            if len(values) == 1:
+                return values[0]
+            if not values:
+                return combined_physics_hash
+            return "multi:" + hashlib.sha256(json.dumps(values).encode("utf-8")).hexdigest()
+
+        contract_provenance = {
+            "config_hash": _combined("config_hash"),
+            "grid_definition_hash": _combined("grid_definition_hash"),
+            "git_commit": git_commit or _first_meaningful_attr(runs, ("git_commit", "git_sha")),
+            "turbospectrum_version": _first_meaningful_attr(runs, ("turbospectrum_version", "synthesis_code_version")),
+            "linelist_identifier": _first_meaningful_attr(runs, ("linelist_identifier", "linelist_path", "linelist")),
+            "linelist_version": _first_meaningful_attr(runs, ("linelist_version",)),
+            "atmosphere_model_identifier": _first_meaningful_attr(runs, ("atmosphere_model_identifier", "model_atmosphere_path", "atmosphere")),
+            "synthesis_timestamp": created_utc,
+            "pipeline_version": _first_meaningful_attr(runs, ("pipeline_version",)) or (f"git:{git_commit[:12]}" if git_commit else ""),
         }
-        attrs_payload["run_rows_wrong_snap"] = [
-            int(s["n_wrong_snap"]) if s else 0 for s in snap_stats
-        ]
-    attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
-    root_out.attrs.update(attrs_payload)
+        if not args.allow_incomplete_provenance:
+            assert_required_provenance_fields(contract_provenance, context="merge_spectra_runs.py")
 
-    try:
-        zarr.consolidate_metadata(store)
-        print(f"Consolidated Zarr metadata: {out_path}")
-    except Exception as exc:  # pragma: no cover
-        print(f"WARN: zarr.consolidate_metadata failed (non-fatal): {exc}")
+        attrs_payload: Dict[str, Any] = {
+            "title": "SPICE Synthetic Spectral Grid (multi-run merge)",
+            "generator": args.generator,
+            "created_utc": created_utc,
+            "synthesis_timestamp": created_utc,
+            "flux_definition": resolved_flux_definition,
+            "wavelength_unit": "angstrom",
+            "flux_unit": resolved_flux_unit,
+            "physics_hash": combined_physics_hash,
+            "git_commit": git_commit,
+            "git_sha": git_commit,
+            "contact": args.contact,
+            "schema_version": args.schema_version,
+            "n_models": int(out_row_count),
+            "n_lambda": int(wl_count),
+            "n_params": int(len(union_names)),
+            "continuum_present": bool(any_continuum),
+            "runs_merged": len(runs),
+            "source_runs": [r.path for r in runs],
+            "source_physics_hashes": [r.physics_hash for r in runs],
+            "source_config_hashes": [str(r.attrs.get("config_hash") or "") for r in runs],
+            "source_input_hashes": [str(r.attrs.get("input_hash") or "") for r in runs],
+            "run_rows": [int(r.n_rows) for r in runs],
+            "run_rows_kept": [int(m.sum()) for m in run_masks],
+            "param_names": list(union_names),
+            "strict_params": bool(args.strict_params),
+            "dedup_by_model_id": bool(args.dedup_by_model_id),
+            "total_input_rows": int(total_input_rows),
+            "output_mode_values": output_mode_values,
+            "snap_filter_applied": bool(args.filter_bad_snaps),
+        }
+        if args.filter_bad_snaps:
+            attrs_payload["snap_filter_atmosphere_path"] = _norm(args.atmosphere_path)
+            attrs_payload["snap_filter_thresholds"] = {
+                k: v for k, v in (
+                    ("max_dteff", args.max_dteff),
+                    ("max_dlogg", args.max_dlogg),
+                    ("max_dfeh", args.max_dfeh),
+                ) if v is not None
+            }
+            attrs_payload["run_rows_wrong_snap"] = [
+                int(s["n_wrong_snap"]) if s else 0 for s in snap_stats
+            ]
+        attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
+        root_out.attrs.update(attrs_payload)
+
+        try:
+            zarr.consolidate_metadata(store)
+            print(f"Consolidated Zarr metadata: {out_path}")
+        except Exception as exc:  # pragma: no cover
+            print(f"WARN: zarr.consolidate_metadata failed (non-fatal): {exc}")
 
     print(
         f"Wrote combined spectra Zarr: {out_path}\n"

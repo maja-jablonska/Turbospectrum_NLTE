@@ -103,6 +103,30 @@ class MergeSpectraRunsTests(unittest.TestCase):
     def _open(path: str):
         return zarr.open_group(store=zarr_store(path), mode="r")
 
+    # -- safety ----------------------------------------------------------------
+
+    def test_refuses_output_that_is_an_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            r1 = os.path.join(tmp, "run1.zarr")
+            self._write_run(r1, n_rows=3, param_names=["teff"], physics_hash="a" * 64)
+            proc = self._run_merge("--run", r1, "--output-zarr", r1)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("also an input run", proc.stderr)
+            self.assertEqual(tuple(self._open(r1)["flux"].shape), (3, 8))
+
+    def test_mixed_configs_are_not_labelled_as_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            r1 = os.path.join(tmp, "run1.zarr")
+            r2 = os.path.join(tmp, "run2.zarr")
+            out = os.path.join(tmp, "combined.zarr")
+            self._write_run(r1, n_rows=3, param_names=["teff"], physics_hash="a" * 64)
+            self._write_run(r2, n_rows=2, param_names=["teff"], physics_hash="b" * 64, base=10.0)
+            proc = self._run_merge("--run", r1, "--run", r2, "--output-zarr", out)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            attrs = self._open(out).attrs
+            self.assertTrue(attrs["config_hash"].startswith("multi:"))
+            self.assertEqual(attrs["source_config_hashes"], ["cfg" + "a" * 6, "cfg" + "b" * 6])
+
     # -- happy path ----------------------------------------------------------
 
     def test_union_merge_concatenates_and_aligns_columns(self) -> None:
