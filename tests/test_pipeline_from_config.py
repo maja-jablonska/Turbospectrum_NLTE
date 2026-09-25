@@ -32,3 +32,23 @@ class PipelineFromConfigRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SynthesisPassthroughTests(unittest.TestCase):
+    def test_runtime_limits_are_forwarded(self) -> None:
+        runtime = {"max_failures": 5, "fail_fast_after": 20, "batch_size": 8}
+        self.assertEqual(
+            pipeline_from_config._synthesis_passthrough_args(runtime, True, sharded=True),
+            ["--max-failures", "5", "--fail-fast-after", "20", "--batch-size", "8", "--allow-incomplete-provenance"],
+        )
+        # The full-mode engine has no --batch-size.
+        self.assertEqual(
+            pipeline_from_config._synthesis_passthrough_args(runtime, False, sharded=False),
+            ["--max-failures", "5", "--fail-fast-after", "20"],
+        )
+        self.assertEqual(pipeline_from_config._synthesis_passthrough_args({}, False, sharded=True), [])
+
+    def test_shard_runner_sigkill_code_triggers_retry(self) -> None:
+        from scripts import run_turbospectrum_shard
+
+        self.assertTrue(pipeline_from_config._is_sigkill_returncode(run_turbospectrum_shard.SIGKILL_EXIT_CODE))

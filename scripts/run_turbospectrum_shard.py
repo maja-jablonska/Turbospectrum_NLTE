@@ -15,6 +15,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -272,6 +273,10 @@ def _write_string_1d(root, name: str, values, chunks: int = 128):
 
 def _write_string_scalar(root, name: str, value: str) -> None:
     _zc_write_string_scalar_impl(root, name, value)
+
+
+# Exit status that pipeline_from_config treats as "killed; retry with fewer workers".
+SIGKILL_EXIT_CODE = 137
 
 
 def _existing_shard_is_usable(
@@ -1218,6 +1223,7 @@ def main():
     logger.info("Starting synthesis with %d workers", worker_count)
 
     tracker = FailFastTracker(threshold=args.fail_fast_after)
+    worker_pool_broken = False
     early_exit = False
 
     with ProcessPoolExecutor(
@@ -1237,6 +1243,8 @@ def main():
             except Exception as exc:  # noqa: BLE001
                 # If a worker crashes, don't abort the whole shard. Mark those rows
                 # so the output shard isn't "empty" and we have diagnostics.
+                if isinstance(exc, BrokenProcessPool):
+                    worker_pool_broken = True
                 err_msg = f"Worker crashed: {exc}"
                 logger.exception(err_msg)
                 for global_i, _row_values in task_batch:
@@ -1467,7 +1475,10 @@ def main():
             n_failures,
             args.max_failures,
         )
-        sys.exit(1)
+        # A worker killed by the kernel (usually the OOM killer) breaks the
+        # pool. Report it as SIGKILL so pipeline_from_config retries the
+        # shard with half the workers instead of failing it outright.
+        sys.exit(SIGKILL_EXIT_CODE if worker_pool_broken else 1)
 
 
 if __name__ == "__main__":

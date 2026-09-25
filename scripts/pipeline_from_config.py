@@ -327,6 +327,20 @@ def _replace_flag_value(cmd: list[str], flag: str, value: str) -> list[str]:
     return updated
 
 
+def _synthesis_passthrough_args(runtime: dict, allow_incomplete_provenance: bool, *, sharded: bool) -> list[str]:
+    """runtime.* failure/batching knobs -> synthesis CLI flags."""
+    keys = [("max_failures", "--max-failures"), ("fail_fast_after", "--fail-fast-after")]
+    if sharded:  # only the shard runner batches adaptively
+        keys.append(("batch_size", "--batch-size"))
+    out: list[str] = []
+    for key, flag in keys:
+        if runtime.get(key) is not None:
+            out += [flag, str(int(runtime[key]))]
+    if allow_incomplete_provenance:
+        out.append("--allow-incomplete-provenance")
+    return out
+
+
 def _is_sigkill_returncode(returncode: int) -> bool:
     return int(returncode) in (-9, 137)
 
@@ -394,6 +408,11 @@ def main() -> None:
         metavar="TMP_PATH",
         help="Temp path for atomic write: write to TMP_PATH, then rename to final. Use for stability (avoids partial shards).",
     )
+    parser.add_argument(
+        "--allow-incomplete-provenance",
+        action="store_true",
+        help="Forwarded to synthesis (also enabled by runtime.allow_incomplete_provenance).",
+    )
     args = parser.parse_args()
 
     cfg_path = os.path.abspath(args.config)
@@ -406,6 +425,7 @@ def main() -> None:
     scratch = args.scratch or runtime.get("scratch")
     workers = args.workers or runtime.get("workers")
     chunk_rows = int(runtime.get("chunk_rows", 128))
+    allow_incomplete = bool(args.allow_incomplete_provenance or runtime.get("allow_incomplete_provenance"))
 
     run_root = _abs_from(cfg_dir, outputs.get("run_root")) or ""
     grid_zarr = _abs_output_from(run_root, cfg_dir, outputs.get("grid_zarr"))
@@ -451,6 +471,7 @@ def main() -> None:
             cmd.append("--no-scratch")
         if args.output_tmp:
             cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
+        cmd += _synthesis_passthrough_args(runtime, allow_incomplete, sharded=False)
         _run(cmd)
         print(f"Wrote synthesized spectra Zarr: {out_zarr}")
         return
@@ -492,6 +513,7 @@ def main() -> None:
         cmd.append("--no-scratch")
     if args.output_tmp:
         cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
+    cmd += _synthesis_passthrough_args(runtime, allow_incomplete, sharded=True)
     _run(cmd)
     print(f"Wrote shard spectra Zarr: {out_zarr}")
 

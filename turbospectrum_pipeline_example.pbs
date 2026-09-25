@@ -192,6 +192,10 @@ write_missing_shards_file() {
 }
 
 FINALIZE_ONLY_EFFECTIVE="$(to_bool01 "${FINALIZE_ONLY}")"
+SYNTH_PROVENANCE_FLAG=""
+if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
+    SYNTH_PROVENANCE_FLAG="--allow-incomplete-provenance"
+fi
 FORCE_RESTART_EFFECTIVE="$(to_bool01 "${FORCE_RESTART}")"
 
 ############################################
@@ -762,7 +766,7 @@ if (( ARRAY_TASK_MODE == 1 )); then
         --shard-count "${SHARD_COUNT}" \
         --scratch "${SCRATCH}" \
         --output "${TMP_OUT}" \
-        ${no_scratch_flag} \
+        ${no_scratch_flag} ${SYNTH_PROVENANCE_FLAG} \
         2>&1 | tee "${LOG_FILE}" || _array_synth_rc=$?
 
     rm -rf "${SCRATCH}"
@@ -904,7 +908,7 @@ else
                 --workers 1 \
                 --scratch "${attempt_scratch}" \
                 --output "${tmp_out}" \
-                ${no_scratch_flag} \
+                ${no_scratch_flag} ${SYNTH_PROVENANCE_FLAG} \
                 >> "${log_file}" 2>&1; then
                 end=$(date +%s)
                 echo "runtime_seconds=$((end-start)) attempt=${attempt}" >> "${log_file}"
@@ -988,7 +992,7 @@ else
     }
 
     export -f worker
-    export NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE SHARD_COUNT LOG_DIR REPO PYTHON PBS_JOBID CONFIG_PATH TMP_OUTPUT_DIR \
+    export SYNTH_PROVENANCE_FLAG NEXT_WORK_ITEM LOCK_FILE PENDING_COUNT PENDING_SHARDS_FILE SHARD_COUNT LOG_DIR REPO PYTHON PBS_JOBID CONFIG_PATH TMP_OUTPUT_DIR \
            CONSECUTIVE_FAILURE_ABORT_THRESHOLD CONSECUTIVE_FAILURE_COUNT_FILE SUCCESS_COUNT_FILE EARLY_STOP_MARKER TAG
 
     ########################################
