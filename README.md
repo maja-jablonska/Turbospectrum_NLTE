@@ -454,7 +454,7 @@ shard_count    = ceil(row_count / rows_per_shard)
 If both are supplied, they must cover the full dataset. If neither is supplied:
 
 - `turbospectrum_pipeline_example.pbs` (the single script for both LHS and regular grids) reads `runtime.shard_count` / `runtime.rows_per_shard` from config, or `SHARD_COUNT` / `ROWS_PER_SHARD` from the environment
-- `turbospectrum_example_array.pbs` requires one of `SHARD_COUNT` or `ROWS_PER_SHARD`
+- in array mode (`qsub -J 0-(N-1)`) the pipeline script infers `SHARD_COUNT=N` from the submitted range and fails if it cannot
 
 You can preview the resolved layout before submitting:
 
@@ -491,7 +491,7 @@ python3 scripts/resolve_shard_layout.py \
   --zarr-path runs/local-dev/outputs/grids/parameter_grid.zarr \
   --rows-per-shard 128
 
-qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_pipeline.json,SHARD_COUNT=10 turbospectrum_example_array.pbs
+qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_pipeline.json,SHARD_COUNT=10 turbospectrum_pipeline_example.pbs
 
 qsub -J 0-9 -v CONFIG_PATH=configs/pipeline/config_regular_grid.example.json,SHARD_COUNT=10,WORKERS=32 turbospectrum_pipeline_example.pbs
 ```
@@ -591,36 +591,38 @@ qsub -v PROJECT=mk27,MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pi
 For long sharded production runs on Gadi, use:
 
 ```bash
-qsub turbospectrum_example.pbs
+qsub turbospectrum_pipeline_example.pbs
 ```
 
 Common overrides:
 
 ```bash
-qsub -v MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json,RUN_ROOT=/scratch/mk27/$USER/turbospec,WORKERS=16,ROWS_PER_SHARD=32 turbospectrum_example.pbs
+qsub -v MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pipeline.json,RUN_ROOT=/scratch/mk27/$USER/turbospec,WORKERS=16,ROWS_PER_SHARD=32 turbospectrum_pipeline_example.pbs
 ```
 
 Post-processing tuning overrides (optional):
 
 ```bash
-qsub -v WORKERS=32,VALIDATE_WORKERS=32,MERGE_CHUNK_ROWS=128 turbospectrum_example.pbs
+qsub -v WORKERS=32,VALIDATE_WORKERS=32,MERGE_CHUNK_ROWS=128 turbospectrum_pipeline_example.pbs
 ```
 
 Optional early-abort safety:
 
 ```bash
-qsub -v INITIAL_FAILURE_ABORT_THRESHOLD=3 turbospectrum_example.pbs
+qsub -v CONSECUTIVE_FAILURE_ABORT_THRESHOLD=3 turbospectrum_pipeline_example.pbs
 ```
 
 Behavior summary:
 - uses the one-config pipeline (`pipeline_from_config.py --synthesis-mode sharded`) for shard generation
 - reads default grid/shard/merged output paths from `outputs` in the pipeline config
 - uses `RUN_ROOT` for queue state/log/tmp directories (and as a fallback when output paths are missing)
-- validates shard completeness with `scripts/validate_dataset.py` before merge
+- validates shards (`scripts/shard_status.py` + `scripts/validate_dataset.py`) before merge; a failed validation aborts unless `ALLOW_PARTIAL_MERGE=1` (the default)
+- exit status: `0` complete merge, `3` partial merge written (`missing_models > 0`, shards kept for the next resume), `1` error
 - preserves valid shard outputs across reruns and resumes only the missing shard IDs on later submissions
-- defaults to legacy one-row-per-shard scheduling unless `SHARD_COUNT` or `ROWS_PER_SHARD` is set in the environment or `runtime`
+- defaults to `ROWS_PER_SHARD=128` unless `SHARD_COUNT` or `ROWS_PER_SHARD` is set in the environment or `runtime`
 - for large grids, set `ROWS_PER_SHARD` or `runtime.rows_per_shard` to reduce per-shard startup overhead
-- use `FORCE_RESTART=1` only when you want to discard prior shard outputs and start again from scratch
+- a shard is reused on resume only if its `input_hash` (config + grid + linelist/atmosphere content) matches; changed inputs are recomputed
+- use `FORCE_RESTART=1` only when you want to discard the grid, prior shard outputs and the merged store and start again from scratch
 
 ## Regular-grid Gadi Synthesis (PBS)
 

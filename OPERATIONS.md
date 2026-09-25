@@ -410,14 +410,18 @@ If file count grows faster than shard count, investigate chunk sizes. The author
 
 ## Safety Switches (Strongly Recommended)
 
-The worker should support:
+What exists today (`turbospectrum_pipeline_example.pbs` env vars / `runtime.*` config keys):
 
-* `--max-shards` (limit per job)
-* `--max-failures` (stop if too many)
-* `--retry N`
-* `--retry-backoff-seconds`
-* `--dry-run` (print planned actions)
-* `--output TMP_PATH` (atomic write: write to temp, then rename to final)
+* `runtime.max_failures` -> `--max-failures`: rows allowed to fail before a shard exits non-zero
+* `runtime.fail_fast_after` -> `--fail-fast-after`: consecutive row failures that abort a shard
+* `SHARD_RETRY_ATTEMPTS` (default 3): per-shard retries in single-job mode, with backoff
+* `CONSECUTIVE_FAILURE_ABORT_THRESHOLD` (default 10): consecutive failed shards that stop the job
+* SIGKILL/OOM: a shard whose worker pool is killed exits 137 and is retried with half the workers
+* `ALLOW_PARTIAL_MERGE=0`: abort instead of merging when shards are missing/invalid; a partial
+  merge otherwise exits 3
+* `--output TMP_PATH` (atomic write: write to temp, then rename to final); merge, filter, split,
+  rechunk and grid generation all publish atomically as well
+* `python scripts/shard_status.py ...`: list missing/invalid shards without touching them
 
 These prevent runaway disasters.
 
