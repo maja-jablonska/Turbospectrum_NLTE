@@ -588,7 +588,16 @@ qsub -v PROJECT=mk27,MAMBA_ENV_NAME=astro,CONFIG_PATH=configs/pipeline/config_pi
 
 ## Main Gadi Synthesis (PBS)
 
-For long sharded production runs on Gadi, use:
+For an array-mode run, submit grid -> shard array -> finalize as one chain from a
+login node (finalize runs `afterany`, so it merges whatever finished and exits 3 if
+the merge is partial; resubmitting fills in only the missing shards):
+
+```bash
+scripts/submit_pipeline.sh configs/pipeline/config_harps_ml.json 500 RUN_ROOT=/scratch/mk27/$USER/harps,WORKERS=48
+DRY_RUN=1 scripts/submit_pipeline.sh ...   # print the qsub commands only
+```
+
+For long sharded production runs as a single job (worker pool), use:
 
 ```bash
 qsub turbospectrum_pipeline_example.pbs
