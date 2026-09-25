@@ -62,6 +62,7 @@ from provenance_contract import (  # noqa: E402
     directory_manifest_sha256,
     file_sha256,
     is_meaningful_provenance_value,
+    physics_config_payload,
 )
 from synthesis_validation import SUCCESS_STATUSES, FailFastTracker, validate_synthesis_results
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
@@ -1205,6 +1206,8 @@ def main() -> None:
     # provenance so the dataset stays reproducible from the original input.
     with open(args.config, "r", encoding="utf-8") as _cfg_handle:
         raw_config_text = _cfg_handle.read()
+    # Hash before the scratch override so config_hash is stable across runs.
+    config_hash = canonical_json_sha256(physics_config_payload(config))
     logger.info("mu_sampling=%s", json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True))
     if args.scratch and not args.no_scratch:
         scratch = os.path.abspath(args.scratch)
@@ -1374,7 +1377,6 @@ def main() -> None:
         explicit_definition=args.flux_definition,
     )
     config_payload = dataclasses.asdict(config)
-    config_hash = canonical_json_sha256(config_payload)
     grid_definition_hash = compute_grid_definition_hash(column_data)
     status_counts = _validate_synthesis_results(
         statuses=statuses,

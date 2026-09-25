@@ -48,6 +48,8 @@ from provenance_contract import (  # noqa: E402
     directory_manifest_sha256,
     file_sha256,
     is_meaningful_provenance_value,
+    physics_config_payload,
+    grid_columns_for_hash as _grid_columns_for_hash,
 )
 from spectrum_output import extract_flux_and_continuum, infer_flux_metadata
 from zarr_rowstore import check_shard
@@ -277,11 +279,13 @@ def _existing_shard_is_usable(
     expected_global_indices: np.ndarray,
     *,
     expected_wavelengths: np.ndarray | None = None,
+    expected_input_hash: str | None = None,
 ) -> bool:
     reason = check_shard(
         path,
         expected_global_indices=expected_global_indices.astype(np.int64, copy=False),
         expected_wavelengths=expected_wavelengths,
+        expected_attrs={"input_hash": expected_input_hash} if expected_input_hash else None,
     )
     if reason is not None:
         logging.getLogger(__name__).info("Existing shard %s not reusable: %s", path, reason)
@@ -356,33 +360,6 @@ def _capture_environment_text() -> str:
             f"VECLIB_MAXIMUM_THREADS={os.environ.get('VECLIB_MAXIMUM_THREADS', '')}",
         ]
     )
-
-
-def _grid_columns_for_hash(grid_root) -> Dict[str, np.ndarray]:
-    keys = (
-        "teff",
-        "logg",
-        "feh",
-        "turbvel",
-        "t_value",
-        "lam_min",
-        "lam_max",
-        "lam_step",
-        "a",
-        "c",
-        "n",
-        "o",
-        "r",
-        "s",
-        "output_mode",
-        "calculation_mode",
-        "grid_version",
-    )
-    out: Dict[str, np.ndarray] = {}
-    for key in keys:
-        if key in grid_root:
-            out[key] = np.asarray(grid_root[key][:])
-    return out
 
 
 def _init_worker(config):
@@ -876,6 +853,9 @@ def main():
         cfg_data["project_root"] = project_root
 
     config = TurbospectrumConfig(**cfg_data)
+    # Hash the config as supplied, before per-attempt scratch paths are
+    # swapped in; otherwise config_hash differs for every shard and job.
+    config_hash = canonical_json_sha256(physics_config_payload(config))
     logger.info(
         "mu_sampling=%s",
         json.dumps(getattr(config, "mu_sampling", {}) or {}, sort_keys=True),
@@ -917,7 +897,6 @@ def main():
     created_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     git_commit = _git_commit(project_root)
     config_payload = dataclasses.asdict(config)
-    config_hash = canonical_json_sha256(config_payload)
     grid_definition_hash = compute_grid_definition_hash(_grid_columns_for_hash(grid))
 
     linelist_files_abs = _resolve_linelist_paths(config)
@@ -972,8 +951,21 @@ def main():
     if (not is_meaningful_provenance_value(pipeline_version)) and is_meaningful_provenance_value(git_commit):
         pipeline_version = f"git:{git_commit[:12]}"
 
+    # Everything that determines the spectra: physics config, grid rows and
+    # the content of the linelists / atmosphere set. Resume refuses to reuse a
+    # shard whose input_hash differs (see _existing_shard_is_usable).
+    input_hash = canonical_json_sha256(
+        {
+            "config_hash": config_hash,
+            "grid_definition_hash": grid_definition_hash,
+            "linelist_sha256": linelist_sha,
+            "atmosphere_sha256": atmosphere_sha,
+        }
+    )
+
     contract_provenance: Dict[str, str] = {
         "config_hash": config_hash,
+        "input_hash": input_hash,
         "grid_definition_hash": grid_definition_hash,
         "git_commit": git_commit,
         "turbospectrum_version": turbospectrum_version,
@@ -1081,7 +1073,9 @@ def main():
             _expected_wl = np.linspace(_lam_min0, _lam_max0, _npts)
 
     if os.path.exists(final_path):
-        if _existing_shard_is_usable(final_path, indices, expected_wavelengths=_expected_wl):
+        if _existing_shard_is_usable(
+            final_path, indices, expected_wavelengths=_expected_wl, expected_input_hash=input_hash,
+        ):
             logger.warning("Shard output already exists and is valid — skipping.")
             return
         logger.warning("Shard output exists but is incomplete/invalid; removing and recomputing: %s", final_path)

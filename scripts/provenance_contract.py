@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -144,3 +145,32 @@ def assert_required_provenance_fields(fields: Mapping[str, Any], *, context: str
     if missing:
         details = ", ".join(f"{key}={fields.get(key)!r}" for key in missing)
         raise ValueError(f"{context}: missing required provenance fields: {details}")
+
+
+# Config fields that only say where/how fast to run, not what is computed.
+_RUNTIME_ONLY_CONFIG_FIELDS = frozenset({
+    "project_root", "force", "output_dir", "log_dir", "tmp_dir", "model_opac_dir",
+    "babsma_path", "bsyn_path", "interpol_path",
+    "max_workers", "worker_memory_gb", "worker_memory_reserve_gb", "environment_capture",
+    "linelist_file_path",
+})
+
+
+def physics_config_payload(config) -> dict[str, Any]:
+    """Config as a dict minus runtime-only fields; the basis of config_hash."""
+    payload = dataclasses.asdict(config)
+    return {k: v for k, v in payload.items() if k not in _RUNTIME_ONLY_CONFIG_FIELDS}
+
+
+# Grid columns that define which spectra a grid asks for (grid_definition_hash).
+GRID_HASH_COLUMNS: tuple[str, ...] = (
+    "teff", "logg", "feh", "turbvel", "t_value",
+    "lam_min", "lam_max", "lam_step",
+    "a", "c", "n", "o", "r", "s",
+    "mu",
+    "output_mode", "calculation_mode", "grid_version",
+)
+
+
+def grid_columns_for_hash(grid_root) -> dict[str, np.ndarray]:
+    return {key: np.asarray(grid_root[key][:]) for key in GRID_HASH_COLUMNS if key in grid_root}

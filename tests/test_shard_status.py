@@ -52,6 +52,8 @@ def test_check_shard_reasons(tmp_path):
     _write_shard(p, [0], attrs={"config_hash": "abc"})
     assert check_shard(str(p), expected_attrs={"config_hash": "abc"}) is None
     assert check_shard(str(p), expected_attrs={"config_hash": "xyz"}) == "config_hash_mismatch"
+    # Shards written before an attr existed are accepted (legacy runs keep resuming).
+    assert check_shard(str(p), expected_attrs={"input_hash": "new"}) is None
     assert check_shard(str(tmp_path / "nope.zarr")).startswith("unreadable")
 
 

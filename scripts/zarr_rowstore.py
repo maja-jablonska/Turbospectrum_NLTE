@@ -111,9 +111,11 @@ def check_shard(
         if wl.size != expected_wavelengths.size or not np.allclose(wl, expected_wavelengths, atol=1e-4):
             return "wavelength_mismatch"
     if expected_attrs:
+        # A shard without the attr predates it (legacy) and is accepted; one
+        # that records a different value was produced from different inputs.
         for key, want in expected_attrs.items():
-            have = str(root.attrs.get(key, "") or "")
-            if have != str(want):
+            have = root.attrs.get(key)
+            if have not in (None, "") and str(have) != str(want):
                 return f"{key}_mismatch"
 
     ok = np.array([s in SUCCESS_STATUSES for s in statuses], dtype=bool)

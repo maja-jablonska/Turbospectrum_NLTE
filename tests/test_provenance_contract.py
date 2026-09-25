@@ -266,3 +266,35 @@ def test_assert_provenance_fails_on_sentinel():
     fields["git_commit"] = "unknown"
     with pytest.raises(ValueError, match="git_commit"):
         assert_required_provenance_fields(fields, context="test")
+
+
+# -- physics_config_payload / grid_columns_for_hash ---------------------------
+
+
+def test_config_hash_ignores_runtime_paths():
+    import dataclasses
+
+    from provenance_contract import physics_config_payload
+
+    @dataclasses.dataclass
+    class Cfg:
+        lambda_min: float = 5000.0
+        tmp_dir: str = "/scratch/a/tmp"
+        output_dir: str = "/scratch/a/spectra"
+        max_workers: int = 4
+
+    a = canonical_json_sha256(physics_config_payload(Cfg()))
+    b = canonical_json_sha256(physics_config_payload(Cfg(tmp_dir="/x", output_dir="/y", max_workers=1)))
+    c = canonical_json_sha256(physics_config_payload(Cfg(lambda_min=5001.0)))
+    assert a == b
+    assert a != c
+
+
+def test_grid_hash_includes_mu():
+    from provenance_contract import grid_columns_for_hash
+
+    base = {"teff": np.array([5000.0, 5000.0]), "mu": np.array([1.0, 0.5])}
+    other = {"teff": np.array([5000.0, 5000.0]), "mu": np.array([1.0, 0.2])}
+    assert compute_grid_definition_hash(grid_columns_for_hash(base)) != compute_grid_definition_hash(
+        grid_columns_for_hash(other)
+    )

@@ -285,6 +285,25 @@ class MergeSpectraShardsTests(unittest.TestCase):
             self.assertTrue(np.all(np.isfinite(flux)))
             self.assertTrue(np.isnan(merged["flux"].fill_value))
 
+    def test_merge_rejects_shards_from_different_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(tmpdir)
+            zarr.open_group(shards[0], mode="a").attrs["input_hash"] = "a" * 64
+            zarr.open_group(shards[1], mode="a").attrs["input_hash"] = "b" * 64
+            result = self._run_merge(os.path.join(tmpdir, "merged.zarr"), grid_path, shards, "--allow-missing")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("different input sets", result.stderr)
+
+    def test_merge_records_common_input_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(tmpdir)
+            for shard in shards:
+                zarr.open_group(shard, mode="a").attrs["input_hash"] = "c" * 64
+            out = os.path.join(tmpdir, "merged.zarr")
+            result = self._run_merge(out, grid_path, shards)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertEqual(zarr.open_group(out, mode="r").attrs["input_hash"], "c" * 64)
+
     def _write_shard_provenance(self, path: str, input_config_text: str) -> None:
         """Attach a full provenance group to an existing shard zarr."""
         root = zarr.open_group(path, mode="a")

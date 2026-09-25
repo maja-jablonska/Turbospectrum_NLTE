@@ -43,6 +43,7 @@ from provenance_contract import (
     canonical_json_sha256,
     compute_grid_definition_hash,
     is_meaningful_provenance_value,
+    grid_columns_for_hash as _grid_columns_for_hash,
 )
 from spectrum_output import infer_flux_metadata
 from synthesis_validation import SUCCESS_STATUSES
@@ -533,33 +534,6 @@ def _physics_relevant_grid_attrs(attrs: Mapping[str, Any]) -> Dict[str, str]:
     return out
 
 
-def _grid_columns_for_hash(grid_root) -> Dict[str, np.ndarray]:
-    keys = (
-        "teff",
-        "logg",
-        "feh",
-        "turbvel",
-        "t_value",
-        "lam_min",
-        "lam_max",
-        "lam_step",
-        "a",
-        "c",
-        "n",
-        "o",
-        "r",
-        "s",
-        "output_mode",
-        "calculation_mode",
-        "grid_version",
-    )
-    out: Dict[str, np.ndarray] = {}
-    for key in keys:
-        if key in grid_root:
-            out[key] = np.asarray(grid_root[key][:])
-    return out
-
-
 def _compute_merge_physics_hash(
     *,
     wavelengths: np.ndarray,
@@ -978,6 +952,17 @@ def main() -> None:
             sval = str(mu_sampling_attr).strip()
             if sval:
                 mu_sampling_values.add(sval)
+
+    # Shards synthesized from different inputs (config, grid, linelists,
+    # atmospheres) must never be stitched together, partial merge or not.
+    # Shards that predate input_hash carry none and cannot be checked.
+    input_hashes = sorted({snap["input_hash"] for snap in shard_attr_snapshots if snap.get("input_hash")})
+    if len(input_hashes) > 1:
+        raise ValueError(
+            f"Shards were produced from {len(input_hashes)} different input sets "
+            f"(input_hash values {[h[:12] for h in input_hashes]}); re-synthesize stale shards "
+            "(or FORCE_RESTART) before merging."
+        )
 
     missing_rows = np.flatnonzero(~seen_rows)
     if missing_rows.size:
@@ -1521,6 +1506,7 @@ def main() -> None:
             "skipped_invalid_shards": int(len(skipped_invalid_shards)),
             "expected_models": int(row_count),
             "missing_models": int(row_count - out_row_count),
+            "input_hash": input_hashes[0] if input_hashes else "",
         }
         attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})
         root_out.attrs.update(attrs_payload)
