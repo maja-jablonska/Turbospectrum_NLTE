@@ -13,6 +13,7 @@ import zarr
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
+from zarr_compat import create_array, write_string_array, write_string_scalar  # noqa: E402
 from validate_dataset import (
     _contract_fields_from_attrs,
     _missing_contract_fields,
@@ -27,9 +28,9 @@ def _make_valid_shard(path, n_rows=3, n_lambda=10, *, with_provenance=True):
     """Create a valid shard Zarr at the given path."""
     root = zarr.open_group(str(path), mode="w")
     flux = np.random.default_rng(42).random((n_rows, n_lambda)).astype(np.float32) + 0.1
-    root.array("flux", flux)
-    root.array("wavelength", np.linspace(5000, 5100, n_lambda, dtype=np.float32))
-    root.array("params", np.random.default_rng(0).random((n_rows, 3)).astype(np.float32))
+    create_array(root, "flux", data=flux)
+    create_array(root, "wavelength", data=np.linspace(5000, 5100, n_lambda, dtype=np.float32))
+    create_array(root, "params", data=np.random.default_rng(0).random((n_rows, 3)).astype(np.float32))
 
     if with_provenance:
         root.attrs["config_hash"] = "abc123"
@@ -43,13 +44,13 @@ def _make_valid_shard(path, n_rows=3, n_lambda=10, *, with_provenance=True):
         root.attrs["pipeline_version"] = "v2.0"
 
         prov = root.require_group("provenance")
-        prov.array("canonical_config.yaml", np.array("config: true"))
-        prov.array("synthesis_config.yaml", np.array("synth: true"))
-        prov.array("input_config.json", np.array(json.dumps({"input": True})))
-        prov.array("linelist_manifest.json", np.array(json.dumps({"lines": 1})))
-        prov.array("atmosphere_manifest.json", np.array(json.dumps({"atm": 1})))
-        prov.array("software_manifest.json", np.array(json.dumps({"sw": 1})))
-        prov.array("environment.txt", np.array("python==3.11"))
+        write_string_scalar(prov, "canonical_config.yaml", "config: true")
+        write_string_scalar(prov, "synthesis_config.yaml", "synth: true")
+        write_string_scalar(prov, "input_config.json", json.dumps({"input": True}))
+        write_string_scalar(prov, "linelist_manifest.json", json.dumps({"lines": 1}))
+        write_string_scalar(prov, "atmosphere_manifest.json", json.dumps({"atm": 1}))
+        write_string_scalar(prov, "software_manifest.json", json.dumps({"sw": 1}))
+        write_string_scalar(prov, "environment.txt", "python==3.11")
 
     return root
 
@@ -206,8 +207,8 @@ def test_validate_shard_rejects_nan_flux():
         path = Path(tmp) / "spectra_shard_0.zarr"
         root = zarr.open_group(str(path), mode="w")
         flux = np.array([[1.0, np.nan, 3.0]], dtype=np.float32)
-        root.array("flux", flux)
-        root.array("wavelength", np.array([5000, 5050, 5100], dtype=np.float32))
+        create_array(root, "flux", data=flux)
+        create_array(root, "wavelength", data=np.array([5000, 5050, 5100], dtype=np.float32))
         ok, info = validate_shard(path, enforce_provenance=False)
         assert ok is False
         assert info.get("nan") is True
@@ -218,8 +219,8 @@ def test_validate_shard_rejects_inf_flux():
         path = Path(tmp) / "spectra_shard_0.zarr"
         root = zarr.open_group(str(path), mode="w")
         flux = np.array([[1.0, np.inf, 3.0]], dtype=np.float32)
-        root.array("flux", flux)
-        root.array("wavelength", np.array([5000, 5050, 5100], dtype=np.float32))
+        create_array(root, "flux", data=flux)
+        create_array(root, "wavelength", data=np.array([5000, 5050, 5100], dtype=np.float32))
         ok, info = validate_shard(path, enforce_provenance=False)
         assert ok is False
         assert info.get("inf") is True
@@ -230,8 +231,8 @@ def test_validate_shard_rejects_zero_flux():
         path = Path(tmp) / "spectra_shard_0.zarr"
         root = zarr.open_group(str(path), mode="w")
         flux = np.zeros((1, 5), dtype=np.float32)
-        root.array("flux", flux)
-        root.array("wavelength", np.linspace(5000, 5050, 5, dtype=np.float32))
+        create_array(root, "flux", data=flux)
+        create_array(root, "wavelength", data=np.linspace(5000, 5050, 5, dtype=np.float32))
         ok, info = validate_shard(path, enforce_provenance=False)
         assert ok is False
         assert info.get("empty") is True
@@ -241,8 +242,8 @@ def test_validate_shard_rejects_empty_flux():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "spectra_shard_0.zarr"
         root = zarr.open_group(str(path), mode="w")
-        root.array("flux", np.zeros((0, 5), dtype=np.float32))
-        root.array("wavelength", np.linspace(5000, 5050, 5, dtype=np.float32))
+        create_array(root, "flux", data=np.zeros((0, 5), dtype=np.float32))
+        create_array(root, "wavelength", data=np.linspace(5000, 5050, 5, dtype=np.float32))
         ok, info = validate_shard(path, enforce_provenance=False)
         assert ok is False
         assert info.get("empty") is True
@@ -271,7 +272,26 @@ def test_validate_shard_missing_arrays():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "spectra_shard_0.zarr"
         root = zarr.open_group(str(path), mode="w")
-        root.array("params", np.zeros((2, 3)))
+        create_array(root, "params", data=np.zeros((2, 3)))
         ok, info = validate_shard(path, enforce_provenance=False)
         assert ok is False
         assert info.get("missing_arrays") is True
+
+
+def test_validate_shard_rejects_failed_status_rows(tmp_path):
+    root = _make_valid_shard(tmp_path / "shard.zarr", n_rows=3)
+    write_string_array(root, "status", ["success", "failed", "success"])
+    ok, info = validate_shard(tmp_path / "shard.zarr")
+    assert not ok
+    assert info["non_success_rows"] == 1
+    assert info["non_success_statuses"] == ["failed"]
+
+
+def test_validate_shard_chunked_nan_count(tmp_path):
+    root = zarr.open_group(str(tmp_path / "s.zarr"), mode="w")
+    flux = np.ones((10, 4), dtype=np.float32)
+    flux[[2, 7], 1] = np.nan
+    create_array(root, "flux", data=flux, chunks=(3, 4))
+    create_array(root, "wavelength", data=np.arange(4, dtype=np.float32))
+    ok, info = validate_shard(tmp_path / "s.zarr", enforce_provenance=False)
+    assert not ok and info["nan_rows"] == 2

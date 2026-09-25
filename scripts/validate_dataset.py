@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import zarr
+from zarr_rowstore import SUCCESS_STATUSES, decode_statuses
 from provenance_contract import (
     REQUIRED_PROVENANCE_FIELDS,
     is_meaningful_provenance_value,
@@ -100,22 +101,18 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
         # Stream rows safely
         ########################################
 
+        # Read one row chunk at a time (row-by-row reads decompress each
+        # chunk chunk_rows times).
         nan_count = 0
         inf_count = 0
         empty_count = 0
-        for i in range(flux.shape[0]):
-
-            row = flux[i]
-
-            if not np.isfinite(row).all():
-                if np.isnan(row).any():
-                    nan_count += 1
-                if np.isinf(row).any():
-                    inf_count += 1
-                continue
-
-            if np.allclose(row, 0):
-                empty_count += 1
+        step = int(flux.chunks[0]) if flux.chunks else 64
+        for lo in range(0, flux.shape[0], step):
+            block = np.asarray(flux[lo:lo + step])
+            finite = np.isfinite(block).all(axis=1)
+            nan_count += int(np.isnan(block).any(axis=1).sum())
+            inf_count += int(np.isinf(block).any(axis=1).sum())
+            empty_count += int(np.all(np.isclose(block[finite], 0), axis=1).sum())
 
         if nan_count:
             info["nan"] = True
@@ -128,6 +125,13 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
             info["empty_rows"] = empty_count
         if nan_count or inf_count or empty_count:
             return False, info
+
+        if "status" in root:
+            bad = [st for st in decode_statuses(root["status"][...]) if st not in SUCCESS_STATUSES]
+            if bad:
+                info["non_success_rows"] = len(bad)
+                info["non_success_statuses"] = sorted(set(bad))
+                return False, info
 
         ########################################
         # Wavelength consistency

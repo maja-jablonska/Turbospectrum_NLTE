@@ -990,6 +990,11 @@ set +e
 VALIDATE_RC=$?
 set -e
 ALLOW_PARTIAL_MERGE_EFFECTIVE="$(to_bool01 "${ALLOW_PARTIAL_MERGE}")"
+# Dropping failed rows is a partial merge by definition (merge --drop-failed-rows
+# implies --allow-missing), so it cannot coexist with a strict merge policy.
+if [[ "$(to_bool01 "${DROP_FAILED_ROWS:-0}")" == "1" ]]; then
+    ALLOW_PARTIAL_MERGE_EFFECTIVE=1
+fi
 if (( VALIDATE_RC != 0 )); then
     if [[ "${ALLOW_PARTIAL_MERGE_EFFECTIVE}" == "1" ]]; then
         echo "[${TAG}] WARN: validation exited with code ${VALIDATE_RC}; ALLOW_PARTIAL_MERGE=1 so invalid shards will be skipped." >&2
