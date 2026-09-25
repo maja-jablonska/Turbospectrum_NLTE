@@ -711,6 +711,11 @@ def resolve_grid_columns(config: Mapping[str, Any], rng: np.random.Generator, ba
         sampling = "grid" if config.get("axes") else "lhs"
 
     if sampling in _LHS_SAMPLING_ALIASES:
+        # Without a seed, regenerating the grid (FORCE_RESTART, a lost grid
+        # zarr) yields different rows under the same row indices, silently
+        # mismatching any shards already synthesized.
+        if config.get("seed") is None:
+            raise ValueError("grid.seed is required for LHS sampling (so the grid is reproducible)")
         columns = _resolve_ml_sampling(config, rng, base_dir=base_dir)
     elif sampling in _REGULAR_SAMPLING_ALIASES:
         try:
@@ -849,17 +854,22 @@ def _write_zarr_from_columns(columns: Mapping[str, np.ndarray], zarr_path: str, 
             create_array as zc_create_array, write_string_array,
         )
 
-    os.makedirs(os.path.dirname(os.path.abspath(zarr_path)), exist_ok=True)
-    store = zarr_store(zarr_path)
-    comp_kw = compression_kwargs(compressor_cfg)
+    try:
+        from zarr_rowstore import atomic_output
+    except ImportError:
+        from .zarr_rowstore import atomic_output
 
-    root = create_root_group(store, overwrite=True)
-    for name, values in columns.items():
-        if values.dtype == object:
-            write_string_array(root, name, values.tolist(),
-                               chunks=int(chunks), compression_kw=comp_kw)
-        else:
-            zc_create_array(root, name, data=values, chunks=int(chunks), **comp_kw)
+    comp_kw = compression_kwargs(compressor_cfg)
+    # Build beside the final path and rename: the PBS readiness check treats
+    # an existing grid zarr as complete, so a killed write must not leave one.
+    with atomic_output(zarr_path) as write_path:
+        root = create_root_group(zarr_store(write_path), overwrite=True)
+        for name, values in columns.items():
+            if values.dtype == object:
+                write_string_array(root, name, values.tolist(),
+                                   chunks=int(chunks), compression_kw=comp_kw)
+            else:
+                zc_create_array(root, name, data=values, chunks=int(chunks), **comp_kw)
 
 
 def _default_index_parquet_path(*, grid_zarr_path: str | None, grid_csv_path: str | None) -> str:

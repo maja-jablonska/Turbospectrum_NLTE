@@ -52,3 +52,44 @@ class SynthesisPassthroughTests(unittest.TestCase):
         from scripts import run_turbospectrum_shard
 
         self.assertTrue(pipeline_from_config._is_sigkill_returncode(run_turbospectrum_shard.SIGKILL_EXIT_CODE))
+
+
+class GridGenerationSafetyTests(unittest.TestCase):
+    def test_lhs_requires_seed(self) -> None:
+        import numpy as np
+
+        from scripts import generate_grid
+
+        with self.assertRaisesRegex(ValueError, "grid.seed is required"):
+            generate_grid.resolve_grid_columns({"sampling": "lhs", "num_samples": 4}, rng=np.random.default_rng())
+
+    def test_grid_zarr_write_is_atomic(self) -> None:
+        import os
+        import tempfile
+
+        import numpy as np
+
+        from scripts import generate_grid
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "grids", "grid.zarr")
+            generate_grid._write_zarr_from_columns({"teff": np.arange(3.0)}, path, chunks=2, compressor_cfg=None)
+            self.assertTrue(os.path.isdir(path))
+            import zarr_compat
+
+            real_create = zarr_compat.create_array
+
+            def create_then_die(group, name, **kw):  # simulate a job killed mid-write
+                if name == "logg":
+                    raise RuntimeError("killed")
+                return real_create(group, name, **kw)
+
+            cols = {"teff": np.arange(3.0) + 10, "logg": np.arange(3.0)}
+            with mock.patch.object(zarr_compat, "create_array", side_effect=create_then_die):
+                with self.assertRaisesRegex(RuntimeError, "killed"):
+                    generate_grid._write_zarr_from_columns(cols, path, chunks=2, compressor_cfg=None)
+            import zarr
+
+            root = zarr.open_group(path, mode="r")
+            np.testing.assert_array_equal(root["teff"][:], np.arange(3.0))  # previous grid intact
+            self.assertEqual(sorted(os.listdir(os.path.dirname(path))), ["grid.zarr"])

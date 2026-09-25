@@ -203,11 +203,12 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
         if len(written) > 1:
             print(f"Wrote compressed CSV: {written[1]}")
 
+    # Index first: the grid zarr appearing is the "grid ready" signal.
+    gg._write_index_parquet_from_columns(columns, grid_index_parquet)  # type: ignore[attr-defined]
     gg._write_zarr_from_columns(  # type: ignore[attr-defined]
         columns, grid_zarr,
         chunks=grid_io["zarr_chunks"], compressor_cfg=grid_io["zarr_compressor"],
     )
-    gg._write_index_parquet_from_columns(columns, grid_index_parquet)  # type: ignore[attr-defined]
     print(f"Wrote grid Zarr: {grid_zarr}")
     print(f"Wrote grid parameter index: {grid_index_parquet}")
 
