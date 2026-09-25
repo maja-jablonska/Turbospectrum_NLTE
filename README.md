@@ -442,7 +442,6 @@ The repository now uses one shared shard-layout rule across the PBS wrappers via
 
 - `SHARD_COUNT` means “split the dataset into this many shards”.
 - `ROWS_PER_SHARD` means “target this many rows per shard”.
-- `CHUNK_ROWS` in `rechunk_array_example.pbs` is the rechunking equivalent of `ROWS_PER_SHARD`.
 - `chunk_rows` in pipeline config or synthesis scripts controls Zarr storage chunking, not how many PBS shards/jobs run.
 
 The wrappers resolve the missing value with ceiling division:
@@ -454,7 +453,6 @@ shard_count    = ceil(row_count / rows_per_shard)
 
 If both are supplied, they must cover the full dataset. If neither is supplied:
 
-- `rechunk_array_example.pbs` defaults to `CHUNK_ROWS=1500`
 - `turbospectrum_pipeline_example.pbs` (the single script for both LHS and regular grids) reads `runtime.shard_count` / `runtime.rows_per_shard` from config, or `SHARD_COUNT` / `ROWS_PER_SHARD` from the environment
 - `turbospectrum_example_array.pbs` requires one of `SHARD_COUNT` or `ROWS_PER_SHARD`
 
@@ -475,13 +473,14 @@ SHARD_COUNT=10
 ARRAY_RANGE=0-9
 ```
 
-For rechunking on PBS, you can now submit from the login node with `bash` and let the script compute and submit the correct array itself:
+For rechunking on PBS, run the wrapper with `bash` on a login node; it submits
+init -> an array of `TASKS` -> finalize, chained with `afterok`, all writing into one
+final store (`scripts/rechunk_zarr.py`):
 
 ```bash
 INPUT_ZARR=/g/data/y89/mj8805/your_input.zarr \
-OUTPUT_DIR=/scratch/mk27/$USER/harps2_rechunked \
-SHARD_COUNT=10 \
-PYTHON=$(which python) \
+OUTPUT_ZARR=/scratch/mk27/$USER/harps2_ml.zarr \
+TASKS=10 \
 bash rechunk_array_example.pbs
 ```
 

@@ -1,129 +1,63 @@
 #!/bin/bash
-#PBS -N rechunk_harps
+#PBS -N rechunk
 #PBS -P mk27
 #PBS -q rsaa
-#PBS -l ncpus=16
+#PBS -l ncpus=1
 #PBS -l mem=16GB
 #PBS -l walltime=02:00:00
 #PBS -l storage=scratch/y89+scratch/dg97+scratch/mk27+gdata/y89
 #PBS -r y
 #PBS -j oe
-#PBS -M maja.jablonska@anu.edu.au
 #PBS -m bae
+
+# Rechunk a merged spectra store into the ML layout (scripts/rechunk_zarr.py).
+# Replaces rechunk_worker.py + merge_rechunked.py: tasks write straight into
+# the final store, so there is no second concatenation copy.
+#
+#   From a login node — submits init -> array of TASKS -> finalize, chained
+#   with afterok dependencies:
+#     INPUT_ZARR=/scratch/.../merged.zarr OUTPUT_ZARR=/scratch/.../ml.zarr TASKS=16 \
+#         bash rechunk_array_example.pbs
+#
+#   As one job (small stores):
+#     qsub -v INPUT_ZARR=...,OUTPUT_ZARR=...,RECHUNK_STAGE=all rechunk_array_example.pbs
+#
+# Knobs: TASKS (default 16), QSUB_BIN, PYTHON_BIN / MAMBA_ENV_NAME.
+# Array tasks are 0-based (-J 0-(TASKS-1)); extra tasks exit 0.
 
 set -euo pipefail
 
-WORKDIR="${PBS_O_WORKDIR:-$(pwd)}"
-cd "${WORKDIR}"
+: "${INPUT_ZARR:?Need INPUT_ZARR}"
+: "${OUTPUT_ZARR:?Need OUTPUT_ZARR}"
+TASKS="${TASKS:-16}"
+QSUB_BIN="${QSUB_BIN:-qsub}"
 
-SCRIPT_BASENAME="$(basename "${BASH_SOURCE[0]}")"
 if [[ -n "${PBS_O_WORKDIR:-}" ]]; then
-    SCRIPT_PATH="${PBS_O_WORKDIR}/${SCRIPT_BASENAME}"
+    REPO="${REPO:-${PBS_O_WORKDIR}}"
 else
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-    SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_BASENAME}"
+    REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)}"
 fi
-REPO_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" >/dev/null 2>&1 && pwd)"
-LAYOUT_HELPER="${REPO_DIR}/scripts/resolve_shard_layout.py"
+SCRIPT_PATH="${REPO}/rechunk_array_example.pbs"
+# shellcheck source=scripts/pbs_env.sh
+source "${REPO}/scripts/pbs_env.sh"
+RECHUNK=("${PYTHON}" "${REPO}/scripts/rechunk_zarr.py" -i "${INPUT_ZARR}" -o "${OUTPUT_ZARR}" --tasks "${TASKS}")
 
-# -------- REQUIRED --------
-: "${INPUT_ZARR:?Need INPUT_ZARR via -v}"
-: "${OUTPUT_DIR:?Need OUTPUT_DIR via -v}"
-
-# -------- OPTIONAL --------
-DEFAULT_CHUNK_ROWS=1500
-CHUNK_ROWS_RAW=${CHUNK_ROWS:-}
-SHARD_COUNT_RAW=${SHARD_COUNT:-}
-QSUB_BIN=${QSUB_BIN:-qsub}
-
-# -------- PYTHON --------
-PYTHON=${PYTHON:-/scratch/y89/mj8805/miniforge/envs/astro/bin/python}
-
-if [[ ! -f "${LAYOUT_HELPER}" ]]; then
-    echo "[rechunk] ERROR: shard layout helper not found: ${LAYOUT_HELPER}" >&2
-    exit 1
-fi
-
-LAYOUT_CMD=(
-    "${PYTHON}" "${LAYOUT_HELPER}"
-    --zarr-path "${INPUT_ZARR}"
-    --row-keys "flux,continuum,params,global_index"
-    --default-rows-per-shard "${DEFAULT_CHUNK_ROWS}"
-)
-if [[ -n "${CHUNK_ROWS_RAW}" ]]; then
-    LAYOUT_CMD+=(--rows-per-shard "${CHUNK_ROWS_RAW}")
-fi
-if [[ -n "${SHARD_COUNT_RAW}" ]]; then
-    LAYOUT_CMD+=(--shard-count "${SHARD_COUNT_RAW}")
-fi
-
-LAYOUT_OUTPUT="$("${LAYOUT_CMD[@]}")"
-while IFS='=' read -r key value; do
-    case "${key}" in
-        ROW_COUNT) ROW_COUNT="${value}" ;;
-        ROWS_PER_SHARD) CHUNK_ROWS="${value}" ;;
-        SHARD_COUNT) SHARD_COUNT="${value}" ;;
-        ARRAY_RANGE) ARRAY_RANGE="${value}" ;;
-    esac
-done <<< "${LAYOUT_OUTPUT}"
-
-if [[ -z "${PBS_ARRAY_INDEX:-}" ]]; then
-    if ! command -v "${QSUB_BIN}" >/dev/null 2>&1; then
-        echo "[rechunk] ERROR: qsub executable '${QSUB_BIN}' not found." >&2
-        exit 1
-    fi
-
-    echo "====================================="
-    echo "Submitting rechunk array"
-    echo "INPUT_ZARR  = $INPUT_ZARR"
-    echo "OUTPUT_DIR  = $OUTPUT_DIR"
-    echo "ROW_COUNT   = $ROW_COUNT"
-    echo "CHUNK_ROWS  = $CHUNK_ROWS"
-    echo "SHARD_COUNT = $SHARD_COUNT"
-    echo "ARRAY_RANGE = $ARRAY_RANGE"
-    echo "PYTHON      = $PYTHON"
-    echo "SCRIPT_PATH = $SCRIPT_PATH"
-    echo "====================================="
-
-    "${QSUB_BIN}" \
-        -J "${ARRAY_RANGE}" \
-        -v "INPUT_ZARR=${INPUT_ZARR},OUTPUT_DIR=${OUTPUT_DIR},CHUNK_ROWS=${CHUNK_ROWS},PYTHON=${PYTHON},SHARD_COUNT=${SHARD_COUNT},QSUB_BIN=${QSUB_BIN}" \
-        "${SCRIPT_PATH}"
+if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
+    "${RECHUNK[@]:0:2}" task "${RECHUNK[@]:2}" --task-index "${PBS_ARRAY_INDEX}"
     exit 0
 fi
 
-if ! [[ "${PBS_ARRAY_INDEX}" =~ ^[0-9]+$ ]] || (( PBS_ARRAY_INDEX < 0 )); then
-    echo "[rechunk] ERROR: PBS_ARRAY_INDEX must be a non-negative integer, got '${PBS_ARRAY_INDEX:-}'." >&2
-    exit 1
-fi
-
-if (( PBS_ARRAY_INDEX >= SHARD_COUNT )); then
-    echo "[rechunk] INFO: array task ${PBS_ARRAY_INDEX} is outside SHARD_COUNT=${SHARD_COUNT}; exiting cleanly."
+STAGE="${RECHUNK_STAGE:-}"
+if [[ -z "${STAGE}" && -z "${PBS_JOBID:-}" ]]; then
+    # Login node: submit the chain.
+    VARS="INPUT_ZARR=${INPUT_ZARR},OUTPUT_ZARR=${OUTPUT_ZARR},TASKS=${TASKS},REPO=${REPO}"
+    [[ -n "${PYTHON_BIN:-}" ]] && VARS+=",PYTHON_BIN=${PYTHON_BIN}"
+    "${RECHUNK[@]:0:2}" plan "${RECHUNK[@]:2}"
+    init_id="$("${QSUB_BIN}" -v "${VARS},RECHUNK_STAGE=init" "${SCRIPT_PATH}")"
+    array_id="$("${QSUB_BIN}" -W depend=afterok:"${init_id}" -J "0-$((TASKS - 1))" -v "${VARS}" "${SCRIPT_PATH}")"
+    final_id="$("${QSUB_BIN}" -W depend=afterok:"${array_id}" -v "${VARS},RECHUNK_STAGE=finalize" "${SCRIPT_PATH}")"
+    echo "[rechunk] submitted init=${init_id} tasks=${array_id} finalize=${final_id}"
     exit 0
 fi
 
-# -------- JOB INDEX --------
-JOB_ID=${PBS_ARRAY_INDEX}
-START=$(( JOB_ID * CHUNK_ROWS ))
-END=$(( START + CHUNK_ROWS ))
-
-echo "====================================="
-echo "Job $JOB_ID"
-echo "INPUT_ZARR = $INPUT_ZARR"
-echo "OUTPUT_DIR = $OUTPUT_DIR"
-echo "ROW_COUNT  = $ROW_COUNT"
-echo "SHARDS     = $SHARD_COUNT"
-echo "ROWS       = [$START:$END]"
-echo "PYTHON     = $PYTHON"
-echo "====================================="
-
-mkdir -p "$OUTPUT_DIR"
-
-$PYTHON rechunk_worker.py \
-    "$INPUT_ZARR" \
-    "$OUTPUT_DIR" \
-    "$START" \
-    "$END" \
-    "$JOB_ID"
-
-echo "✅ Job $JOB_ID done"
+"${RECHUNK[@]:0:2}" "${STAGE:-all}" "${RECHUNK[@]:2}"

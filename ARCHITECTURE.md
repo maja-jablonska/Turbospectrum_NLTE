@@ -170,7 +170,7 @@ The pipeline uses different chunk layouts at each stage, tuned for that stage's 
 |-------|------|--------------------|-----------|------------------|
 | Shard synthesis | `run_turbospectrum_shard.py` | `_SHARD_ROW_CHUNK = 64` | 64 | min(65536, L) |
 | Merge | `merge_spectra_shards.py` | `--chunk-rows` (default 128) | 128 | full L |
-| Rechunk (ML) | `rechunk_worker.py` | `ROW_CHUNK = 128`, `LAMBDA_CHUNK = 8192` | 128 | 8192 |
+| Rechunk (ML) | `scripts/rechunk_zarr.py` | `ROW_CHUNK = 128`, `LAMBDA_CHUNK = 8192` | 128 | 8192 |
 
 **Why they differ:**
 

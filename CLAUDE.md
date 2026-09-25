@@ -108,9 +108,9 @@ Generated artifacts belong under `runs/`, never under `scripts/`. Legacy root-le
 |-----------------|-------------------------------|----------------------------|-----------|-----------------|
 | Shard synthesis | `run_turbospectrum_shard.py`  | `_SHARD_ROW_CHUNK = 64`    | 64        | min(65536, L)   |
 | Merge           | `merge_spectra_shards.py`     | `--chunk-rows` default 128 | 128       | full L          |
-| Rechunk (ML)    | `rechunk_worker.py`           | `ROW_CHUNK=128, LAMBDA_CHUNK=8192` | 128 | 8192       |
+| Rechunk (ML)    | `scripts/rechunk_zarr.py`     | `ROW_CHUNK=128, LAMBDA_CHUNK=8192` | 128 | 8192       |
 
-PBS wrappers default `MERGE_CHUNK_ROWS=128` to match. Pipeline config `runtime.chunk_rows` can override.
+PBS wrappers default `MERGE_CHUNK_ROWS=128` to match (override via the `MERGE_CHUNK_ROWS` env var). Pipeline config `runtime.chunk_rows` only affects full-mode (`--synthesis-mode full`) output, not the sharded PBS path.
 
 **Shard layout rules** (`scripts/resolve_shard_layout.py` is the shared resolver):
 - `SHARD_COUNT` = split dataset into N shards

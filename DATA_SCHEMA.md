@@ -74,7 +74,7 @@ Shard output  →  Merged output  →  Rechunked (ML-ready)
 |-------|--------|-----------|------------------|-----------|
 | Shard synthesis | `_SHARD_ROW_CHUNK` in `run_turbospectrum_shard.py` | 64 | min(65536, L) | Balance write granularity vs inode count |
 | Merge | `--chunk-rows` in `merge_spectra_shards.py` (default 128) | 128 | full L | Row-major reads; matches PBS `MERGE_CHUNK_ROWS` |
-| Rechunk | `ROW_CHUNK`, `LAMBDA_CHUNK` in `rechunk_worker.py` | 128 | 8192 | Cache-friendly mini-batch I/O for GPU streaming |
+| Rechunk | `ROW_CHUNK`, `LAMBDA_CHUNK` in `scripts/rechunk_zarr.py` | 128 | 8192 | Cache-friendly mini-batch I/O for GPU streaming |
 
 Metadata is consolidated at merge time via `zarr.consolidate_metadata()`.
 
@@ -526,14 +526,17 @@ Recommended:
 chunks = (1024–4096 samples, full_lambda)
 ```
 
-The current rechunk step (`rechunk_worker.py` via `rechunk_array_example.pbs`) uses:
+The current rechunk step (`scripts/rechunk_zarr.py` via `rechunk_array_example.pbs`) uses:
 
 ```
-ROW_CHUNK    = 128    # rows per chunk
+ROW_CHUNK    = 128    # rows per chunk (all row-aligned 2D arrays)
 LAMBDA_CHUNK = 8192   # wavelength points per chunk
-PARAM_CHUNK  = 512    # param matrix row chunk
-ONE_D_CHUNK  = 1024   # 1D auxiliary array chunk
+ONE_D_CHUNK  = 1024   # 1D row-aligned array chunk
 ```
+
+Array tasks own disjoint row ranges that are multiples of lcm(ROW_CHUNK, ONE_D_CHUNK)
+and write directly into the final store; `finalize` publishes it only when every task
+has completed.
 
 Why?
 
