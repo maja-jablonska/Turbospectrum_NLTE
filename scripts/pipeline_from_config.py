@@ -2,9 +2,9 @@
 """One-command pipeline: generate grid (CSV/Zarr) + synthesize spectra (Zarr).
 
 This script is intentionally simple glue around:
-- `scripts/generate_grid.py` (grid generation)
-- `scripts/synthesize_spectra_from_zarr.py` (single-job multiprocessing synthesis)
-- `scripts/run_turbospectrum_shard.py` (sharded synthesis)
+- `scripts/generate_grid.py` (grid generation, LHS / regular / rerun_csv)
+- `scripts/run_turbospectrum_shard.py` (the one synthesis engine)
+- `scripts/merge_spectra_shards.py` (``--synthesis-mode full`` = one shard + merge)
 
 It exists to avoid managing separate config files for grid sampling vs synthesis.
 """
@@ -15,6 +15,7 @@ import argparse
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -315,6 +316,8 @@ def _write_temp_turbospectrum_config(
             synth_params = ts_cfg.setdefault("synthesis_parameters", {})
             ms = synth_params.setdefault("mu_sampling", {})
             ms["points"] = points
+            ms["min"], ms["max"] = points[0], points[-1]
+            ms.setdefault("count", 1)
             if str(ms.get("mode", "")).strip().lower() in {"", "none"}:
                 ms["mode"] = "nearest"  # each row reads its own mu column
             print(f"[pipeline] Shared mu axis ({len(points)} points): one bsyn call per physical point.")
@@ -496,22 +499,16 @@ def main() -> None:
 
     ts_cfg_path = _write_temp_turbospectrum_config(pipeline_cfg, config_dir=cfg_dir, scratch=scratch, grid_zarr=grid_zarr)
 
-    if args.synthesis_mode == "full":
-        out_zarr = _abs_output_from(run_root, cfg_dir, outputs.get("spectra_zarr"))
-        if not out_zarr:
-            raise ValueError("outputs.spectra_zarr is required for synthesis-mode=full")
-        _ensure_parent(out_zarr)
+    def _shard_cmd(shard_index: int, shard_count: int, out_zarr: str) -> list[str]:
+        # run_turbospectrum_shard.py uses strided sharding (index::count).
         cmd = [
             sys.executable,
-            os.path.join(SCRIPT_DIR, "synthesize_spectra_from_zarr.py"),
-            "--grid-zarr",
-            grid_zarr,
-            "--config",
-            ts_cfg_path,
-            "--output-zarr",
-            out_zarr,
-            "--chunk-rows",
-            str(chunk_rows),
+            os.path.join(SCRIPT_DIR, "run_turbospectrum_shard.py"),
+            "--grid-zarr", grid_zarr,
+            "--config", ts_cfg_path,
+            "--output-zarr", out_zarr,
+            "--shard-index", str(shard_index),
+            "--shard-count", str(shard_count),
         ]
         if workers:
             cmd += ["--workers", str(workers)]
@@ -521,8 +518,30 @@ def main() -> None:
             cmd.append("--no-scratch")
         if args.output_tmp:
             cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
-        cmd += _synthesis_passthrough_args(runtime, allow_incomplete, sharded=False)
-        _run(cmd)
+        return cmd + _synthesis_passthrough_args(runtime, allow_incomplete, sharded=True)
+
+    if args.synthesis_mode == "full":
+        # One engine for every mode: "full" is the whole grid as a single
+        # shard, merged exactly as a PBS run would be, so both produce the
+        # same schema and provenance.
+        out_zarr = _abs_output_from(run_root, cfg_dir, outputs.get("spectra_zarr"))
+        if not out_zarr:
+            raise ValueError("outputs.spectra_zarr is required for synthesis-mode=full")
+        _ensure_parent(out_zarr)
+        shard_zarr = f"{out_zarr}.shard_0_of_1.zarr"
+        _run(_shard_cmd(0, 1, shard_zarr))
+        merge_cmd = [
+            sys.executable,
+            os.path.join(SCRIPT_DIR, "merge_spectra_shards.py"),
+            "--shard", shard_zarr,
+            "--grid-zarr", grid_zarr,
+            "--output-zarr", out_zarr,
+            "--chunk-rows", str(chunk_rows),
+        ]
+        if allow_incomplete:
+            merge_cmd.append("--allow-incomplete-provenance")
+        subprocess.run(merge_cmd, check=True)
+        shutil.rmtree(shard_zarr, ignore_errors=True)
         print(f"Wrote synthesized spectra Zarr: {out_zarr}")
         return
 
@@ -538,33 +557,7 @@ def main() -> None:
         raise ValueError("outputs.spectra_shard_template is required for synthesis-mode=sharded")
     out_zarr = _abs_output_from(run_root, cfg_dir, str(template).format(shard_index=shard_index))
     _ensure_parent(out_zarr)
-
-    # Use the existing shard runner (available on HPC deployments).
-    # Note: run_turbospectrum_shard.py uses strided sharding (index::count).
-    cmd = [
-        sys.executable,
-        os.path.join(SCRIPT_DIR, "run_turbospectrum_shard.py"),
-        "--grid-zarr",
-        grid_zarr,
-        "--config",
-        ts_cfg_path,
-        "--output-zarr",
-        out_zarr,
-        "--shard-index",
-        str(shard_index),
-        "--shard-count",
-        str(shard_count),
-    ]
-    if workers:
-        cmd += ["--workers", str(workers)]
-    if scratch:
-        cmd += ["--scratch", str(scratch)]
-    if args.no_scratch:
-        cmd.append("--no-scratch")
-    if args.output_tmp:
-        cmd += ["--output-tmp", os.path.abspath(args.output_tmp)]
-    cmd += _synthesis_passthrough_args(runtime, allow_incomplete, sharded=True)
-    _run(cmd)
+    _run(_shard_cmd(shard_index, shard_count, out_zarr))
     print(f"Wrote shard spectra Zarr: {out_zarr}")
 
 

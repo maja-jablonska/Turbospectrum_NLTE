@@ -22,7 +22,7 @@ from scripts.run_turbospectrum import (
     _resolve_nlte_ascii_runtime_info,
     get_synthesis_output_stem_from_params,
 )
-from scripts.synthesize_spectra_from_zarr import _build_tasks
+from scripts.run_turbospectrum_shard import _build_task_batches
 from scripts.synthesize_regular_grid import _build_regular_columns
 
 
@@ -376,7 +376,7 @@ class NlteAsciiDepartureTests(unittest.TestCase):
             self.assertIn("nlte_ascii_departure_dir", columns)
             self.assertEqual(columns["nlte_ascii_departure_species"].tolist(), ["Fe", "Fe"])
 
-    def test_build_tasks_preserves_nlte_ascii_control_keys(self) -> None:
+    def test_task_batches_preserve_nlte_ascii_control_keys(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             selector = normalize_nlte_ascii_selector(
                 directory=tmpdir,
@@ -394,12 +394,13 @@ class NlteAsciiDepartureTests(unittest.TestCase):
                 **build_nlte_ascii_selector_columns(1, selector),
             }
 
-            tasks = _build_tasks(
-                1,
+            batches, _ = _build_task_batches(
+                np.asarray([0]),
                 column_data,
-                SimpleNamespace(output_mode="Flux", nlte=True),
+                batch_size=1,
+                config=SimpleNamespace(output_mode="Flux", nlte=True, mu_sampling={}),
             )
-            row_values = tasks[0][1]
+            row_values = batches[0][0][1]
 
             self.assertEqual(row_values["nlte_ascii_departure_dir"], tmpdir)
             self.assertEqual(row_values["nlte_ascii_departure_species"], "Fe")

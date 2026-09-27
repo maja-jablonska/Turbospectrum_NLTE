@@ -166,7 +166,7 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
         if not isinstance(mu_sampling, dict):
             mu_sampling = {}
         # Do NOT force an Intensity default of mode="random" here. The per-row
-        # consumers (synthesize_spectra_from_zarr.py / run_turbospectrum_shard.py)
+        # consumer (run_turbospectrum_shard.py)
         # pick "nearest" when the row carries a target mu and "random" only when
         # it does not. Forcing "random" at load time would defeat that and make
         # each row select an arbitrary mu instead of its requested one.

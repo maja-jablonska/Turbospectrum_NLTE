@@ -13,9 +13,9 @@ from scripts.run_turbospectrum import (
     _normalize_config_dict,
     _write_mu_points_file,
 )
-from scripts.synthesize_regular_grid import _materialize_synthesis_config
-from scripts.synthesize_spectra_from_zarr import _choose_mu_indices
-import scripts.synthesize_spectra_from_zarr as synth_zarr
+from scripts.pipeline_from_config import _write_temp_turbospectrum_config
+from scripts.run_turbospectrum_shard import _build_task_batches, _choose_mu_indices
+import scripts.run_turbospectrum_shard as shard_runner
 
 
 class MuSamplingTests(unittest.TestCase):
@@ -69,7 +69,7 @@ class MuSamplingTests(unittest.TestCase):
 
         chosen, mu_summary = _choose_mu_indices(
             mu_points,
-            row_index=7,
+            global_index=7,
             cfg=cfg,
             target_mu=0.6,
         )
@@ -97,10 +97,10 @@ class MuSamplingTests(unittest.TestCase):
         )
 
         _, mu_low = _choose_mu_indices(
-            mu_points, row_index=0, cfg=cfg, target_mu=0.25, reduce_mode="first"
+            mu_points, global_index=0, cfg=cfg, target_mu=0.25, reduce_mode="first"
         )
         _, mu_high = _choose_mu_indices(
-            mu_points, row_index=1, cfg=cfg, target_mu=0.82, reduce_mode="first"
+            mu_points, global_index=1, cfg=cfg, target_mu=0.82, reduce_mode="first"
         )
 
         self.assertAlmostEqual(mu_low, 0.2, places=5)
@@ -117,7 +117,7 @@ class MuSamplingTests(unittest.TestCase):
         )
         mu_points = np.asarray([0.05, 0.3, 0.55, 0.85], dtype=np.float32)
         chosen, mu_summary = _choose_mu_indices(
-            mu_points, row_index=0, cfg=cfg, target_mu=0.6
+            mu_points, global_index=0, cfg=cfg, target_mu=0.6
         )
         np.testing.assert_array_equal(chosen, np.asarray([2], dtype=np.int64))
         self.assertAlmostEqual(mu_summary, 0.55, places=6)
@@ -168,7 +168,7 @@ class MuSamplingTests(unittest.TestCase):
         mu_points = np.asarray([0.1, 0.3, 0.5, 0.7, 0.9], dtype=np.float32)
 
         _, mu_mean = _choose_mu_indices(
-            mu_points, row_index=0, cfg=cfg, target_mu=0.45, reduce_mode="mean"
+            mu_points, global_index=0, cfg=cfg, target_mu=0.45, reduce_mode="mean"
         )
         # Three nearest to 0.45: 0.5, 0.3, 0.7 → mean = 0.5.
         self.assertAlmostEqual(mu_mean, 0.5, places=5)
@@ -204,7 +204,7 @@ class MuSamplingTests(unittest.TestCase):
                 tmp_dir=tmpdir,
                 mu_sampling={"mode": "nearest", "count": 1, "min": 0.0, "max": 1.0},
             )
-            synth_zarr._init_worker(config)
+            shard_runner._init_worker(config)
 
             results = []
             for target_mu in (0.2, 0.8):
@@ -222,7 +222,7 @@ class MuSamplingTests(unittest.TestCase):
                     "mu": target_mu,
                 }
                 with mock.patch.object(
-                    synth_zarr,
+                    shard_runner,
                     "run_single_synthesis",
                     return_value={
                         "status": "success",
@@ -232,7 +232,7 @@ class MuSamplingTests(unittest.TestCase):
                         "log_path": "",
                     },
                 ):
-                    result = synth_zarr._synthesis_task((0, row_values))
+                    result = shard_runner._synthesis_task([(0, row_values)])[0]
                 results.append(result)
 
             mu_sel_02 = results[0]["mu_selected"]
@@ -302,41 +302,38 @@ class ExactMuPointsTests(unittest.TestCase):
             json.dump({"synthesis_parameters": {"output_mode": "Intensity"}}, fh)
         return base
 
+    def _runtime_mu_sampling(self, tmp, mu_values):
+        import zarr
+
+        from scripts.zarr_compat import create_array, write_string_array
+
+        grid = os.path.join(tmp, "grid.zarr")
+        root = zarr.open_group(grid, mode="w")
+        create_array(root, "mu", data=np.asarray(mu_values, dtype=np.float64))
+        write_string_array(root, "output_mode", ["Intensity"] * len(mu_values))
+        pipeline_cfg = {"turbospectrum": {"config": self._write_base_config(tmp)}}
+        out = _write_temp_turbospectrum_config(pipeline_cfg, config_dir=tmp, scratch=tmp, grid_zarr=grid)
+        with open(out, encoding="utf-8") as fh:
+            return json.load(fh)["synthesis_parameters"].get("mu_sampling", {})
+
     def test_regular_grid_sets_exact_mu_points(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            out = _materialize_synthesis_config(
-                base_config_path=self._write_base_config(tmp),
-                run_root=tmp,
-                mu_axis=np.array([0.8, 0.2, 0.8, 0.5]),
-            )
-            with open(out, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-            ms = cfg["synthesis_parameters"]["mu_sampling"]
+            ms = self._runtime_mu_sampling(tmp, [0.8, 0.2, 0.8, 0.5])
             self.assertEqual(ms["points"], [0.2, 0.5, 0.8])
             self.assertAlmostEqual(ms["min"], 0.2)
             self.assertAlmostEqual(ms["max"], 0.8)
 
-    def test_regular_grid_rejects_more_than_30_mu(self) -> None:
+    def test_more_than_30_mu_keeps_per_row_mu_points(self) -> None:
+        # bsyn takes at most 30 MU-POINTS; larger axes fall back to one exact
+        # MU-POINTS entry per row instead of a shared axis.
         with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(ValueError):
-                _materialize_synthesis_config(
-                    base_config_path=self._write_base_config(tmp),
-                    run_root=tmp,
-                    mu_axis=np.linspace(0.02, 1.0, 31),
-                )
+            self.assertNotIn("points", self._runtime_mu_sampling(tmp, np.linspace(0.02, 1.0, 31)))
 
     def test_regular_grid_sets_nearest_mode_for_mu_axis(self) -> None:
-        # mu_range rows are explicit per-mu targets; the runtime config must
-        # select "nearest" so each row keeps its own mu (not "random"/"none").
+        # mu rows are explicit per-mu targets; the runtime config must select
+        # "nearest" so each row keeps its own mu (not "random"/"none").
         with tempfile.TemporaryDirectory() as tmp:
-            out = _materialize_synthesis_config(
-                base_config_path=self._write_base_config(tmp),
-                run_root=tmp,
-                mu_axis=np.array([0.15, 0.45, 0.75]),
-            )
-            with open(out, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-            self.assertEqual(cfg["synthesis_parameters"]["mu_sampling"]["mode"], "nearest")
+            self.assertEqual(self._runtime_mu_sampling(tmp, [0.15, 0.45, 0.75])["mode"], "nearest")
 
 
 class SynthesisDedupTests(unittest.TestCase):
@@ -351,38 +348,33 @@ class SynthesisDedupTests(unittest.TestCase):
             "output_mode": "Intensity", "calculation_mode": "LTE", "mode": "1D", "mu": mu,
         }
 
-    def test_group_tasks_dedups_shared_mu_rows(self) -> None:
+    @staticmethod
+    def _columns(rows):
+        keys = rows[0].keys()
+        return {k: np.asarray([r[k] for r in rows], dtype=object if isinstance(rows[0][k], str) else None)
+                for k in keys}
+
+    def test_batches_dedup_shared_mu_rows(self) -> None:
         cfg = TurbospectrumConfig(
             project_root="/tmp",
             output_mode="Intensity",
             mu_sampling={"mode": "nearest", "points": [0.15, 0.45, 0.75], "min": 0.15, "max": 0.75},
         )
-        tasks = []
-        i = 0
-        for teff in (5500, 6000):
-            for mu in (0.15, 0.45, 0.75):
-                tasks.append((i, self._row(teff, mu)))
-                i += 1
-        groups = synth_zarr._group_tasks(tasks, cfg)
-        self.assertEqual(len(groups), 2)  # 6 rows -> 2 physical points
-        self.assertTrue(all(len(g) == 3 for g in groups))
-        for g in groups:
-            self.assertEqual(len({t[1]["teff"] for t in g}), 1)  # one star per group
+        rows = [self._row(teff, mu) for teff in (5500, 6000) for mu in (0.15, 0.45, 0.75)]
+        # batch_size=3: each physical point's 3 mu rows form one whole batch.
+        batches, _ = _build_task_batches(np.arange(6), self._columns(rows), batch_size=3, config=cfg)
+        self.assertEqual(len(batches), 2)  # 6 rows -> 2 physical points
+        for batch in batches:
+            self.assertEqual(len({row["teff"] for _g, row in batch}), 1)  # one star per batch
 
-    def test_group_tasks_singletons_without_shared_axis(self) -> None:
-        # No shared mu axis (e.g. Flux, or per-row LHS mu) => one group per row.
+    def test_batches_singletons_without_shared_axis(self) -> None:
+        # No shared mu axis (e.g. Flux) => rows are not tied together.
         cfg = TurbospectrumConfig(project_root="/tmp", output_mode="Flux", mu_sampling={})
-        tasks = [
-            (0, {"teff": 5500, "logg": 4.5, "feh": 0.0, "turbvel": "01", "t_value": "01",
-                 "lam_min": 5000.0, "lam_max": 5010.0, "lam_step": 0.01,
-                 "output_mode": "Flux", "calculation_mode": "LTE", "mode": "1D"}),
-            (1, {"teff": 6000, "logg": 4.5, "feh": 0.0, "turbvel": "01", "t_value": "01",
-                 "lam_min": 5000.0, "lam_max": 5010.0, "lam_step": 0.01,
-                 "output_mode": "Flux", "calculation_mode": "LTE", "mode": "1D"}),
-        ]
-        groups = synth_zarr._group_tasks(tasks, cfg)
-        self.assertEqual(len(groups), 2)
-        self.assertTrue(all(len(g) == 1 for g in groups))
+        rows = [dict(self._row(t, 0.5), output_mode="Flux") for t in (5500, 6000)]
+        for r in rows:
+            r.pop("mu")
+        batches, _ = _build_task_batches(np.arange(2), self._columns(rows), batch_size=1, config=cfg)
+        self.assertEqual([len(b) for b in batches], [1, 1])
 
 
 class IntensityModeLoadTests(unittest.TestCase):

@@ -141,7 +141,7 @@ Two NLTE workflows share this one mental model:
 
   Point the config at the per-species directory (e.g. `…/Fe`); see `config_regular_grid_nlte_fe.example.json`. The export tool itself is `scripts/export_nlte_grid_ascii.py` if you need to run it standalone.
 
-The pre-synthesis preflight runs in both `pipeline_from_config.py` and `synthesize_regular_grid.py`; bypass it with `--skip-nlte-preflight`.
+The pre-synthesis preflight runs in `pipeline_from_config.py`; bypass it with `--skip-nlte-preflight`.
 
 ## Downloading Data
 

@@ -8,7 +8,7 @@
     "NLTE COST: Fe NLTE over the full 3780-6910 A window (~313k lambda points) is expensive. The grid below is deliberately tiny (3 x 2 x 2 = 12 points). Scale up cautiously and prefer chunked shards on HPC."
   ],
   "_note": [
-    "Use with: python scripts/synthesize_regular_grid.py --config-json configs/pipeline/config_harps_nlte.example.json",
+    "Use with: python scripts/pipeline_from_config.py --config configs/pipeline/config_harps_nlte.example.json (or qsub turbospectrum_pipeline_example.pbs)",
     "This example focuses on the Fe NLTE ASCII-departure selection workflow at HARPS resolution.",
     "Update the Turbospectrum path overrides for your local checkout or cluster environment before a full synthesis run.",
     "When synthesized, turbvel is preserved as a numeric parameter column alongside vmicro in the final spectra Zarr."
@@ -60,7 +60,7 @@
   },
   "turbospectrum": {
     "_note": [
-      "Base synthesis runtime config used by synthesize_spectra_from_zarr.py.",
+      "Base synthesis runtime config used by run_turbospectrum_shard.py.",
       "overrides turns on NLTE Fe, sets the HARPS resolution, and points at the repository NLTE info file."
     ],
     "config": "../synthesis/config_sample_comprehensive.json",

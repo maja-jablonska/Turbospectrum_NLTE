@@ -11,10 +11,9 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from scripts.merge_spectra_shards import _build_params_matrix as build_merged_params_matrix
-from scripts.synthesize_spectra_from_zarr import _build_params_matrix as build_synth_params_matrix
 
 
-def test_synthesis_params_preserve_turbvel_and_t_value() -> None:
+def test_params_preserve_turbvel_and_t_value_across_rows() -> None:
     columns = {
         "teff": np.asarray([5000, 5250], dtype=np.int64),
         "logg": np.asarray([4.0, 4.5], dtype=np.float64),
@@ -24,7 +23,7 @@ def test_synthesis_params_preserve_turbvel_and_t_value() -> None:
         "a": np.asarray(["+0.00", "+0.10"], dtype=object),
     }
 
-    params, param_names = build_synth_params_matrix(columns)
+    params, param_names = build_merged_params_matrix(columns)
 
     assert param_names.tolist() == ["teff", "logg", "feh", "vmicro", "turbvel", "t_value", "a"]
     np.testing.assert_allclose(params[:, 3], np.asarray([1.0, 2.0], dtype=np.float32))

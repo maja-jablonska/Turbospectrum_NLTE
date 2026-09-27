@@ -1,7 +1,7 @@
 {
   "_comment": "Regular-grid example for Fe NLTE synthesis using per-abundance ASCII departure files.",
   "_note": [
-    "Use with: python scripts/synthesize_regular_grid.py --config-json configs/pipeline/config_regular_grid_nlte_fe.example.json",
+    "Use with: python scripts/pipeline_from_config.py --config configs/pipeline/config_regular_grid_nlte_fe.example.json (or qsub turbospectrum_pipeline_example.pbs)",
     "This example focuses on the new Fe NLTE ASCII-departure selection workflow.",
     "Update the Turbospectrum path overrides for your local checkout or cluster environment before a full synthesis run.",
     "When synthesized, turbvel is preserved as a numeric parameter column alongside vmicro in the final spectra Zarr."
@@ -53,7 +53,7 @@
   },
   "turbospectrum": {
     "_note": [
-      "Base synthesis runtime config used by synthesize_spectra_from_zarr.py.",
+      "Base synthesis runtime config used by run_turbospectrum_shard.py.",
       "overrides lets this example turn on NLTE Fe and point at the repository NLTE info file."
     ],
     "config": "../synthesis/config_sample_comprehensive.json",

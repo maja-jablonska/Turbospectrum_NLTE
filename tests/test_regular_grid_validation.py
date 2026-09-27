@@ -6,13 +6,9 @@ import json
 import numpy as np
 import zarr
 
-from scripts.synthesize_regular_grid import (
-    _build_regular_columns,
-    _materialize_synthesis_config,
-    _verify_continuum_saved,
-)
-from scripts.pipeline_from_config import _write_temp_turbospectrum_config
-from scripts.synthesize_spectra_from_zarr import _validate_synthesis_results
+from scripts.synthesize_regular_grid import _build_regular_columns
+from scripts.pipeline_from_config import _normalize_synthesis_overrides, _write_temp_turbospectrum_config
+from scripts.synthesis_validation import validate_synthesis_results as _validate_synthesis_results
 
 
 class RegularGridValidationTests(unittest.TestCase):
@@ -40,22 +36,25 @@ class RegularGridValidationTests(unittest.TestCase):
         fluxes = np.array([[1.0, 0.9], [0.8, 0.7]], dtype=np.float32)
         continua = np.array([[1.0, 1.0], [0.9, 0.9]], dtype=np.float32)
 
-        with self.assertRaises(RuntimeError) as exc_info:
-            _validate_synthesis_results(
+        # Returns (so the shard is still written) and logs an ERROR; the
+        # caller exits non-zero based on the counts.
+        with self.assertLogs("scripts.synthesis_validation", level="ERROR") as logs:
+            counts = _validate_synthesis_results(
                 statuses=["success", "error"],
                 messages=["ok", "bsyn failed"],
                 fluxes=fluxes,
                 continua=continua,
             )
 
-        self.assertIn("failed rows=1", str(exc_info.exception))
-        self.assertIn("bsyn failed", str(exc_info.exception))
+        self.assertEqual(counts, {"success": 1, "error": 1})
+        self.assertIn("failed rows=1", logs.output[0])
+        self.assertIn("bsyn failed", logs.output[0])
 
     def test_validate_synthesis_results_rejects_nonfinite_flux(self) -> None:
         fluxes = np.array([[1.0, 0.9], [np.nan, 0.7]], dtype=np.float32)
         continua = np.array([[1.0, 1.0], [0.9, 0.9]], dtype=np.float32)
 
-        with self.assertRaises(RuntimeError) as exc_info:
+        with self.assertLogs("scripts.synthesis_validation", level="ERROR") as logs:
             _validate_synthesis_results(
                 statuses=["success", "success"],
                 messages=["ok", "missing spectrum"],
@@ -63,181 +62,18 @@ class RegularGridValidationTests(unittest.TestCase):
                 continua=continua,
             )
 
-        self.assertIn("rows with non-finite flux=1", str(exc_info.exception))
+        self.assertIn("rows with non-finite flux=1", logs.output[0])
 
-    def test_verify_continuum_saved_rejects_failed_status_counts(self) -> None:
+    def test_absolute_linelist_override_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = zarr.open_group(tmpdir, mode="w")
-            self._create_array(root, "wavelength", np.array([1.0, 2.0], dtype=np.float32))
-            self._create_array(root, "flux", np.array([[1.0, 0.9]], dtype=np.float32))
-            self._create_array(root, "continuum", np.array([[1.0, 1.0]], dtype=np.float32))
-            root.attrs["status_counts"] = {"success": 1, "error": 2}
-
-            with self.assertRaises(ValueError) as exc_info:
-                _verify_continuum_saved(tmpdir)
-
-            self.assertIn("status_counts", str(exc_info.exception))
-
-    def test_verify_continuum_saved_accepts_success_only_status_counts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = zarr.open_group(tmpdir, mode="w")
-            self._create_array(root, "wavelength", np.array([1.0, 2.0], dtype=np.float32))
-            self._create_array(root, "flux", np.array([[1.0, 0.9]], dtype=np.float32))
-            self._create_array(root, "continuum", np.array([[1.0, 1.0]], dtype=np.float32))
-            root.attrs["status_counts"] = {"success": 1}
-
-            _verify_continuum_saved(tmpdir)
-
-    def test_materialize_synthesis_config_applies_inline_linelist_override(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_cfg_path = os.path.join(tmpdir, "base.json")
-            run_root = os.path.join(tmpdir, "run")
-            cfg_dir = os.path.join(tmpdir, "configs", "pipeline")
-            linelist_dir = os.path.join(tmpdir, "input_files", "linelists")
-            os.makedirs(cfg_dir, exist_ok=True)
-            os.makedirs(linelist_dir, exist_ok=True)
-
-            with open(base_cfg_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "project_root": "",
-                        "paths": {
-                            "linelist_path": "",
-                            "linelist_files": ["base_list"],
-                        },
-                        "synthesis_parameters": {
-                            "output_mode": "Flux",
-                        },
-                    },
-                    handle,
-                )
-
-            materialized = _materialize_synthesis_config(
-                base_config_path=base_cfg_path,
-                run_root=run_root,
-                overrides={
-                    "paths": {
-                        "linelist_path": "../../input_files/linelists",
-                        "linelist_files": ["custom_list"],
-                    }
-                },
-                overrides_base_dir=cfg_dir,
-            )
-
-            self.assertTrue(materialized.startswith(os.path.join(run_root, "config")))
-            with open(materialized, "r", encoding="utf-8") as handle:
-                cfg = json.load(handle)
-
-            self.assertEqual(cfg["paths"]["linelist_path"], linelist_dir)
-            self.assertEqual(cfg["paths"]["linelist_files"], ["custom_list"])
-
-    def test_materialize_synthesis_config_preserves_absolute_linelist_override(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_cfg_path = os.path.join(tmpdir, "base.json")
-            run_root = os.path.join(tmpdir, "run")
-            cfg_dir = os.path.join(tmpdir, "configs", "pipeline")
             linelist_dir = os.path.join(tmpdir, "external", "linelists")
-            os.makedirs(cfg_dir, exist_ok=True)
-            os.makedirs(linelist_dir, exist_ok=True)
-
-            with open(base_cfg_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "project_root": "",
-                        "paths": {
-                            "linelist_path": "",
-                            "linelist_files": ["base_list"],
-                        },
-                        "synthesis_parameters": {
-                            "output_mode": "Flux",
-                        },
-                    },
-                    handle,
-                )
-
-            materialized = _materialize_synthesis_config(
-                base_config_path=base_cfg_path,
-                run_root=run_root,
-                overrides={
-                    "paths": {
-                        "linelist_path": linelist_dir,
-                        "linelist_files": ["custom_list"],
-                    }
-                },
-                overrides_base_dir=cfg_dir,
+            os.makedirs(linelist_dir)
+            out = _normalize_synthesis_overrides(
+                {"paths": {"linelist_path": linelist_dir, "linelist_files": ["custom_list"]}},
+                os.path.join(tmpdir, "configs", "pipeline"),
             )
-
-            with open(materialized, "r", encoding="utf-8") as handle:
-                cfg = json.load(handle)
-
-            self.assertEqual(cfg["paths"]["linelist_path"], linelist_dir)
-            self.assertEqual(cfg["paths"]["linelist_files"], ["custom_list"])
-
-    def test_materialize_synthesis_config_normalizes_nlte_info_override(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_cfg_path = os.path.join(tmpdir, "base.json")
-            run_root = os.path.join(tmpdir, "run")
-            cfg_dir = os.path.join(tmpdir, "configs", "pipeline")
-            nlte_info_path = os.path.join(tmpdir, "DATA", "SPECIES_LTE_NLTE.dat")
-            os.makedirs(cfg_dir, exist_ok=True)
-            os.makedirs(os.path.dirname(nlte_info_path), exist_ok=True)
-
-            with open(nlte_info_path, "w", encoding="utf-8") as handle:
-                handle.write("fake nlte info\n")
-
-            with open(base_cfg_path, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "project_root": "",
-                        "nlte": {
-                            "enabled": True,
-                            "nlte_info_file": "",
-                        },
-                        "synthesis_parameters": {
-                            "output_mode": "Flux",
-                        },
-                    },
-                    handle,
-                )
-
-            materialized = _materialize_synthesis_config(
-                base_config_path=base_cfg_path,
-                run_root=run_root,
-                overrides={
-                    "nlte": {
-                        "enabled": True,
-                        "nlte_info_file": "../../DATA/SPECIES_LTE_NLTE.dat",
-                    }
-                },
-                overrides_base_dir=cfg_dir,
-            )
-
-            with open(materialized, "r", encoding="utf-8") as handle:
-                cfg = json.load(handle)
-
-            self.assertEqual(cfg["nlte"]["nlte_info_file"], nlte_info_path)
-
-    def test_materialize_synthesis_config_applies_mu_range_to_written_config(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base_cfg_path = os.path.join(tmpdir, "base.json")
-            run_root = os.path.join(tmpdir, "run")
-            with open(base_cfg_path, "w", encoding="utf-8") as handle:
-                json.dump({"synthesis_parameters": {}}, handle)
-
-            materialized = _materialize_synthesis_config(
-                base_config_path=base_cfg_path,
-                run_root=run_root,
-                mu_axis=np.asarray([0.2, 0.5, 0.8], dtype=np.float64),
-            )
-
-            with open(materialized, "r", encoding="utf-8") as handle:
-                cfg = json.load(handle)
-
-            mu_sampling = cfg["synthesis_parameters"]["mu_sampling"]
-            self.assertEqual(mu_sampling["mode"], "nearest")
-            self.assertEqual(mu_sampling["count"], 1)
-            self.assertEqual(mu_sampling["min"], 0.2)
-            self.assertEqual(mu_sampling["max"], 0.8)
+            self.assertEqual(out["paths"]["linelist_path"], linelist_dir)
+            self.assertEqual(out["paths"]["linelist_files"], ["custom_list"])
 
     def test_build_regular_columns_expands_uniform_mu_axis(self) -> None:
         abund = {k: np.asarray(["+0.00"], dtype=object) for k in ("a", "c", "n", "o", "r", "s")}

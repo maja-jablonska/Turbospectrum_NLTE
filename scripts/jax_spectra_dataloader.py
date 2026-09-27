@@ -2,8 +2,7 @@
 """JAX dataloader utilities for Zarr-based spectral ML datasets.
 
 This module targets the synthesis layout written by:
-- scripts/synthesize_spectra_from_zarr.py
-- scripts/merge_spectra_shards.py
+- scripts/merge_spectra_shards.py (also what pipeline_from_config --synthesis-mode full writes)
 
 It can also read simpler stores that at least expose `flux` (or another chosen
 input array) with row-major sample indexing.

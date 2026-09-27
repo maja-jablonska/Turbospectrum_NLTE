@@ -341,7 +341,7 @@ Prevent:
 **Your pipeline must support `--output TMP_PATH`.** If it currently writes directly to the final shard path, change that. Atomic rename is one of the biggest stability upgrades possible.
 
 * **`pipeline_from_config.py`**: Pass `--output TMP_PATH` to write to a temp path. The pipeline forwards this as `--output-tmp` to the synthesis scripts.
-* **`run_turbospectrum_shard.py`** and **`synthesize_spectra_from_zarr.py`**: Accept `--output-tmp TMP_PATH`. Write to `TMP_PATH`, then `os.rename(TMP_PATH, final_path)`. The final path is always `--output-zarr`.
+* **`run_turbospectrum_shard.py`** (the only synthesis engine): Accepts `--output-tmp TMP_PATH`. Write to `TMP_PATH`, then `os.rename(TMP_PATH, final_path)`. The final path is always `--output-zarr`.
 * **Same filesystem**: Temp and final paths must be on the same filesystem for true atomic rename. Cross-FS rename does copy+delete (not atomic).
 
 #### 4) Systemic Bug (Many Shards Failing)

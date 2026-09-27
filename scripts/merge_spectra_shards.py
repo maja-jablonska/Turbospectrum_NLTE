@@ -366,8 +366,7 @@ def _build_params_matrix(columns: Mapping[str, np.ndarray]) -> Tuple[np.ndarray,
         params_by_name["vmicro"] = _to_float32(np.asarray(columns["t_value"]))
 
     # Preserve the synthesis microturbulence (turbvel) and the snapped atmosphere
-    # label (t_value) as their own numeric columns, mirroring
-    # synthesize_spectra_from_zarr._build_params_matrix.
+    # label (t_value) as their own numeric columns.
     if "turbvel" in columns:
         params_by_name["turbvel"] = _to_float32(np.asarray(columns["turbvel"]))
     if "t_value" in columns:
