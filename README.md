@@ -627,6 +627,7 @@ Behavior summary:
 - uses `RUN_ROOT` for queue state/log/tmp directories (and as a fallback when output paths are missing)
 - validates shards (`scripts/shard_status.py` + `scripts/validate_dataset.py`) before merge; a failed validation aborts unless `ALLOW_PARTIAL_MERGE=1` (the default)
 - exit status: `0` complete merge, `3` partial merge written (`missing_models > 0`, shards kept for the next resume), `1` error
+- rows whose synthesis failed are dropped from the merge by default and recorded (`dropped_global_index`, `dropped_failed_rows`, `dropped_status_counts` attrs); this does not make the merge partial. Resume still retries them. `DROP_FAILED_ROWS=0` rejects shards with failed rows instead
 - preserves valid shard outputs across reruns and resumes only the missing shard IDs on later submissions
 - defaults to `ROWS_PER_SHARD=128` unless `SHARD_COUNT` or `ROWS_PER_SHARD` is set in the environment or `runtime`
 - for large grids, set `ROWS_PER_SHARD` or `runtime.rows_per_shard` to reduce per-shard startup overhead

@@ -249,9 +249,32 @@ class MergeSpectraShardsTests(unittest.TestCase):
     def test_strict_merge_rejects_failed_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             grid_path, shards = self._write_two_row_run(tmpdir, bad_status="failed")
-            result = self._run_merge(os.path.join(tmpdir, "merged.zarr"), grid_path, shards)
+            result = self._run_merge(os.path.join(tmpdir, "merged.zarr"), grid_path, shards, "--fail-on-failed-rows")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("non-success statuses", result.stderr)
+
+    def test_default_merge_drops_failed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(
+                tmpdir, bad_flux=np.asarray([[np.nan, np.nan]]), bad_status="failed"
+            )
+            out = os.path.join(tmpdir, "merged.zarr")
+            result = self._run_merge(out, grid_path, shards)
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            merged = zarr.open_group(out, mode="r")
+            np.testing.assert_array_equal(merged["global_index"][:], [0])
+            np.testing.assert_array_equal(merged["dropped_global_index"][:], [1])
+            self.assertTrue(np.all(np.isfinite(merged["flux"][:])))
+            self.assertEqual(int(merged.attrs["dropped_failed_rows"]), 1)
+            self.assertEqual(int(merged.attrs["missing_models"]), 0)  # dropped != missing
+            self.assertEqual(merged.attrs["dropped_status_counts"], {"failed": 1})
+
+    def test_dropping_failed_rows_does_not_allow_missing_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            grid_path, shards = self._write_two_row_run(tmpdir)
+            result = self._run_merge(os.path.join(tmpdir, "merged.zarr"), grid_path, shards[:1])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("would be incomplete", result.stderr)
 
     def test_failed_remerge_keeps_previous_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

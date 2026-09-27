@@ -419,6 +419,8 @@ What exists today (`turbospectrum_pipeline_example.pbs` env vars / `runtime.*` c
 * SIGKILL/OOM: a shard whose worker pool is killed exits 137 and is retried with half the workers
 * `ALLOW_PARTIAL_MERGE=0`: abort instead of merging when shards are missing/invalid; a partial
   merge otherwise exits 3
+* `DROP_FAILED_ROWS` (default 1): failed rows are dropped at merge and recorded in
+  `dropped_global_index` / `dropped_*` attrs; `0` rejects any shard with a failed row
 * `--output TMP_PATH` (atomic write: write to temp, then rename to final); merge, filter, split,
   rechunk and grid generation all publish atomically as well
 * `python scripts/shard_status.py ...`: list missing/invalid shards without touching them

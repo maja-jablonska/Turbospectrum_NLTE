@@ -127,3 +127,52 @@ class SharedMuPointsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             self.assertIsNone(pipeline_from_config._shared_mu_points(self._grid(tmpdir, np.linspace(0.1, 1, 31))))
         self.assertIsNone(pipeline_from_config._shared_mu_points(None))
+
+
+class FullModeFailedRowsTests(unittest.TestCase):
+    def _run_full(self, tmpdir, shard_written: bool):
+        import json
+        import os
+
+        cfg = {
+            "grid": {},
+            "turbospectrum": {},
+            "outputs": {"grid_zarr": os.path.join(tmpdir, "grid.zarr"),
+                        "spectra_zarr": os.path.join(tmpdir, "out", "spectra.zarr")},
+        }
+        cfg_path = os.path.join(tmpdir, "cfg.json")
+        with open(cfg_path, "w") as fh:
+            json.dump(cfg, fh)
+        merge_calls = []
+
+        def fake_run(cmd):
+            if shard_written:
+                os.makedirs(cmd[cmd.index("--output-zarr") + 1], exist_ok=True)
+            raise subprocess.CalledProcessError(1, cmd)
+
+        def fake_subprocess_run(cmd, check):
+            merge_calls.append(cmd)
+
+        with mock.patch.object(pipeline_from_config, "_run", side_effect=fake_run), \
+             mock.patch.object(pipeline_from_config.subprocess, "run", side_effect=fake_subprocess_run), \
+             mock.patch.object(pipeline_from_config, "_write_temp_turbospectrum_config", return_value="ts.json"), \
+             mock.patch.object(pipeline_from_config, "_nlte_preflight_or_exit"), \
+             mock.patch("sys.argv", ["pipeline_from_config.py", "--config", cfg_path, "--skip-grid"]):
+            pipeline_from_config.main()
+        return merge_calls
+
+    def test_failed_rows_still_merge_when_shard_was_written(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls = self._run_full(tmpdir, shard_written=True)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("merge_spectra_shards.py", calls[0][1])
+            self.assertNotIn("--fail-on-failed-rows", calls[0])
+
+    def test_no_shard_is_fatal(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(subprocess.CalledProcessError):
+                self._run_full(tmpdir, shard_written=False)

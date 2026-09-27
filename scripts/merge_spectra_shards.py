@@ -755,13 +755,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--drop-failed-rows",
+        "--fail-on-failed-rows",
         action="store_true",
         help=(
-            "Keep shards that contain non-success rows (e.g. failed NLTE departures) "
-            "but drop those rows from the merged output instead of rejecting the "
-            "entire shard. Implies --allow-missing."
+            "Reject any shard containing non-success rows. By default such rows "
+            "(e.g. failed NLTE departures, OOM-killed bsyn) are dropped from the "
+            "merged output and recorded in dropped_global_index / attrs."
         ),
+    )
+    parser.add_argument(
+        "--drop-failed-rows",
+        action="store_true",
+        help="Accepted for compatibility; dropping failed rows is the default.",
     )
     args = parser.parse_args()
 
@@ -773,14 +778,16 @@ def main() -> None:
         os.environ["TEMP"] = tmp_dir
         tempfile.tempdir = tmp_dir
 
-    drop_failed_rows = bool(args.drop_failed_rows)
+    # Failed rows are dropped by default. This is NOT a partial merge: rows
+    # that were never synthesized (missing/invalid shards) still need
+    # --allow-missing and are counted in missing_models; dropped rows are
+    # counted separately in dropped_failed_rows.
+    drop_failed_rows = not bool(args.fail_on_failed_rows)
     partial_merge_requested = bool(
         args.allow_missing or args.skip_nonexistent_shards or args.skip_invalid_shards
-        or drop_failed_rows
     )
     effective_skip_invalid_shards = bool(
         args.skip_invalid_shards or args.allow_missing or args.skip_nonexistent_shards
-        or drop_failed_rows
     )
 
     shards = _list_shards(args.shard, args.shard_dir)
@@ -889,6 +896,9 @@ def main() -> None:
 
     # Preflight integrity checks: every row must be written exactly once.
     seen_rows = np.zeros(row_count, dtype=bool)
+    dropped_rows = np.zeros(row_count, dtype=bool)
+    dropped_status_counts: Dict[str, int] = {}
+    dropped_messages: List[str] = []
     mu_sampling_values: Set[str] = set()
     shard_attr_snapshots: List[Dict[str, str]] = []
     shard_provenance_candidates: Dict[str, List[str]] = {name: [] for name in PROVENANCE_FILENAMES}
@@ -916,10 +926,18 @@ def main() -> None:
         if gidx.size == 0:
             continue
 
-        # When --drop-failed-rows, only register success rows in the preflight.
+        # Only success rows are merged; failed rows are recorded as dropped.
         if drop_failed_rows:
             _statuses = decode_statuses(shard["status"][:])
             success_mask = np.array([s in SUCCESS_STATUSES for s in _statuses], dtype=bool)
+            if not success_mask.all():
+                failed_idx = gidx[~success_mask]
+                dropped_rows[failed_idx[(failed_idx >= 0) & (failed_idx < row_count)]] = True
+                _msgs = [str(m) for m in np.asarray(shard["message"][:]).tolist()]
+                for _i in np.flatnonzero(~success_mask):
+                    dropped_status_counts[_statuses[_i]] = dropped_status_counts.get(_statuses[_i], 0) + 1
+                    if len(dropped_messages) < 20:
+                        dropped_messages.append(f"global_index={int(gidx[_i])}: {_msgs[_i][:300]}")
             gidx = gidx[success_mask]
             if gidx.size == 0:
                 continue
@@ -963,7 +981,14 @@ def main() -> None:
             "(or FORCE_RESTART) before merging."
         )
 
-    missing_rows = np.flatnonzero(~seen_rows)
+    dropped_global_index = np.flatnonzero(dropped_rows & ~seen_rows).astype(np.int64)
+    if dropped_global_index.size:
+        print(
+            f"WARNING: dropping {dropped_global_index.size} failed row(s) "
+            f"(status_counts={dropped_status_counts}); first: {dropped_messages[:3]}",
+            file=sys.stderr,
+        )
+    missing_rows = np.flatnonzero(~seen_rows & ~dropped_rows)
     if missing_rows.size:
         if not effective_allow_missing:
             preview = missing_rows[:20].tolist()
@@ -977,11 +1002,7 @@ def main() -> None:
             f"from output."
         )
 
-    selected_global_indices = (
-        np.flatnonzero(seen_rows).astype(np.int64)
-        if effective_allow_missing
-        else np.arange(row_count, dtype=np.int64)
-    )
+    selected_global_indices = np.flatnonzero(seen_rows).astype(np.int64)
     out_row_count = int(selected_global_indices.size)
     if out_row_count <= 0:
         raise ValueError("No valid shard rows available to merge")
@@ -1005,6 +1026,12 @@ def main() -> None:
         )
         # fill_value (not an explicit prefill) marks unwritten rows, so the full
         # dataset is written once rather than twice.
+        # Grid rows whose synthesis failed and were left out (see attrs
+        # dropped_status_counts / dropped_messages_sample).
+        _zc_create_array(
+            root_out, "dropped_global_index", data=dropped_global_index,
+            chunks=(max(1, int(dropped_global_index.size)),), **compression_kwargs,
+        )
         flux_out = _zc_create_array(root_out, "flux", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, fill_value=np.nan, **compression_kwargs)
         continuum_out = _zc_create_array(root_out, "continuum", shape=(out_row_count, wl_count), dtype=np.float32, chunks=chunk_shape, fill_value=np.nan, **compression_kwargs)
         mu_chunk = (min(int(args.chunk_rows), out_row_count) if out_row_count else 1,)
@@ -1207,18 +1234,15 @@ def main() -> None:
                     if name in _GRID_SKIP:
                         continue
                     values = np.asarray(grid_root[name][:])
-                    if effective_allow_missing:
-                        values = values[selected_global_indices]
+                    values = values[selected_global_indices]
                     grid_cols[name] = values
             if "turbvel" in grid_root:
                 turb_vals = np.asarray(grid_root["turbvel"][:])
-                if effective_allow_missing:
-                    turb_vals = turb_vals[selected_global_indices]
+                turb_vals = turb_vals[selected_global_indices]
                 grid_cols["turb"] = turb_vals
             elif "t_value" in grid_root:
                 turb_vals = np.asarray(grid_root["t_value"][:])
-                if effective_allow_missing:
-                    turb_vals = turb_vals[selected_global_indices]
+                turb_vals = turb_vals[selected_global_indices]
                 grid_cols["turb"] = turb_vals
             # Inject mu_selected as the "mu" param — it's the angle actually used.
             if saw_mu_selected:
@@ -1263,16 +1287,14 @@ def main() -> None:
 
         if grid_root is not None and "output_mode" in grid_root:
             output_mode_data = np.asarray(grid_root["output_mode"][:])
-            if effective_allow_missing:
-                output_mode_data = output_mode_data[selected_global_indices]
+            output_mode_data = output_mode_data[selected_global_indices]
             output_mode_values = _collect_unique_strings(output_mode_data)
         else:
             output_mode_values = _collect_unique_strings(np.asarray(merged_meta["output_mode"]))
 
         if grid_root is not None and "calculation_mode" in grid_root:
             calculation_mode_data = np.asarray(grid_root["calculation_mode"][:])
-            if effective_allow_missing:
-                calculation_mode_data = calculation_mode_data[selected_global_indices]
+            calculation_mode_data = calculation_mode_data[selected_global_indices]
             calculation_mode_values = _collect_unique_strings(calculation_mode_data)
         else:
             calculation_mode_values = _collect_unique_strings(np.asarray(merged_meta["calculation_mode"]))
@@ -1504,7 +1526,10 @@ def main() -> None:
             "skipped_nonexistent_shards": int(len(skipped_nonexistent_shards)),
             "skipped_invalid_shards": int(len(skipped_invalid_shards)),
             "expected_models": int(row_count),
-            "missing_models": int(row_count - out_row_count),
+            "missing_models": int(row_count - out_row_count - dropped_global_index.size),
+            "dropped_failed_rows": int(dropped_global_index.size),
+            "dropped_status_counts": dropped_status_counts,
+            "dropped_messages_sample": dropped_messages,
             "input_hash": input_hashes[0] if input_hashes else "",
         }
         attrs_payload.update({str(k): str(v) for k, v in contract_provenance.items()})

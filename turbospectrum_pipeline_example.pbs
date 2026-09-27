@@ -37,6 +37,8 @@
 #   FORCE_RESTART=1           wipe grid, shards and merged zarr once (lock winner
 #                             only in array mode), then regenerate
 #   ALLOW_PARTIAL_MERGE=0     abort instead of merging when shards are missing/invalid
+#   DROP_FAILED_ROWS=0        reject shards with failed rows (default 1: the merge
+#                             drops failed rows and records them; resume retries them)
 #
 # Array jobs must use -J 0-(N-1) (shard index = PBS_ARRAY_INDEX). SHARD_COUNT is
 # inferred from the submitted range (qstat) and the task fails if it cannot be.
@@ -78,6 +80,10 @@ FORCE_RESTART="${FORCE_RESTART:-0}"
 ALLOW_PARTIAL_MERGE="${ALLOW_PARTIAL_MERGE:-1}"
 ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
 SKIP_BAD_SHARDS="${SKIP_BAD_SHARDS:-1}"
+# Merge drops rows whose synthesis failed (recorded in dropped_global_index /
+# dropped_* attrs). DROP_FAILED_ROWS=0 rejects any shard with a failed row.
+# Resume always retries failed rows either way.
+DROP_FAILED_ROWS="${DROP_FAILED_ROWS:-1}"
 CLEANUP_SHARDS="${CLEANUP_SHARDS:-1}"
 MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-128}"
 # Auto-prune shards whose stride/layout no longer matches SHARD_COUNT before
@@ -118,9 +124,14 @@ print_log_excerpt() {
 
 # Missing/invalid shard report: same validity predicate the shard runner uses
 # to decide skip vs recompute (scripts/zarr_rowstore.check_shard).
+# Usage: write_missing_shards_file [--prune-stale | --for-merge]
+#   default      resume list: shards with failed rows count as missing, so
+#                failed rows are retried (often transient, e.g. OOM)
+#   --for-merge  final count: shards with failed rows are fine when the merge
+#                drops them (DROP_FAILED_ROWS=1)
 write_missing_shards_file() {
     local extra=()
-    if [[ "$(to_bool01 "${DROP_FAILED_ROWS:-0}")" == "1" ]]; then extra+=(--drop-failed-rows); fi
+    if [[ "${1:-}" == "--for-merge" && "$(to_bool01 "${DROP_FAILED_ROWS}")" == "1" ]]; then extra+=(--drop-failed-rows); fi
     if [[ "${1:-}" == "--prune-stale" ]]; then extra+=(--prune-stale); fi
     "${PYTHON}" "${REPO}/scripts/shard_status.py" \
         --shard-dir "${SHARDS_DIR}" \
@@ -902,7 +913,7 @@ fi  # end of synthesis (single-job or finalize skip)
 echo "[${TAG}] Validating shard outputs..."
 
 # Recount missing/invalid shards (needed for both single-job and finalize paths).
-if ! write_missing_shards_file 2>> "${LOG_DIR}/missing.log"; then
+if ! write_missing_shards_file --for-merge 2>> "${LOG_DIR}/missing.log"; then
     echo "[${TAG}] ERROR: shard status check failed; see ${LOG_DIR}/missing.log" >&2
     exit 1
 fi
@@ -924,16 +935,14 @@ VALIDATE_CMD=(
 if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
     VALIDATE_CMD+=(--allow-incomplete-provenance)
 fi
+if [[ "$(to_bool01 "${DROP_FAILED_ROWS}")" != "1" ]]; then
+    VALIDATE_CMD+=(--fail-on-failed-rows)
+fi
 set +e
 "${VALIDATE_CMD[@]}"
 VALIDATE_RC=$?
 set -e
 ALLOW_PARTIAL_MERGE_EFFECTIVE="$(to_bool01 "${ALLOW_PARTIAL_MERGE}")"
-# Dropping failed rows is a partial merge by definition (merge --drop-failed-rows
-# implies --allow-missing), so it cannot coexist with a strict merge policy.
-if [[ "$(to_bool01 "${DROP_FAILED_ROWS:-0}")" == "1" ]]; then
-    ALLOW_PARTIAL_MERGE_EFFECTIVE=1
-fi
 if (( VALIDATE_RC != 0 )); then
     if [[ "${ALLOW_PARTIAL_MERGE_EFFECTIVE}" == "1" ]]; then
         echo "[${TAG}] WARN: validation exited with code ${VALIDATE_RC}; ALLOW_PARTIAL_MERGE=1 so invalid shards will be skipped." >&2
@@ -980,8 +989,8 @@ if [[ "$(to_bool01 "${SKIP_BAD_SHARDS}")" == "1" ]]; then
     MERGE_CMD+=(--skip-invalid-shards)
 fi
 
-if [[ "$(to_bool01 "${DROP_FAILED_ROWS:-0}")" == "1" ]]; then
-    MERGE_CMD+=(--drop-failed-rows)
+if [[ "$(to_bool01 "${DROP_FAILED_ROWS}")" != "1" ]]; then
+    MERGE_CMD+=(--fail-on-failed-rows)
 fi
 
 if [[ "$(to_bool01 "${ALLOW_INCOMPLETE_PROVENANCE}")" == "1" ]]; then
@@ -1002,12 +1011,20 @@ echo "[${TAG}] Merging shard outputs..."
 "${MERGE_CMD[@]}"
 
 # Completeness is judged from what the merge actually wrote, not from the
-# pre-merge shard count: --skip-invalid-shards / --drop-failed-rows can drop
-# rows from shards that exist.
+# pre-merge shard count: --skip-invalid-shards can drop shards that exist.
+# missing_models excludes dropped failed rows (dropped_failed_rows), so a
+# merge whose only gaps are failed rows is complete.
 MERGED_MISSING_MODELS="$("${PYTHON}" -c "
 import sys, zarr
 print(int(zarr.open_group(sys.argv[1], mode='r').attrs.get('missing_models', -1)))
 " "${MERGED_ZARR}")"
+MERGED_DROPPED="$("${PYTHON}" -c "
+import sys, zarr
+print(int(zarr.open_group(sys.argv[1], mode='r').attrs.get('dropped_failed_rows', 0)))
+" "${MERGED_ZARR}")"
+if [[ "${MERGED_DROPPED}" != "0" ]]; then
+    echo "[${TAG}] NOTE: ${MERGED_DROPPED} failed row(s) dropped from the merge (see dropped_global_index / dropped_status_counts)." >&2
+fi
 if [[ "${MERGED_MISSING_MODELS}" == "0" ]]; then
     MERGE_COMPLETE=1
     echo "[${TAG}] Merge complete: ${MERGED_ZARR}"

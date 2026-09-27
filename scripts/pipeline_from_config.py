@@ -529,7 +529,19 @@ def main() -> None:
             raise ValueError("outputs.spectra_zarr is required for synthesis-mode=full")
         _ensure_parent(out_zarr)
         shard_zarr = f"{out_zarr}.shard_0_of_1.zarr"
-        _run(_shard_cmd(0, 1, shard_zarr))
+        try:
+            _run(_shard_cmd(0, 1, shard_zarr))
+        except subprocess.CalledProcessError as exc:
+            # The shard runner saves the shard, then exits non-zero when rows
+            # failed. Failed rows are dropped by the merge, so carry on if the
+            # shard exists; anything else (no shard written) is fatal.
+            if not os.path.isdir(shard_zarr):
+                raise
+            print(
+                f"[pipeline] WARNING: synthesis exited {exc.returncode} with failed rows; "
+                "merging and dropping them (see dropped_* attrs).",
+                file=sys.stderr,
+            )
         merge_cmd = [
             sys.executable,
             os.path.join(SCRIPT_DIR, "merge_spectra_shards.py"),

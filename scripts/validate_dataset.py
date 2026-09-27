@@ -69,7 +69,8 @@ def _missing_contract_fields(fields: dict[str, str]) -> list[str]:
 # Shard Validation
 ############################################
 
-def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance: bool = True):
+def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance: bool = True,
+                   fail_on_failed_rows: bool = False):
 
     info = {
         "spectra": 0,
@@ -103,12 +104,24 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
 
         # Read one row chunk at a time (row-by-row reads decompress each
         # chunk chunk_rows times).
+        # Failed rows (non-success status) are dropped at merge time, so by
+        # default only success rows must carry finite, non-empty flux.
+        statuses = decode_statuses(root["status"][...]) if "status" in root else None
+        ok_rows = (np.array([st in SUCCESS_STATUSES for st in statuses], dtype=bool)
+                   if statuses is not None else np.ones(flux.shape[0], dtype=bool))
+        if statuses is not None and not ok_rows.all():
+            bad = [st for st in statuses if st not in SUCCESS_STATUSES]
+            info["non_success_rows"] = len(bad)
+            info["non_success_statuses"] = sorted(set(bad))
+            if fail_on_failed_rows:
+                return False, info
+
         nan_count = 0
         inf_count = 0
         empty_count = 0
         step = int(flux.chunks[0]) if flux.chunks else 64
         for lo in range(0, flux.shape[0], step):
-            block = np.asarray(flux[lo:lo + step])
+            block = np.asarray(flux[lo:lo + step])[ok_rows[lo:lo + step]]
             finite = np.isfinite(block).all(axis=1)
             nan_count += int(np.isnan(block).any(axis=1).sum())
             inf_count += int(np.isinf(block).any(axis=1).sum())
@@ -125,13 +138,6 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
             info["empty_rows"] = empty_count
         if nan_count or inf_count or empty_count:
             return False, info
-
-        if "status" in root:
-            bad = [st for st in decode_statuses(root["status"][...]) if st not in SUCCESS_STATUSES]
-            if bad:
-                info["non_success_rows"] = len(bad)
-                info["non_success_statuses"] = sorted(set(bad))
-                return False, info
 
         ########################################
         # Wavelength consistency
@@ -175,11 +181,13 @@ def validate_shard(path: Path, reference_wavelength=None, *, enforce_provenance:
         return False, {"exception": str(e)}
 
 
-def _validate_one_shard(path: Path, reference_wavelength, *, enforce_provenance: bool):
+def _validate_one_shard(path: Path, reference_wavelength, *, enforce_provenance: bool,
+                        fail_on_failed_rows: bool = False):
     ok, info = validate_shard(
         path,
         reference_wavelength,
         enforce_provenance=enforce_provenance,
+        fail_on_failed_rows=fail_on_failed_rows,
     )
     return path.name, ok, info
 
@@ -227,6 +235,7 @@ def validate_dataset(
     *,
     allow_incomplete_provenance: bool,
     workers: int = 1,
+    fail_on_failed_rows: bool = False,
 ):
 
     shards = sorted(shard_dir.glob("spectra_shard_*.zarr"))
@@ -291,6 +300,7 @@ def validate_dataset(
                 shard,
                 reference_wavelength,
                 enforce_provenance=enforce_provenance,
+                fail_on_failed_rows=fail_on_failed_rows,
             )
             results_by_name[name] = (ok, info)
     else:
@@ -302,6 +312,7 @@ def validate_dataset(
                     shard,
                     reference_wavelength,
                     enforce_provenance=enforce_provenance,
+                    fail_on_failed_rows=fail_on_failed_rows,
                 ): shard
                 for shard in shards
             }
@@ -366,6 +377,12 @@ if __name__ == "__main__":
         default=1,
         help="Parallel worker threads for deep shard validation.",
     )
+    parser.add_argument(
+        "--fail-on-failed-rows",
+        action="store_true",
+        help="Treat shards with non-success rows as invalid (default: they are "
+             "accepted, since the merge drops failed rows).",
+    )
 
     args = parser.parse_args()
 
@@ -374,4 +391,5 @@ if __name__ == "__main__":
         args.expected_shards,
         allow_incomplete_provenance=bool(args.allow_incomplete_provenance),
         workers=int(args.workers),
+        fail_on_failed_rows=bool(args.fail_on_failed_rows),
     )

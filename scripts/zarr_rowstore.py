@@ -144,7 +144,7 @@ def check_shard(
 # ---------------------------------------------------------------------------
 
 # Never row-aligned even when their length happens to equal the row count.
-NON_ROW_ARRAYS = frozenset({"wavelength", "param_names", "physics_hash", "schema_version"})
+NON_ROW_ARRAYS = frozenset({"wavelength", "param_names", "physics_hash", "schema_version", "dropped_global_index"})
 _ROW_COUNT_HINTS = ("flux", "spectra", "labels", "teff", "global_index", "status")
 _BATCH_TARGET_BYTES = 512 * 1024 ** 2
 

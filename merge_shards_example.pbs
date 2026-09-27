@@ -32,6 +32,7 @@ MERGE_CHUNK_ROWS="${MERGE_CHUNK_ROWS:-128}"
 ALLOW_MISSING="${ALLOW_MISSING:-0}"
 ALLOW_INCOMPLETE_PROVENANCE="${ALLOW_INCOMPLETE_PROVENANCE:-0}"
 SKIP_BAD_SHARDS="${SKIP_BAD_SHARDS:-1}"
+DROP_FAILED_ROWS="${DROP_FAILED_ROWS:-1}"  # 0 = reject shards with failed rows
 
 if [[ "${REPO}" != /* ]]; then
     REPO="${PBS_O_WORKDIR}/${REPO}"
@@ -174,6 +175,10 @@ fi
 
 if [[ "${ALLOW_INCOMPLETE_PROVENANCE_BOOL}" == "1" ]]; then
     MERGE_CMD+=(--allow-incomplete-provenance)
+fi
+
+if [[ "$(to_bool01 "${DROP_FAILED_ROWS}")" != "1" ]]; then
+    MERGE_CMD+=(--fail-on-failed-rows)
 fi
 
 echo "[merge] Running shard merge..."

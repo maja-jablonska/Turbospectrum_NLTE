@@ -75,13 +75,18 @@ def test_array_range_must_start_at_zero(tmp_path):
     assert "must be 0-(N-1)" in proc.stderr
 
 
-def _write_shard(path, gidx):
+def _write_shard(path, gidx, failed=()):
     root = zarr.open_group(str(path), mode="w")
+    flux = np.ones((len(gidx), 3), dtype=np.float32)
+    status = ["success"] * len(gidx)
+    for i in failed:
+        flux[i] = np.nan
+        status[i] = "error"
     create_array(root, "wavelength", data=np.asarray([5000.0, 5000.1, 5000.2], dtype=np.float32))
     create_array(root, "global_index", data=np.asarray(gidx, dtype=np.int64))
-    create_array(root, "flux", data=np.ones((len(gidx), 3), dtype=np.float32))
-    write_string_array(root, "status", ["success"] * len(gidx))
-    write_string_array(root, "message", [""] * len(gidx))
+    create_array(root, "flux", data=flux)
+    write_string_array(root, "status", status)
+    write_string_array(root, "message", ["bsyn died" if i in failed else "" for i in range(len(gidx))])
 
 
 def _prepare_grid(config_path, run_root):
@@ -131,3 +136,36 @@ def test_finalize_complete_merge_cleans_shards(tmp_path):
     assert not os.path.exists(shard_dir)
     merged = zarr.open_group(cfg["outputs"]["spectra_zarr"], mode="r")
     assert int(merged.attrs["missing_models"]) == 0
+
+
+def _two_shards_one_failed_row(tmp_path):
+    config_path, cfg = _config(tmp_path, {"shard_count": 2})
+    run_root = cfg["outputs"]["run_root"]
+    _prepare_grid(config_path, run_root)
+    shard_dir = os.path.join(run_root, "outputs", "shards")
+    os.makedirs(shard_dir, exist_ok=True)
+    _write_shard(os.path.join(shard_dir, "spectra_shard_0.zarr"), [0, 2, 4, 6])
+    _write_shard(os.path.join(shard_dir, "spectra_shard_1.zarr"), [1, 3, 5, 7], failed=(1,))
+    return config_path, cfg, run_root, shard_dir
+
+
+def test_finalize_drops_failed_rows_by_default(tmp_path):
+    config_path, cfg, run_root, shard_dir = _two_shards_one_failed_row(tmp_path)
+    proc = _run(config_path, run_root, FINALIZE_ONLY="1", ALLOW_INCOMPLETE_PROVENANCE="1", ALLOW_PARTIAL_MERGE="0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "1 failed row(s) dropped" in proc.stderr
+    merged = zarr.open_group(cfg["outputs"]["spectra_zarr"], mode="r")
+    assert int(merged.attrs["missing_models"]) == 0
+    assert int(merged.attrs["dropped_failed_rows"]) == 1
+    np.testing.assert_array_equal(merged["dropped_global_index"][:], [3])
+    assert merged["flux"].shape[0] == 7
+    assert not os.path.exists(shard_dir)
+
+
+def test_drop_failed_rows_0_rejects_failed_shard(tmp_path):
+    config_path, cfg, run_root, shard_dir = _two_shards_one_failed_row(tmp_path)
+    proc = _run(config_path, run_root, FINALIZE_ONLY="1", ALLOW_INCOMPLETE_PROVENANCE="1", DROP_FAILED_ROWS="0")
+    assert proc.returncode == 3, proc.stdout + proc.stderr  # partial: shard 1 skipped
+    merged = zarr.open_group(cfg["outputs"]["spectra_zarr"], mode="r")
+    assert int(merged.attrs["missing_models"]) == 4
+    assert os.path.isdir(shard_dir)

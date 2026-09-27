@@ -281,10 +281,31 @@ def test_validate_shard_missing_arrays():
 def test_validate_shard_rejects_failed_status_rows(tmp_path):
     root = _make_valid_shard(tmp_path / "shard.zarr", n_rows=3)
     write_string_array(root, "status", ["success", "failed", "success"])
-    ok, info = validate_shard(tmp_path / "shard.zarr")
+    ok, info = validate_shard(tmp_path / "shard.zarr", fail_on_failed_rows=True)
     assert not ok
     assert info["non_success_rows"] == 1
     assert info["non_success_statuses"] == ["failed"]
+
+
+def test_validate_shard_accepts_failed_rows_by_default(tmp_path):
+    # The merge drops failed rows, so their NaN flux must not fail validation,
+    # but NaN in a *success* row still must.
+    root = _make_valid_shard(tmp_path / "shard.zarr", n_rows=3)
+    flux = np.asarray(root["flux"][...])
+    flux[1] = np.nan
+    root["flux"][...] = flux
+    write_string_array(root, "status", ["success", "failed", "success"])
+    ok, info = validate_shard(tmp_path / "shard.zarr")
+    assert ok, info
+    assert info["non_success_rows"] == 1
+
+    root2 = _make_valid_shard(tmp_path / "shard2.zarr", n_rows=2)
+    flux2 = np.asarray(root2["flux"][...])
+    flux2[0] = np.nan
+    root2["flux"][...] = flux2
+    write_string_array(root2, "status", ["success", "failed"])
+    ok2, info2 = validate_shard(tmp_path / "shard2.zarr")
+    assert not ok2 and info2["nan_rows"] == 1
 
 
 def test_validate_shard_chunked_nan_count(tmp_path):
