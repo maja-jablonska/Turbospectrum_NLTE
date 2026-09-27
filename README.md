@@ -451,7 +451,7 @@ rows_per_shard = ceil(row_count / shard_count)
 shard_count    = ceil(row_count / rows_per_shard)
 ```
 
-If both are supplied, they must cover the full dataset. If neither is supplied:
+If both are supplied and `SHARD_COUNT × ROWS_PER_SHARD` is short of the row count, `SHARD_COUNT` wins and `ROWS_PER_SHARD` is raised to cover every row (with a warning). If neither is supplied:
 
 - `turbospectrum_pipeline_example.pbs` (the single script for both LHS and regular grids) reads `runtime.shard_count` / `runtime.rows_per_shard` from config, or `SHARD_COUNT` / `ROWS_PER_SHARD` from the environment
 - in array mode (`qsub -J 0-(N-1)`) the pipeline script infers `SHARD_COUNT=N` from the submitted range and fails if it cannot

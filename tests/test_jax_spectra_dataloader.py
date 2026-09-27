@@ -12,6 +12,7 @@ import types
 from unittest import mock
 
 import numpy as np
+from scripts.zarr_compat import create_array as _zc_create_array, write_string_array as _zc_write_strings  # noqa: E402
 import pytest
 import zarr
 
@@ -53,11 +54,10 @@ def _make_dataset_zarr(tmp_dir, n_rows=20, n_lambda=10, n_params=3):
     wavelength = np.linspace(5000, 5100, n_lambda, dtype=np.float32)
     param_names = [f"p{i}" for i in range(n_params)]
 
-    root.array("params", params)
-    root.array("flux", flux)
-    root.array("wavelength", wavelength)
-    root.array("param_names", np.array(param_names, dtype=object), dtype=object,
-               object_codec=zarr.codecs.VLenUTF8() if hasattr(zarr.codecs, "VLenUTF8") else None)
+    _zc_create_array(root, "params", data=params)
+    _zc_create_array(root, "flux", data=flux)
+    _zc_create_array(root, "wavelength", data=wavelength)
+    _zc_write_strings(root, "param_names", list(param_names))
 
     return zarr_path, params, flux, wavelength, param_names
 

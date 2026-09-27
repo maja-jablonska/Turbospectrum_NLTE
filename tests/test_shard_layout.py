@@ -6,6 +6,7 @@ import sys
 import tempfile
 
 import numpy as np
+from scripts.zarr_compat import create_array as _zc_create_array, write_string_array as _zc_write_strings  # noqa: E402
 import pytest
 import zarr
 
@@ -49,7 +50,7 @@ def test_infer_row_count_from_flux():
     with tempfile.TemporaryDirectory() as tmp:
         zarr_path = os.path.join(tmp, "grid.zarr")
         root = zarr.open_group(zarr_path, mode="w")
-        root.array("flux", np.zeros((42, 100), dtype=np.float32))
+        _zc_create_array(root, "flux", data=np.zeros((42, 100), dtype=np.float32))
         count = _infer_row_count(zarr_path, ("flux", "params"))
         assert count == 42
 
@@ -58,7 +59,7 @@ def test_infer_row_count_from_params():
     with tempfile.TemporaryDirectory() as tmp:
         zarr_path = os.path.join(tmp, "grid.zarr")
         root = zarr.open_group(zarr_path, mode="w")
-        root.array("params", np.zeros((15, 5), dtype=np.float32))
+        _zc_create_array(root, "params", data=np.zeros((15, 5), dtype=np.float32))
         count = _infer_row_count(zarr_path, ("flux", "params"))
         assert count == 15
 
@@ -67,7 +68,7 @@ def test_infer_row_count_from_teff():
     with tempfile.TemporaryDirectory() as tmp:
         zarr_path = os.path.join(tmp, "grid.zarr")
         root = zarr.open_group(zarr_path, mode="w")
-        root.array("teff", np.array([5000, 5500, 6000], dtype=np.float32))
+        _zc_create_array(root, "teff", data=np.array([5000, 5500, 6000], dtype=np.float32))
         count = _infer_row_count(zarr_path, ("teff",))
         assert count == 3
 
@@ -77,9 +78,9 @@ def test_infer_row_count_key_precedence():
     with tempfile.TemporaryDirectory() as tmp:
         zarr_path = os.path.join(tmp, "grid.zarr")
         root = zarr.open_group(zarr_path, mode="w")
-        root.array("flux", np.zeros((10, 50), dtype=np.float32))
-        root.array("params", np.zeros((10, 3), dtype=np.float32))
-        root.array("teff", np.array([5000] * 10, dtype=np.float32))
+        _zc_create_array(root, "flux", data=np.zeros((10, 50), dtype=np.float32))
+        _zc_create_array(root, "params", data=np.zeros((10, 3), dtype=np.float32))
+        _zc_create_array(root, "teff", data=np.array([5000] * 10, dtype=np.float32))
         count = _infer_row_count(zarr_path, ("flux", "params", "teff"))
         assert count == 10
 
@@ -88,7 +89,7 @@ def test_infer_row_count_no_matching_key():
     with tempfile.TemporaryDirectory() as tmp:
         zarr_path = os.path.join(tmp, "grid.zarr")
         root = zarr.open_group(zarr_path, mode="w")
-        root.array("unrelated", np.zeros((5, 3), dtype=np.float32))
+        _zc_create_array(root, "unrelated", data=np.zeros((5, 3), dtype=np.float32))
         with pytest.raises(RuntimeError, match="Could not infer row count"):
             _infer_row_count(zarr_path, ("flux", "params"))
 
@@ -102,7 +103,7 @@ def test_shard_layout_from_shard_count(tmp_path):
 
     zarr_path = str(tmp_path / "grid.zarr")
     root = zarr.open_group(zarr_path, mode="w")
-    root.array("flux", np.zeros((100, 10), dtype=np.float32))
+    _zc_create_array(root, "flux", data=np.zeros((100, 10), dtype=np.float32))
 
     result = subprocess.run(
         [sys.executable, "-m", "resolve_shard_layout",
@@ -123,7 +124,7 @@ def test_shard_layout_from_rows_per_shard(tmp_path):
 
     zarr_path = str(tmp_path / "grid.zarr")
     root = zarr.open_group(zarr_path, mode="w")
-    root.array("flux", np.zeros((100, 10), dtype=np.float32))
+    _zc_create_array(root, "flux", data=np.zeros((100, 10), dtype=np.float32))
 
     result = subprocess.run(
         [sys.executable, "-m", "resolve_shard_layout",
@@ -153,8 +154,9 @@ def test_shard_layout_explicit_row_count(tmp_path):
     assert "ROWS_PER_SHARD=40" in result.stdout
 
 
-def test_shard_layout_rejects_insufficient_coverage(tmp_path):
-    """Explicit shard_count*rows_per_shard < row_count should fail."""
+def test_shard_layout_widens_rows_per_shard_when_coverage_is_short(tmp_path):
+    """shard_count*rows_per_shard < row_count: shard_count (e.g. a fixed PBS
+    array size) wins and rows_per_shard is raised so every row is covered."""
     import subprocess
 
     result = subprocess.run(
@@ -163,4 +165,7 @@ def test_shard_layout_rejects_insufficient_coverage(tmp_path):
         capture_output=True, text=True,
         cwd=os.path.join(os.path.dirname(__file__), "..", "scripts"),
     )
-    assert result.returncode != 0
+    assert result.returncode == 0, result.stderr
+    assert "SHARD_COUNT=2" in result.stdout
+    assert "ROWS_PER_SHARD=50" in result.stdout
+    assert "Auto-adjusting rows_per_shard to 50" in result.stderr

@@ -6,6 +6,7 @@ import sys
 import tempfile
 
 import numpy as np
+from scripts.zarr_compat import create_array as _zc_create_array, write_string_array as _zc_write_strings  # noqa: E402
 import pytest
 import zarr
 
@@ -33,16 +34,15 @@ def _create_test_zarr(tmp_dir, n_rows=5, n_lambda=10, n_params=3):
             params[i, 1] = 3.0 + i * 0.5  # logg
         if n_params > 2:
             params[i, 2] = -2.0 + i * 0.5  # feh
-    root.array("params", params)
+    _zc_create_array(root, "params", data=params)
 
     flux = np.random.default_rng(42).random((n_rows, n_lambda)).astype(np.float32)
-    root.array("flux", flux)
+    _zc_create_array(root, "flux", data=flux)
 
     wavelength = np.linspace(5000, 5100, n_lambda, dtype=np.float32)
-    root.array("wavelength", wavelength)
+    _zc_create_array(root, "wavelength", data=wavelength)
 
-    root.array("param_names", np.array(param_names, dtype=object), dtype=object,
-               object_codec=zarr.codecs.VLenUTF8() if hasattr(zarr.codecs, "VLenUTF8") else None)
+    _zc_write_strings(root, "param_names", list(param_names))
 
     return zarr_path, params, flux, wavelength, param_names
 
@@ -51,11 +51,10 @@ def _create_test_zarr_simple(tmp_dir, params_data, flux_data, param_names_list):
     """Build a Zarr store from explicit data arrays."""
     zarr_path = os.path.join(tmp_dir, "spectra.zarr")
     root = zarr.open_group(zarr_path, mode="w")
-    root.array("params", np.array(params_data, dtype=np.float32))
-    root.array("flux", np.array(flux_data, dtype=np.float32))
-    root.array("wavelength", np.linspace(5000, 5100, flux_data.shape[1], dtype=np.float32))
-    root.array("param_names", np.array(param_names_list, dtype=object), dtype=object,
-               object_codec=zarr.codecs.VLenUTF8() if hasattr(zarr.codecs, "VLenUTF8") else None)
+    _zc_create_array(root, "params", data=np.array(params_data, dtype=np.float32))
+    _zc_create_array(root, "flux", data=np.array(flux_data, dtype=np.float32))
+    _zc_create_array(root, "wavelength", data=np.linspace(5000, 5100, flux_data.shape[1], dtype=np.float32))
+    _zc_write_strings(root, "param_names", list(param_names_list))
     return zarr_path
 
 
@@ -208,7 +207,7 @@ def test_loader_rejects_missing_arrays():
     with tempfile.TemporaryDirectory() as tmp:
         zarr_path = os.path.join(tmp, "empty.zarr")
         root = zarr.open_group(zarr_path, mode="w")
-        root.array("flux", np.zeros((2, 5)))
+        _zc_create_array(root, "flux", data=np.zeros((2, 5)))
         with pytest.raises(KeyError, match="Missing required arrays"):
             LazySpectrumLoader(zarr_path)
 
@@ -217,10 +216,9 @@ def test_loader_rejects_row_mismatch():
     with tempfile.TemporaryDirectory() as tmp:
         zarr_path = os.path.join(tmp, "bad.zarr")
         root = zarr.open_group(zarr_path, mode="w")
-        root.array("params", np.zeros((3, 2), dtype=np.float32))
-        root.array("flux", np.zeros((5, 10), dtype=np.float32))
-        root.array("param_names", np.array(["a", "b"], dtype=object), dtype=object,
-                    object_codec=zarr.codecs.VLenUTF8() if hasattr(zarr.codecs, "VLenUTF8") else None)
+        _zc_create_array(root, "params", data=np.zeros((3, 2), dtype=np.float32))
+        _zc_create_array(root, "flux", data=np.zeros((5, 10), dtype=np.float32))
+        _zc_write_strings(root, "param_names", list(["a", "b"]))
         with pytest.raises(ValueError, match="Row mismatch"):
             LazySpectrumLoader(zarr_path)
 

@@ -353,6 +353,7 @@ class NlteAsciiDepartureTests(unittest.TestCase):
                 logg_axis=np.asarray([1.0], dtype=np.float64),
                 feh_axis=np.asarray([-0.5], dtype=np.float64),
                 turbvel_axis=np.asarray(["01"], dtype=object),
+                t_value_options=["01"],
                 mu_axis=None,
                 grid_version="regular-linear-v1",
                 lam_min=8400.0,
@@ -361,14 +362,7 @@ class NlteAsciiDepartureTests(unittest.TestCase):
                 output_mode="Flux",
                 mode="1D",
                 calculation_mode="LTE",
-                abundances={
-                    "a": "+0.00",
-                    "c": "+0.00",
-                    "n": "+0.00",
-                    "o": "+0.00",
-                    "r": "+0.00",
-                    "s": "+0.00",
-                },
+                abundances={k: np.asarray(["+0.00"], dtype=object) for k in ("a", "c", "n", "o", "r", "s")},
                 nlte_ascii_selector=selector,
                 max_rows=100,
             )
