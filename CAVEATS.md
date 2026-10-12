@@ -48,3 +48,18 @@ between −5/−4 and −4/−3. The pipeline `snap_prefilter` defaults used in 
 rejected-space configs cap `max_dteff` (125 K) and `max_dlogg` (0.25) but set
 `max_dfeh: null`, so these rows are *not* dropped. Set `max_dfeh` in the config
 if a run needs a bounded metallicity mismatch instead.
+
+## C/N/O offsets were written as absolute abundances (fixed 2026-10-12)
+
+Before 2026-10-12 `_build_abundance_controls` wrote the grid's `c`, `n`, `o` columns ([X/Fe] offsets)
+straight into bsyn's `INDIVIDUAL ABUNDANCES` block, which `makeabund.f` reads as absolute log eps
+(`abund(iel) = fixabund(iel)`). Every spectrum of the HARPS campaigns (`harps_gaps`, `harps_clean2`,
+merged into `/g/data/y89/mj8805/harps_final.zarr`, and hence the `TPayne-spice-harps` emulator) was
+therefore synthesised with A(C) = A(N) = A(O) ~ 0: no CH, CN, C2, OH/CO opacity, no C/N/O atomic
+lines, atmospheres unaffected. `a`, `r`, `s` were always correct (ALPHA/Fe, R-/S-PROCESS keywords),
+and grids that pass other elements (e.g. `fe` for the Kochukhov grid) pass absolute values correctly.
+
+Now `_build_abundance_controls(abundances, feh=...)` converts c/n/o with
+A(X) = A(X)_sun(magg) + [Fe/H] + [X/Fe] (+ [alpha/Fe] for O, so o = 0 reproduces bsyn's default).
+Verified against a run with the lines omitted: identical output. Any grid synthesised before this
+date must be regenerated for its c/n/o columns to mean anything; their physics_hash predates the fix.

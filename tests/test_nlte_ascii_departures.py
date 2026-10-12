@@ -479,6 +479,26 @@ class NlteAsciiDepartureTests(unittest.TestCase):
         self.assertEqual(s_proc, "+0.00")
         self.assertIn(" 26  +7.000", block)
 
+    def test_build_abundance_controls_converts_cno_offsets_to_absolute(self) -> None:
+        # [C/Fe] = +0.30 at [Fe/H] = -0.50 -> A(C) = 8.56 - 0.50 + 0.30; O also gets [alpha/Fe]
+        alpha, _, _, block = _build_abundance_controls(
+            {"a": "+0.20", "c": "+0.30", "n": "0.00", "o": "-0.10"}, feh=-0.5
+        )
+        self.assertEqual(alpha, "+0.20")
+        self.assertIn("  6  +8.360", block)
+        self.assertIn("  7  +7.480", block)
+        self.assertIn("  8  +8.370", block)  # 8.77 - 0.5 + 0.2 - 0.1
+
+    def test_build_abundance_controls_zero_cno_reproduces_bsyn_defaults(self) -> None:
+        _, _, _, block = _build_abundance_controls({"a": "+0.00", "c": "+0.00", "n": "+0.00", "o": "+0.00"}, feh=0.0)
+        self.assertIn("  6  +8.560", block)
+        self.assertIn("  7  +7.980", block)
+        self.assertIn("  8  +8.770", block)
+
+    def test_build_abundance_controls_cno_requires_feh(self) -> None:
+        with self.assertRaises(ValueError):
+            _build_abundance_controls({"c": "+0.10"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1259,7 +1259,47 @@ def _collect_synthesis_abundances(params: Mapping[str, Any]) -> Dict[str, str]:
     return abundances
 
 
-def _build_abundance_controls(abundances: Mapping[str, Any]) -> Tuple[str, str, str, str]:
+# Solar abundances (log eps, H = 12) of the elements the grid samples as [X/Fe]
+# offsets, from the 'magg' table in source/makeabund.f (Magg et al. 2022). Used
+# to turn those offsets into the ABSOLUTE values that bsyn's INDIVIDUAL
+# ABUNDANCES block expects.
+_MAGG_SOLAR_LOG_EPS = {"c": 8.56, "n": 7.98, "o": 8.77}
+# Elements that bsyn's ALPHA/Fe keyword enhances (ielalpha in makeabund.f):
+# O Ne Mg Si S Ar Ca Ti. An [O/Fe] offset is applied on top of that
+# enhancement so that o = 0 reproduces bsyn's own default oxygen.
+_ALPHA_ELEMENTS = {"o"}
+
+
+def _relative_to_absolute_abundance(key: str, offset: Any, feh: float, alpha: float) -> str:
+    """[X/Fe] offset -> absolute log eps for the INDIVIDUAL ABUNDANCES block.
+
+    A(X) = A(X)_sun(magg) + [Fe/H] + [X/Fe] (+ [alpha/Fe] for alpha elements).
+    """
+    value = _MAGG_SOLAR_LOG_EPS[key] + float(feh) + float(offset)
+    if key in _ALPHA_ELEMENTS:
+        value += float(alpha)
+    return f"{value:+0.3f}"
+
+
+def _build_abundance_controls(
+    abundances: Mapping[str, Any],
+    *,
+    feh: Optional[float] = None,
+) -> Tuple[str, str, str, str]:
+    """Translate the grid's abundance columns into the bsyn abundance inputs.
+
+    ``a``, ``r`` and ``s`` are [alpha/Fe], [r/Fe] and [s/Fe] and go through the
+    ALPHA/Fe, R-PROCESS and S-PROCESS keywords, which take offsets. ``c``, ``n``
+    and ``o`` are [X/Fe] offsets in the grid but the INDIVIDUAL ABUNDANCES block
+    they are written to takes *absolute* log eps values (makeabund.f replaces
+    abund(iel) by the given number), so they are converted with
+    :func:`_relative_to_absolute_abundance`; this needs ``feh``. Any other
+    element key (e.g. ``fe`` for the Kochukhov grid) is passed through verbatim
+    as an absolute abundance, as before.
+
+    Grids synthesised before 2026-10-12 wrote the raw c/n/o offsets into the
+    block, i.e. A(C) = A(N) = A(O) ~ 0 (no C, N, O in the line synthesis).
+    """
     normalized = {
         _normalize_abundance_key(name): _format_control_abundance_value(value)
         for name, value in abundances.items()
@@ -1272,7 +1312,12 @@ def _build_abundance_controls(abundances: Mapping[str, Any]) -> Tuple[str, str, 
     individual: Dict[str, str] = {}
     for key in ("c", "n", "o"):
         if key in normalized:
-            individual[key] = normalized[key]
+            if feh is None:
+                raise ValueError(
+                    f"abundance '{key}' is an [X/Fe] offset and needs feh to be converted to the "
+                    "absolute value that bsyn's INDIVIDUAL ABUNDANCES block expects"
+                )
+            individual[key] = _relative_to_absolute_abundance(key, normalized[key], feh, alpha)
     for key, value in normalized.items():
         if key in {"a", "r", "s", "c", "n", "o"}:
             continue
@@ -1995,7 +2040,7 @@ def run_single_synthesis(args):
                 ),
             )
 
-    alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(runtime_abundances)
+    alpha_fe, r_proc, s_proc, individual_abundance_block = _build_abundance_controls(runtime_abundances, feh=feh)
     individual_abundance_count = len(
         [line for line in individual_abundance_block.splitlines() if line.strip()]
     )
