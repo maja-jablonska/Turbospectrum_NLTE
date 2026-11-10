@@ -321,7 +321,7 @@ _MARCS_PARAM_COLS = ("marcs_fe_h", "marcs_a_fe", "marcs_c_fe", "marcs_n_fe", "ma
 # the composition column marcs_fe_h above, so it is not duplicated here. Kept in
 # step with run_turbospectrum._MARCS_ATM_KEYS. Both groups are per-row synthesis
 # outputs written by the shard step and folded into the grid store at merge time.
-_MARCS_ATM_COLS = ("marcs_teff", "marcs_logg", "marcs_turb")
+_MARCS_ATM_COLS = ("marcs_teff", "marcs_logg", "marcs_turb", "marcs_interp")
 _MARCS_SHARD_COLS = _MARCS_PARAM_COLS + _MARCS_ATM_COLS
 
 

@@ -203,6 +203,36 @@ class MergeSpectraRunsTests(unittest.TestCase):
             self.assertEqual(int(root["flux"].shape[0]), 4)  # run2 fully deduplicated
             self.assertEqual(root.attrs["run_rows_kept"], [4, 0])
 
+    def test_block_copy_matches_concatenation_with_drops_and_missing_continuum(self) -> None:
+        # Uneven run lengths, rows dropped mid-run (dedup) and a run without continuum, with an
+        # output chunk that divides neither: every io block size must give the plain concatenation.
+        names = ["teff", "logg", "feh"]
+        with tempfile.TemporaryDirectory() as tmp:
+            r1, r2, r3 = (os.path.join(tmp, f"run{i}.zarr") for i in (1, 2, 3))
+            self._write_run(r1, n_rows=37, param_names=names, physics_hash="a" * 64)
+            self._write_run(r2, n_rows=50, param_names=names, physics_hash="b" * 64, with_continuum=False, base=500.0)
+            p1 = (np.arange(37)[:, None] * 0.1 + np.arange(3)[None, :]).astype(np.float32)
+            p3 = (1000.0 + np.arange(23)[:, None] * 0.1 + np.arange(3)[None, :]).astype(np.float32)
+            dup = [2, 9, 10, 17]          # run3 rows that repeat run1 params -> dropped by dedup
+            p3[dup] = p1[[0, 5, 6, 30]]
+            self._write_run(r3, n_rows=23, param_names=names, physics_hash="c" * 64, base=2000.0, params_matrix=p3)
+
+            def flux(n, base):
+                return (base + np.arange(n)[:, None] + np.arange(_WL.size)[None, :]).astype(np.float32)
+
+            keep3 = np.setdiff1d(np.arange(23), dup)
+            want_flux = np.concatenate([flux(37, 0.0), flux(50, 500.0), flux(23, 2000.0)[keep3]])
+            want_cont = np.concatenate([np.ones((37, _WL.size)), np.full((50, _WL.size), np.nan), np.ones((len(keep3), _WL.size))])
+            for io_chunks in ("1", "3", "64"):
+                out = os.path.join(tmp, f"combined_{io_chunks}.zarr")
+                proc = self._run_merge("--run", r1, "--run", r2, "--run", r3, "--output-zarr", out,
+                                       "--dedup-by-model-id", "--chunk-rows", "8", "--io-chunks", io_chunks)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                root = self._open(out)
+                np.testing.assert_array_equal(root["flux"][...], want_flux)
+                np.testing.assert_array_equal(root["continuum"][...], want_cont.astype(np.float32))
+                self.assertEqual(root.attrs["run_rows_kept"], [37, 50, len(keep3)])
+
     def test_filter_bad_snaps_drops_wrong_atmosphere_rows(self) -> None:
         cols = ["teff", "logg", "feh", "t_value", "marcs_teff", "marcs_logg", "marcs_fe_h"]
         with tempfile.TemporaryDirectory() as tmp:

@@ -27,10 +27,17 @@ On rerun an existing split is skipped only if its ``split`` attrs (seed,
 split count/index, shuffle mode, source rows) match; otherwise the run stops.
 ``--split-index`` values beyond the split count exit 0 (spare array tasks).
 
-``--shuffle global`` (default) permutes individual rows, so every split reads
-nearly every source chunk. ``--shuffle block`` permutes whole source chunks
-and then shuffles rows within each split: roughly one read of the source in
-total, at the cost of chunk-level (not row-level) split membership.
+``--shuffle global`` (default) permutes individual rows, so every split needs
+rows from nearly every source chunk. By default (``--single-pass``) all splits
+of one invocation (every split, or those of ``--split-index``/``--split-stride``)
+are gathered together in one read of the source, decoding each chunk once, and
+held in memory one array at a time (``--max-buffer-gb`` caps that: the splits
+are then written in groups, one source read per group). ``--no-single-pass``
+streams each split separately in ``--batch-rows`` batches with bounded memory,
+which re-decodes most source chunks for every batch and every split. Both write
+identical stores. ``--shuffle block`` permutes whole source chunks and then
+shuffles rows within each split, at the cost of chunk-level (not row-level)
+split membership.
 
 Usage:
     # Plan only (row counts, split sizes) without writing anything
@@ -54,7 +61,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from zarr_compat import open_root_group  # noqa: E402
-from zarr_rowstore import default_batch_rows, is_row_aligned, row_count, write_row_subset  # noqa: E402
+from zarr_rowstore import default_batch_rows, is_row_aligned, row_count, write_row_subsets  # noqa: E402
 
 # Subgroups whose contents index into the *source* row order and would be
 # silently wrong after shuffling.
@@ -154,6 +161,12 @@ def main(argv=None) -> int:
                     help="Rows per streamed read batch (default: sized to ~512 MiB)")
     ap.add_argument("--chunk-rows", type=int, default=None,
                     help="Row chunk for output arrays (default: keep source chunking)")
+    ap.add_argument("--single-pass", action=argparse.BooleanOptionalAction, default=True,
+                    help="Gather this invocation's splits in one source read (default) instead of "
+                         "streaming each split separately")
+    ap.add_argument("--max-buffer-gb", type=float, default=48.0,
+                    help="With --single-pass: max GiB of split rows held in memory for one array "
+                         "(the widest); more splits are written in several groups (default 48)")
     ap.add_argument("--dry-run", action="store_true", help="Print the split plan and exit")
     args = ap.parse_args(argv)
 
@@ -221,6 +234,23 @@ def main(argv=None) -> int:
         if args.split_stride is not None and args.split_stride < 1:
             raise ValueError(f"--split-stride must be >= 1, got {args.split_stride}")
         targets = range(args.split_index, num_splits, args.split_stride or num_splits)
+    widest_row_bytes = max(_row_bytes(a) for _n, a in row_arrays)
+    budget = int(args.max_buffer_gb * 1024 ** 3) if args.single_pass else 0
+    group, group_bytes = [], 0
+
+    def _flush():
+        nonlocal group, group_bytes
+        if group:
+            for k, path, rows, _meta in group:
+                print(f"[{k}] writing {len(rows)} rows -> {path}")
+            write_row_subsets(
+                src, [(path, rows, meta) for _k, path, rows, meta in group],
+                stage="split", source_path=input_path,
+                drop_subgroups=_DROPPED_SUBGROUPS,
+                chunk_rows=args.chunk_rows, batch_rows=batch_rows, single_pass=args.single_pass,
+            )
+        group, group_bytes = [], 0
+
     for k in targets:
         final_path = os.path.join(output_dir, f"{prefix}_{k:0{pad}d}.zarr")
         rows = perm[offsets[k] : offsets[k + 1]]
@@ -242,13 +272,12 @@ def main(argv=None) -> int:
         if args.shuffle == "block":
             # Whole chunks were assigned to this split; shuffle rows within it.
             rows = np.random.default_rng([args.seed, k]).permutation(rows)
-        print(f"[{k}] writing {len(rows)} rows -> {final_path}")
-        write_row_subset(
-            src, final_path, rows,
-            stage="split", source_path=input_path, stage_attrs=meta,
-            drop_subgroups=_DROPPED_SUBGROUPS,
-            chunk_rows=args.chunk_rows, batch_rows=batch_rows,
-        )
+        need = len(rows) * widest_row_bytes
+        if group and group_bytes + need > budget:
+            _flush()
+        group.append((k, final_path, rows, meta))
+        group_bytes += need
+    _flush()
     print("Done.")
     return 0
 

@@ -7,6 +7,8 @@ import glob
 import logging
 import re
 import hashlib
+import shutil
+import tempfile
 import dataclasses
 import functools
 import math
@@ -339,6 +341,11 @@ def _normalize_config_dict(cfg_data: dict, default_project_root: str) -> dict:
     flat["grid_points"] = normalized_points
     flat["grid_points_file"] = cfg_data.get("grid_points_file", "")
 
+    # Atmosphere selection (see TurbospectrumConfig.atmosphere_selection).
+    for key in ("selection", "turb_label", "max_widen", "spherical_below_logg"):
+        if key in model_atmosphere_cfg:
+            flat[f"atmosphere_{key}"] = model_atmosphere_cfg[key]
+
     return flat
 
 
@@ -356,7 +363,21 @@ class TurbospectrumConfig:
     model_atmosphere_path: str = ""
     linelist_path: str = ""
     linelist_files: List[str] = None
-    
+
+    # Atmosphere selection (config: turbospectrum.model_atmosphere.selection etc.).
+    #   "nearest"     - exact MARCS file if present, else nearest-neighbour snap.
+    #   "interpolate" - interpol_modeles over the 8 MARCS models bracketing
+    #       (teff, logg, feh), all at the single t-label atmosphere_turb_label
+    #       (the atmosphere microturbulence is fixed; vmicro only enters bsyn).
+    #       Spherical 1 Msun models below atmosphere_spherical_below_logg,
+    #       plane-parallel at and above it. Brackets with a missing corner
+    #       (unconverged MARCS models) may widen by at most atmosphere_max_widen
+    #       node steps in total; rows with no complete bracket fail.
+    atmosphere_selection: str = "nearest"
+    atmosphere_turb_label: str = "02"
+    atmosphere_max_widen: int = 1
+    atmosphere_spherical_below_logg: float = 3.0
+
     # Output Directories
     output_dir: str = ""
     log_dir: str = ""
@@ -436,6 +457,19 @@ class TurbospectrumConfig:
             raise ValueError(f"resolution must be > 0, got {self.resolution!r}")
         if not isinstance(self.mu_sampling, dict):
             self.mu_sampling = {}
+        self.atmosphere_selection = str(self.atmosphere_selection or "nearest").strip().lower()
+        if self.atmosphere_selection not in ("nearest", "interpolate"):
+            raise ValueError(
+                f"atmosphere_selection must be 'nearest' or 'interpolate', got {self.atmosphere_selection!r}"
+            )
+        self.atmosphere_turb_label = f"{int(float(self.atmosphere_turb_label)):02d}"
+        self.atmosphere_max_widen = int(self.atmosphere_max_widen)
+        if self.atmosphere_max_widen < 0:
+            raise ValueError(f"atmosphere_max_widen must be >= 0, got {self.atmosphere_max_widen!r}")
+        self.atmosphere_spherical_below_logg = float(self.atmosphere_spherical_below_logg)
+        if self.atmosphere_selection == "interpolate" and self.nlte:
+            # NLTE departure lookup keys on the MARCS model stem of the atmosphere file.
+            raise ValueError("atmosphere_selection='interpolate' is not supported with NLTE yet")
         # Intentionally no Intensity default of mode="random": the per-row
         # consumer chooses "nearest" when the row has a target mu, else "random".
         if self.worker_memory_gb not in (None, ""):
@@ -889,12 +923,16 @@ def resolve_linelist_paths(linelist_path: str, linelist_files: Optional[List[str
             continue
 
         candidate = raw if os.path.isabs(raw) else os.path.abspath(os.path.join(base_dir, raw))
+        # Only the entry itself is a pattern: the base directory is escaped, because PBS array
+        # subjobs get directories such as /jobfs/123[0].gadi-pbs whose "[0]" glob would read as a
+        # character class (no entry, even a plain filename, would then match).
+        pattern = raw if os.path.isabs(raw) else os.path.join(glob.escape(os.path.abspath(base_dir)), raw)
 
-        if glob.has_magic(candidate):
-            recursive = "**" in candidate
+        if glob.has_magic(raw):
+            recursive = "**" in raw
             matches = sorted(
                 os.path.abspath(path)
-                for path in glob.glob(candidate, recursive=recursive)
+                for path in glob.glob(pattern, recursive=recursive)
             )
             paths = [path for path in matches if os.path.isfile(path)]
             if not paths:
@@ -983,8 +1021,12 @@ def validate_linelist_files(linelist_path: str, linelist_files: Optional[List[st
 def create_linelist_file(config: TurbospectrumConfig) -> str:
     """Creates a file containing the list of linelists to use."""
     list_file_path = os.path.join(config.tmp_dir, "linelists.txt")
+    # TS_LINELIST_ROOT: a node-local copy of the linelist directory (e.g. staged to $PBS_JOBFS by the
+    # job script) that bsyn reads instead of config.linelist_path. Only the list handed to bsyn
+    # changes; the config, its hash and the provenance checksums still refer to config.linelist_path.
+    linelist_root = os.environ.get("TS_LINELIST_ROOT", "").strip() or config.linelist_path
     with open(list_file_path, "w") as f:
-        for path in validate_linelist_files(config.linelist_path, config.linelist_files):
+        for path in validate_linelist_files(linelist_root, config.linelist_files):
             f.write(f"{path}\n") # Turbospectrum does not want quotes in the list file apparently
             
     return list_file_path
@@ -1031,7 +1073,10 @@ _MARCS_COMP_KEYS = ("marcs_fe_h", "marcs_a_fe", "marcs_c_fe", "marcs_n_fe", "mar
 # result["params"]. (marcs_turb is the microturbulence in km/s, from the t-label.)
 # The atmosphere's [Fe/H] is reported by the composition column marcs_fe_h, so it
 # is deliberately not duplicated here.
-_MARCS_ATM_KEYS = ("marcs_teff", "marcs_logg", "marcs_turb")
+# marcs_interp is set only under atmosphere_selection="interpolate": 0 = a MARCS
+# node file used as is, 1 = interpolated from the nearest bracket, 1 + k = from a
+# bracket widened by k node steps. NaN otherwise (the merge drops all-NaN columns).
+_MARCS_ATM_KEYS = ("marcs_teff", "marcs_logg", "marcs_turb", "marcs_interp")
 
 _MARCS_MODEL_RE = re.compile(
     r"_z([+\-]\d+\.\d+)_a([+\-]\d+\.\d+)_c([+\-]\d+\.\d+)_n([+\-]\d+\.\d+)_o([+\-]\d+\.\d+)"
@@ -1086,6 +1131,7 @@ def parse_marcs_atmosphere_params(model_path: str) -> Dict[str, float]:
         "marcs_teff": teff,
         "marcs_logg": logg,
         "marcs_turb": turb,
+        "marcs_interp": float("nan"),
     }
 
 
@@ -1773,8 +1819,183 @@ class ModelInterpolator:
                 return False, f"Interpolation failed:\n{process.stdout}"
         except Exception as e:
             return False, f"Interpolation execution error: {e}"
-            
+
         return True, "Success"
+
+    def _node_index(self, geom: str, turb_label: str) -> Dict[Tuple[int, float, float], str]:
+        """(teff, logg, feh) -> path for one geometry/t-label subset.
+
+        Spherical models are restricted to 1 Msun so the interpolated structure
+        never mixes masses (interpol_modeles also rejects mixed geometries).
+        """
+        cache = self.__dict__.setdefault("_node_index_cache", {})
+        if (geom, turb_label) not in cache:
+            mass = 1.0 if geom == "s" else 0.0
+            index = {
+                (int(m["teff"]), round(float(m["logg"]), 2), round(float(m["feh"]), 2)): m["path"]
+                for m in self.available_models
+                if m["geom"] == geom and m["turb"] == turb_label and abs(m["mass"] - mass) < 1e-6
+            }
+            axes = tuple(sorted({k[i] for k in index}) for i in range(3))
+            cache[(geom, turb_label)] = (index, axes)
+        return cache[(geom, turb_label)][0]
+
+    def _node_axes(self, geom: str, turb_label: str):
+        """Sorted Teff, logg and [Fe/H] node values of :meth:`_node_index`."""
+        self._node_index(geom, turb_label)
+        return self._node_index_cache[(geom, turb_label)][1]
+
+    def find_interpolation_bracket(
+        self,
+        teff: float,
+        logg: float,
+        feh: float,
+        turb_label: str,
+        *,
+        spherical_below_logg: float = 3.0,
+        max_widen: int = 1,
+    ) -> Dict[str, Any]:
+        """Choose the 8 MARCS models interpol_modeles interpolates between.
+
+        The geometry follows logg (spherical 1 Msun below ``spherical_below_logg``,
+        plane-parallel otherwise) and the t-label is fixed. On each axis the
+        candidate pairs are nodes (lo, hi) with lo <= x <= hi; the adjacent pair
+        is preferred, and a pair spanning k extra nodes costs k widening steps.
+        The complete bracket (all 8 files present) with the fewest total
+        widening steps, then the smallest node span, wins. Raises ValueError when
+        the point lies outside the subset's node range (no extrapolation) or no
+        bracket within ``max_widen`` steps is complete.
+
+        Returns a dict with ``geom``, ``teff``/``logg``/``feh`` node pairs,
+        ``paths`` (8 files, Teff-major then logg then [Fe/H], the order
+        interpol_modeles expects), ``widen`` and, when the point sits exactly on a
+        node, ``node_path`` (that file, used as is).
+        """
+        geom = "s" if logg < spherical_below_logg else "p"
+        index = self._node_index(geom, turb_label)
+        if not index:
+            raise ValueError(f"no {geom}-geometry t{turb_label} models in {self.config.model_atmosphere_path}")
+        eps = 1e-6
+        on_node = all(abs(v - round(v, 2)) < eps for v in (teff, logg, feh))
+        node_path = index.get((int(round(teff)), round(logg, 2), round(feh, 2))) if on_node else None
+        if node_path is not None:
+            return {"geom": geom, "paths": [], "widen": 0, "node_path": node_path,
+                    "teff": (teff, teff), "logg": (logg, logg), "feh": (feh, feh)}
+
+        def axis_pairs(nodes, x, scale):
+            if x < nodes[0] - eps or x > nodes[-1] + eps:
+                return []
+            pairs = []
+            for i in range(len(nodes)):
+                for j in range(i + 1, min(len(nodes), i + 2 + max_widen)):
+                    if nodes[i] <= x + eps and x - eps <= nodes[j]:
+                        # The tightest pair containing x spans one gap (on a
+                        # node, either neighbouring gap); each extra gap is a
+                        # widening step.
+                        pairs.append((nodes[i], nodes[j], j - i - 1, (nodes[j] - nodes[i]) / scale))
+            return pairs
+
+        t_nodes, g_nodes, z_nodes = self._node_axes(geom, turb_label)
+        t_pairs = axis_pairs(t_nodes, teff, SNAP_SCALES["teff"])
+        g_pairs = axis_pairs(g_nodes, logg, SNAP_SCALES["logg"])
+        z_pairs = axis_pairs(z_nodes, feh, SNAP_SCALES["feh"])
+        if not (t_pairs and g_pairs and z_pairs):
+            raise ValueError(
+                f"({teff}, {logg}, {feh}) is outside the {geom} t{turb_label} node range; no extrapolation"
+            )
+
+        best = None
+        for tp in t_pairs:
+            for gp in g_pairs:
+                for zp in z_pairs:
+                    widen = tp[2] + gp[2] + zp[2]
+                    if widen > max_widen:
+                        continue
+                    cost = (widen, tp[3] + gp[3] + zp[3])
+                    if best is not None and cost >= best[0]:
+                        continue
+                    paths = [index.get((t, g, z)) for t in tp[:2] for g in gp[:2] for z in zp[:2]]
+                    if all(paths):
+                        best = (cost, tp, gp, zp, paths)
+        if best is None:
+            raise ValueError(
+                f"no complete {geom} t{turb_label} bracket for ({teff}, {logg}, {feh}) "
+                f"within {max_widen} widening step(s)"
+            )
+        (widen, _), tp, gp, zp, paths = best
+        return {"geom": geom, "paths": paths, "widen": int(widen), "node_path": None,
+                "teff": tp[:2], "logg": gp[:2], "feh": zp[:2]}
+
+    def interpolated_atmosphere(self, bracket: Mapping[str, Any], teff, logg, feh, out_dir: str) -> str:
+        """Run interpol_modeles for ``bracket`` and return the model path.
+
+        The output name is a pure function of the target and the bracket, so a
+        valid file already on disk is reused (idempotent shards); it is written
+        under a temporary name and renamed into place (atomic).
+
+        interpol_modeles returns NaN for T, Pe and Pg at every depth when the
+        target sits exactly on a bracket bound (seen for log g = 2.5 with a
+        2.5-3.0 bracket); bsyn then fails with an empty spectrum. A model with
+        NaN is therefore re-interpolated with the target moved inside the bracket
+        by 1e-4 of its width (0.025 K, 5e-5 dex); models without NaN are never
+        nudged, so rows that interpolate cleanly are unchanged.
+        """
+        out_dir = os.path.abspath(out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        tag = hashlib.sha1("\n".join(bracket["paths"]).encode()).hexdigest()[:8]
+        out_path = os.path.join(
+            out_dir, f"{bracket['geom']}{float(teff):.1f}_g{float(logg):+.3f}_z{float(feh):+.3f}_{tag}.interp.mod"
+        )
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0 and not interpolated_model_has_nan(out_path):
+            return out_path
+        target = {"teff": float(teff), "logg": float(logg), "feh": float(feh)}
+        for nudge in (0.0, 1e-4):
+            point = dict(target)
+            for axis in point:
+                lo, hi = (float(v) for v in bracket[axis])
+                if hi > lo and nudge:
+                    eps = nudge * (hi - lo)
+                    point[axis] = min(max(point[axis], lo + eps), hi - eps)
+            self._run_interpol(bracket, point, out_path, out_dir)
+            if not interpolated_model_has_nan(out_path):
+                return out_path
+        os.remove(out_path)
+        raise RuntimeError(f"interpol_modeles returned NaN for {target} even after nudging inside {bracket['paths'][0]} ...")
+
+    def _run_interpol(self, bracket: Mapping[str, Any], point: Mapping[str, float], out_path: str, out_dir: str) -> None:
+        tmp_path = f"{out_path}.{os.getpid()}.tmp"
+        alt_path = f"{tmp_path}.alt"
+        if len(tmp_path) > 250 or any(len(p) > 250 for p in bracket["paths"]):
+            raise ValueError(f"path too long for interpol_modeles (character*256): {tmp_path}")
+        stdin = "".join(f"'{p}'\n" for p in bracket["paths"])
+        stdin += f"'{tmp_path}'\n'{alt_path}'\n{point['teff']}\n{point['logg']}\n{point['feh']}\n.false.\n.false.\n''\n"
+        # interpol_modeles also writes 'modele.sm' into its working directory;
+        # a private one keeps concurrent workers (and the repo) out of each other's way.
+        work_dir = tempfile.mkdtemp(prefix="interpol.", dir=out_dir)
+        try:
+            proc = subprocess.run(
+                [self.config.interpol_path], input=stdin, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=work_dir,
+            )
+            if proc.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+                raise RuntimeError(f"interpol_modeles failed (rc={proc.returncode}):\n{proc.stdout[-2000:]}")
+            os.replace(tmp_path, out_path)
+        finally:
+            for p in (tmp_path, alt_path):
+                if os.path.exists(p):
+                    os.remove(p)
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def interpolated_model_has_nan(path: str) -> bool:
+    """True when an interpol_modeles model has a non-numeric value in its depth table."""
+    with open(path) as fh:
+        header = fh.readline().split()
+        n = int(header[1])
+        for _ in range(n):
+            if "nan" in fh.readline().lower():
+                return True
+    return False
 
 # bsyn allocates muoutp(30) in source/input.f, so at most 30 mu points may be
 # requested per synthesis (see the COS(THETA)/MU-POINTS branch in input.f).
@@ -1856,6 +2077,11 @@ def run_single_synthesis(args):
         synthesis_abundances = {}
         mode_value = None
 
+    interpolate_atmosphere = getattr(config, "atmosphere_selection", "nearest") == "interpolate"
+    if interpolate_atmosphere:
+        # Fixed atmosphere microturbulence; the requested vmicro only enters bsyn.
+        model_turb_str = config.atmosphere_turb_label
+
     # Map turb_str to float for babsma input if needed
     turb_val = _coerce_microturbulence_value(synthesis_turb_raw, fallback=model_turb_str)
 
@@ -1906,7 +2132,9 @@ def run_single_synthesis(args):
         default_output_mode=output_mode,
         default_calculation_mode=calculation_mode,
         atmosphere_turb_labels=atmosphere_turb_labels,
-    ) + mu_stem_tag
+    ) + ("_ai" if interpolate_atmosphere else "") + mu_stem_tag
+    # "_ai" keeps interpolated-atmosphere stems (and their shared COM/contopac
+    # .opac files) apart from nearest-atmosphere runs at the same parameters.
     result_suffix = ".intensity.spec" if output_mode == "Intensity" else ".spec"
     opac_root = os.path.join(config.project_root, config.model_opac_dir)
     base_name = _fit_stem_to_path_limits(
@@ -1967,7 +2195,21 @@ def run_single_synthesis(args):
     # If exact model doesn't exist, pick a nearest-neighbor MARCS atmosphere (no interpolation).
     model_input_path = model_path
     fallback_model_message = ""
-    if not os.path.exists(model_path):
+    atm_bracket: Optional[Dict[str, Any]] = None
+    if interpolate_atmosphere:
+        model_lib = ModelInterpolator(config)
+        try:
+            atm_bracket = model_lib.find_interpolation_bracket(
+                teff, logg, feh, model_turb_str,
+                spherical_below_logg=config.atmosphere_spherical_below_logg,
+                max_widen=config.atmosphere_max_widen,
+            )
+            model_input_path = atm_bracket["node_path"] or model_lib.interpolated_atmosphere(
+                atm_bracket, teff, logg, feh, os.path.join(config.tmp_dir, "atmospheres")
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            return build_result("error", f"Atmosphere interpolation failed: {exc}")
+    elif not os.path.exists(model_path):
         model_lib = ModelInterpolator(config)
         nearest, message = model_lib.find_nearest_model(teff, logg, feh, model_turb_str)
         if not nearest:
@@ -1981,6 +2223,22 @@ def run_single_synthesis(args):
     # snapped rows they are the grid point the selection was clamped to.
     marcs_composition = parse_marcs_composition(model_input_path)
     marcs_atm = parse_marcs_atmosphere_params(model_input_path)
+    if atm_bracket is not None:
+        # The interpolated structure sits at the requested point. Its alpha is
+        # the [Fe/H]-linear blend of the corner models' standard alpha (equal to
+        # the standard ramp unless the bracket was widened across a kink).
+        z_lo, z_hi = atm_bracket["feh"]
+        w = 0.0 if z_hi == z_lo else (feh - z_lo) / (z_hi - z_lo)
+        alpha = (1 - w) * standard_composition_alpha(z_lo) + w * standard_composition_alpha(z_hi)
+        marcs_composition = {
+            "marcs_fe_h": float(feh), "marcs_a_fe": alpha,
+            "marcs_c_fe": 0.0, "marcs_n_fe": 0.0, "marcs_o_fe": alpha,
+        }
+        marcs_atm = {
+            "marcs_teff": float(teff), "marcs_logg": float(logg),
+            "marcs_turb": float(model_turb_str),
+            "marcs_interp": 0.0 if atm_bracket["node_path"] else 1.0 + atm_bracket["widen"],
+        }
 
     # Check if output exists and skip if force is False. This runs after the
     # atmosphere is resolved so a reused spectrum (e.g. the other mu-rows of
@@ -2069,6 +2327,13 @@ def run_single_synthesis(args):
                 "WARNING: requested atmosphere model was not found; "
                 f"requested={model_path} selected={model_input_path} "
                 f"reason={fallback_model_message}\n"
+            )
+        if atm_bracket is not None:
+            log.write(
+                f"Atmosphere: {atm_bracket['geom']} t{model_turb_str} "
+                f"teff={atm_bracket['teff']} logg={atm_bracket['logg']} feh={atm_bracket['feh']} "
+                f"widen={atm_bracket['widen']} model={model_input_path} "
+                f"corners={[os.path.basename(p) for p in atm_bracket['paths']]}\n"
             )
         if nlte_ascii_info is not None:
             log.write(

@@ -230,6 +230,53 @@ def default_batch_rows(arrays) -> int:
     return int(min(4096, max(64, _BATCH_TARGET_BYTES // widest)))
 
 
+def gather_rows(src_arr, row_lists, slab_rows: Optional[int] = None) -> List[np.ndarray]:
+    """Return ``[src_arr[rows] for rows in row_lists]`` reading ``src_arr`` once, in storage order.
+
+    ``copy_rows`` decodes every source chunk touched by each batch, so a randomly scattered
+    subset re-decodes most of the store once per batch (and again for every subset). Here the
+    source is read in contiguous slabs of whole chunks (zarr decodes the chunks of a slab
+    concurrently) and each slab is decoded once for all subsets; the requested rows are
+    scattered into in-memory buffers, one per subset, in the requested order. Slabs holding
+    no requested row are skipped. Memory: the buffers (sum of subset sizes) plus one slab.
+    """
+    n = int(src_arr.shape[0])
+    chunk = int(src_arr.chunks[0]) if getattr(src_arr, "chunks", None) else n
+    if slab_rows is None:
+        slab_rows = default_slab_rows(src_arr)
+    slab_rows = max(chunk, (int(slab_rows) // chunk) * chunk)
+    tail = tuple(src_arr.shape[1:])
+    out = [np.empty((len(r),) + tail, dtype=src_arr.dtype) for r in row_lists]
+    if not row_lists:
+        return out
+    src_rows = np.concatenate([np.asarray(r, dtype=np.int64) for r in row_lists])
+    owner = np.concatenate([np.full(len(r), k, dtype=np.int64) for k, r in enumerate(row_lists)])
+    pos = np.concatenate([np.arange(len(r), dtype=np.int64) for r in row_lists])
+    order = np.argsort(src_rows, kind="stable")
+    src_rows, owner, pos = src_rows[order], owner[order], pos[order]
+    if src_rows.size and (src_rows[0] < 0 or src_rows[-1] >= n):
+        raise IndexError(f"row index out of range for {n} rows")
+    bounds = np.searchsorted(src_rows, np.arange(0, n + slab_rows, slab_rows))
+    for i, a in enumerate(range(0, n, slab_rows)):
+        lo, hi = int(bounds[i]), int(bounds[i + 1])
+        if lo == hi:
+            continue
+        slab = np.asarray(src_arr[a:min(a + slab_rows, n)])
+        for k in np.unique(owner[lo:hi]):
+            sel = slice(lo, hi)
+            m = owner[sel] == k
+            out[k][pos[sel][m]] = slab[src_rows[sel][m] - a]
+    return out
+
+
+def default_slab_rows(arr) -> int:
+    """Whole chunks per slab read, ~1 GiB, at least 8 chunks so zarr can decode them in parallel."""
+    chunk = int(arr.chunks[0]) if getattr(arr, "chunks", None) else max(1, int(arr.shape[0]))
+    per_row = int(np.prod(arr.shape[1:], dtype=np.int64)) * int(np.dtype(arr.dtype).itemsize) if arr.ndim > 1 else 8
+    n_chunks = max(8, (1 << 30) // max(1, per_row * chunk))
+    return chunk * n_chunks
+
+
 def _derived_physics_hash(parent: str, rows: np.ndarray) -> str:
     import hashlib
     import json
@@ -263,12 +310,36 @@ def write_row_subset(
       ``<stage>`` subgroup.
     Returns {"sliced": [...], "copied": [...]} array names.
     """
+    return write_row_subsets(src, [(output_path, rows, stage_attrs)], stage=stage, source_path=source_path,
+                             drop_subgroups=drop_subgroups, chunk_rows=chunk_rows, batch_rows=batch_rows,
+                             single_pass=False)
+
+
+def write_row_subsets(
+    src,
+    outputs,
+    *,
+    stage: str,
+    source_path: str,
+    drop_subgroups=(),
+    chunk_rows: Optional[int] = None,
+    batch_rows: Optional[int] = None,
+    single_pass: bool = True,
+    slab_rows: Optional[int] = None,
+) -> dict:
+    """``write_row_subset`` for several ``(output_path, rows, stage_attrs)`` outputs at once.
+
+    Each output is exactly what ``write_row_subset`` writes for it. With ``single_pass`` the
+    numeric row-aligned arrays are gathered with ``gather_rows`` (one read of the source for all
+    outputs; each output's rows are held in memory, one array at a time); otherwise each output
+    is streamed separately with ``copy_rows`` (bounded memory, repeated source reads).
+    """
     import json
 
     compression_kwargs, create_array, create_root_group = _zc.compression_kwargs, _zc.create_array, _zc.create_root_group
     write_fixed_string_scalar, zarr_store = _zc.write_fixed_string_scalar, _zc.zarr_store
 
-    rows = np.asarray(rows, dtype=np.int64)
+    outputs = [(path, np.asarray(rows, dtype=np.int64), attrs) for path, rows, attrs in outputs]
     n_rows = row_count(src)
     row_names = [n for n in src.array_keys() if is_row_aligned(n, src[n], n_rows)]
     static_names = [n for n in src.array_keys() if n not in row_names]
@@ -277,58 +348,74 @@ def write_row_subset(
 
     parent_attrs = dict(src.attrs)
     parent_hash = str(parent_attrs.get("physics_hash", "") or "")
-    with atomic_output(output_path) as tmp:
-        dst = create_root_group(zarr_store(tmp), overwrite=True)
-        copy_attrs(src, dst)
+    with contextlib.ExitStack() as stack:
+        dsts = []
+        for path, _rows, _attrs in outputs:
+            tmp = stack.enter_context(atomic_output(path))
+            dst = create_root_group(zarr_store(tmp), overwrite=True)
+            copy_attrs(src, dst)
+            dsts.append((tmp, dst))
         for name in row_names:
             arr = src[name]
             if name == "source_row_index":
                 continue
-            if arr.dtype.kind in "USOT":
-                new = _write_full(dst, name, np.asarray(arr[...])[rows])
-            else:
-                row_chunk = chunk_rows or (arr.chunks[0] if arr.chunks else len(rows))
-                chunks = (max(1, min(len(rows), row_chunk)),) + tuple(arr.chunks[1:] if arr.chunks else arr.shape[1:])
-                new = create_array(dst, name, shape=(len(rows),) + tuple(arr.shape[1:]),
-                                   dtype=arr.dtype, chunks=chunks, **compression_kwargs())
-                copy_rows(arr, new, rows, batch_rows)
-            copy_attrs(arr, new)
-        for name in static_names:
-            if name == "physics_hash":
-                continue
-            copy_array(src, dst, name)
+            numeric = arr.dtype.kind not in "USOT"
+            gathered = (gather_rows(arr, [rows for _p, rows, _a in outputs], slab_rows)
+                        if numeric and single_pass else None)
+            for k, ((_path, rows, _attrs), (_tmp, dst)) in enumerate(zip(outputs, dsts)):
+                if not numeric:
+                    new = _write_full(dst, name, np.asarray(arr[...])[rows])
+                else:
+                    row_chunk = chunk_rows or (arr.chunks[0] if arr.chunks else len(rows))
+                    chunks = (max(1, min(len(rows), row_chunk)),) + tuple(arr.chunks[1:] if arr.chunks else arr.shape[1:])
+                    new = create_array(dst, name, shape=(len(rows),) + tuple(arr.shape[1:]),
+                                       dtype=arr.dtype, chunks=chunks, **compression_kwargs())
+                    if gathered is not None:
+                        if len(rows):
+                            new[...] = gathered[k]
+                        gathered[k] = None  # free each output's buffer as soon as it is written
+                    else:
+                        copy_rows(arr, new, rows, batch_rows)
+                copy_attrs(arr, new)
+            del gathered
 
-        original = (np.asarray(src["source_row_index"][...], dtype=np.int64)[rows]
-                    if "source_row_index" in row_names else rows)
-        create_array(dst, "source_row_index", data=original, chunks=(max(1, min(len(rows), 1 << 20)),))
-        copy_subgroups(src, dst, drop=set(drop_subgroups) | {stage})
+        for (path, rows, stage_attrs), (tmp, dst) in zip(outputs, dsts):
+            for name in static_names:
+                if name == "physics_hash":
+                    continue
+                copy_array(src, dst, name)
 
-        derived_hash = _derived_physics_hash(parent_hash, rows) if parent_hash else ""
-        if "physics_hash" in static_names:
-            write_fixed_string_scalar(dst, "physics_hash", derived_hash or parent_hash, min_width=64,
-                                      compression_kw=compression_kwargs())
-        entry = {"stage": stage, "source": os.path.abspath(source_path),
-                 "source_rows": int(n_rows), "rows": int(len(rows)),
-                 "parent_physics_hash": parent_hash, **dict(stage_attrs or {})}
-        lineage = parent_attrs.get("lineage") or []
-        if isinstance(lineage, str):
-            lineage = json.loads(lineage)
-        update = {"n_models": int(len(rows)), "lineage": list(lineage) + [entry]}
-        if derived_hash:
-            update["physics_hash"] = derived_hash
-        if "status" in row_names:
-            counts: dict = {}
-            for s in decode_statuses(dst["status"][...]):
-                counts[s] = counts.get(s, 0) + 1
-            update["status_counts"] = counts
-        dst.attrs.update(update)
-        grp = dst.create_group(stage)
-        for key, value in (stage_attrs or {}).items():
-            grp.attrs[key] = value
-        try:
-            import zarr
+            original = (np.asarray(src["source_row_index"][...], dtype=np.int64)[rows]
+                        if "source_row_index" in row_names else rows)
+            create_array(dst, "source_row_index", data=original, chunks=(max(1, min(len(rows), 1 << 20)),))
+            copy_subgroups(src, dst, drop=set(drop_subgroups) | {stage})
 
-            zarr.consolidate_metadata(zarr_store(tmp))
-        except Exception:
-            pass
+            derived_hash = _derived_physics_hash(parent_hash, rows) if parent_hash else ""
+            if "physics_hash" in static_names:
+                write_fixed_string_scalar(dst, "physics_hash", derived_hash or parent_hash, min_width=64,
+                                          compression_kw=compression_kwargs())
+            entry = {"stage": stage, "source": os.path.abspath(source_path),
+                     "source_rows": int(n_rows), "rows": int(len(rows)),
+                     "parent_physics_hash": parent_hash, **dict(stage_attrs or {})}
+            lineage = parent_attrs.get("lineage") or []
+            if isinstance(lineage, str):
+                lineage = json.loads(lineage)
+            update = {"n_models": int(len(rows)), "lineage": list(lineage) + [entry]}
+            if derived_hash:
+                update["physics_hash"] = derived_hash
+            if "status" in row_names:
+                counts: dict = {}
+                for s in decode_statuses(dst["status"][...]):
+                    counts[s] = counts.get(s, 0) + 1
+                update["status_counts"] = counts
+            dst.attrs.update(update)
+            grp = dst.create_group(stage)
+            for key, value in (stage_attrs or {}).items():
+                grp.attrs[key] = value
+            try:
+                import zarr
+
+                zarr.consolidate_metadata(zarr_store(tmp))
+            except Exception:
+                pass
     return {"sliced": sorted(row_names), "copied": sorted(static_names)}

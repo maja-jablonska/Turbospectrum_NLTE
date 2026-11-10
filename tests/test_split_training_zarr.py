@@ -226,3 +226,48 @@ def test_split_updates_lineage_and_counts(source_store, tmp_path):
     for grp in _open_splits(out_dir):
         assert grp.attrs["n_models"] == grp["flux"].shape[0]
         assert grp.attrs["lineage"][-1]["stage"] == "split"
+
+
+def _store_contents(path):
+    """Every array (values + dtype + chunks) and attrs of a store, recursively."""
+    import zarr
+
+    out = {}
+
+    def walk(grp, prefix):
+        out[prefix + "@attrs"] = {k: v for k, v in dict(grp.attrs).items()}
+        for name in sorted(grp.array_keys()):
+            arr = grp[name]
+            out[prefix + name] = (np.asarray(arr[...]).tolist(), str(arr.dtype), tuple(arr.chunks))
+        for name in sorted(grp.group_keys()):
+            walk(grp[name], prefix + name + "/")
+
+    walk(zarr.open_group(path, mode="r"), "")
+    return out
+
+
+@pytest.mark.parametrize("extra", [(), ("--max-buffer-gb", "1e-6"), ("--split-index", "1", "--split-stride", "2")])
+def test_single_pass_identical_to_streaming(source_store, tmp_path, extra):
+    a, b = tmp_path / "single", tmp_path / "stream"
+    assert _run(source_store, a, *extra) == 0
+    assert _run(source_store, b, "--no-single-pass", "--batch-rows", "7", *extra) == 0
+    names = sorted(p for p in os.listdir(a) if p.endswith(".zarr"))
+    assert names == sorted(p for p in os.listdir(b) if p.endswith(".zarr")) and names
+    for name in names:
+        assert _store_contents(str(a / name)) == _store_contents(str(b / name)), name
+
+
+def test_gather_rows_matches_fancy_indexing(source_store):
+    from zarr_rowstore import gather_rows
+
+    src = open_root_group(source_store)
+    flux = src["flux"][...]
+    rng = np.random.default_rng(3)
+    perm = rng.permutation(N_ROWS)
+    lists = [perm[:30], perm[30:31], perm[31:31], perm[31:]]
+    for slab in (1, 16, 17, 48, 1000):
+        got = gather_rows(src["flux"], lists, slab_rows=slab)
+        for rows, g in zip(lists, got):
+            np.testing.assert_array_equal(g, flux[rows])
+    with pytest.raises(IndexError):
+        gather_rows(src["flux"], [np.array([N_ROWS])])

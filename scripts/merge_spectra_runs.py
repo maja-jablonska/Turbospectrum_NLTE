@@ -378,23 +378,64 @@ def _build_provenance_group(
         _zc_write_string_scalar(prov, name, carried, compression_kw=compression_kwargs)
 
 
+class _AlignedRowWriter:
+    """Append row blocks to ``dst`` (from row ``start``), writing only whole output chunks.
+
+    Rows are buffered until at least ``flush_rows`` are pending, then every complete chunk is
+    written in one call (zarr encodes those chunks concurrently); ``close()`` writes the tail.
+    An unaligned write would make zarr read, decode and re-encode the partly written chunk at
+    both of its ends, which happens after every dropped row or run boundary.
+    """
+
+    def __init__(self, dst, start: int, flush_rows: int) -> None:
+        self.dst, self.cursor = dst, int(start)
+        self.chunk = int(dst.chunks[0]) if getattr(dst, "chunks", None) else 1
+        self.flush_rows = max(self.chunk, (int(flush_rows) // self.chunk) * self.chunk)
+        self.parts: List[np.ndarray] = []
+        self.pending = 0
+
+    def append(self, block: np.ndarray) -> None:
+        if len(block):
+            self.parts.append(block)
+            self.pending += len(block)
+            if self.pending >= self.flush_rows:
+                self._write(final=False)
+
+    def _write(self, *, final: bool) -> None:
+        if not self.parts:
+            return
+        data = self.parts[0] if len(self.parts) == 1 else np.concatenate(self.parts)
+        k = len(data) if final else (len(data) // self.chunk) * self.chunk
+        if k:
+            self.dst[self.cursor : self.cursor + k] = data[:k]
+            self.cursor += k
+        rest = data[k:]
+        self.parts = [rest] if len(rest) else []
+        self.pending = len(rest)
+
+    def close(self) -> int:
+        self._write(final=True)
+        return self.cursor
+
+
 def _copy_block(
-    dst,
+    writer: _AlignedRowWriter,
     src,
-    dst_start: int,
     mask: np.ndarray,
     *,
-    chunk_rows: int,
+    read_rows: int,
 ) -> None:
-    """Copy the masked source rows into dst starting at dst_start.
+    """Append the masked source rows to ``writer``.
 
     Streams in row blocks either way, so a large run's flux array is never
-    materialised in memory.
+    materialised in memory. Blocks are whole source chunks (``read_rows`` rounded
+    to a multiple of the source chunk) so zarr decodes the chunks of a block in parallel.
     """
     n = src.shape[0]
-    cursor = dst_start
-    for a in range(0, n, chunk_rows):
-        b = min(a + chunk_rows, n)
+    chunk = int(src.chunks[0]) if getattr(src, "chunks", None) else n
+    step = max(chunk, (int(read_rows) // chunk) * chunk)
+    for a in range(0, n, step):
+        b = min(a + step, n)
         block_mask = mask[a:b]
         kept = int(block_mask.sum())
         if not kept:
@@ -402,8 +443,7 @@ def _copy_block(
         block = np.asarray(src[a:b], dtype=np.float32)
         if kept != b - a:
             block = block[block_mask]
-        dst[cursor : cursor + kept] = block
-        cursor += kept
+        writer.append(block)
 
 
 def main() -> None:
@@ -412,6 +452,8 @@ def main() -> None:
     parser.add_argument("--run", action="append", default=None, help="Input run spectra.zarr (repeatable)")
     parser.add_argument("--run-dir", default=None, help="Directory containing input *.zarr run stores")
     parser.add_argument("--chunk-rows", type=int, default=128, help="Row chunk of output arrays (matches merge default)")
+    parser.add_argument("--io-chunks", type=int, default=8,
+                        help="Chunks per spectrum read/write block (decoded/encoded concurrently by zarr)")
     parser.add_argument("--compressor", default=None, help="JSON compressor options (cname, clevel, shuffle)")
     parser.add_argument("--schema-version", default="1.0.0", help="DATA_SCHEMA.md schema version")
     parser.add_argument("--generator", default="turbospectrum_nlte.merge_runs", help="Generator metadata string")
@@ -568,17 +610,22 @@ def main() -> None:
 
         # ---- Pass 2: stream rows into the output ------------------------------
         offset = 0
+        io_rows = max(1, int(args.io_chunks)) * chunk_rows
+        flux_writer = _AlignedRowWriter(flux_out, 0, io_rows)
+        continuum_writer = _AlignedRowWriter(continuum_out, 0, io_rows) if continuum_out is not None else None
         for run_idx, (r, mask) in enumerate(zip(runs, run_masks)):
             n_kept = int(mask.sum())
             if n_kept == 0:
                 continue
             root_in = _open_run(r.path)
 
-            _copy_block(flux_out, root_in["flux"], offset, mask, chunk_rows=chunk_rows)
-            if continuum_out is not None:
+            _copy_block(flux_writer, root_in["flux"], mask, read_rows=io_rows)
+            if continuum_writer is not None:
                 if r.has_continuum:
-                    _copy_block(continuum_out, root_in["continuum"], offset, mask, chunk_rows=chunk_rows)
-                # else: unwritten rows read back as the NaN fill_value.
+                    _copy_block(continuum_writer, root_in["continuum"], mask, read_rows=io_rows)
+                else:
+                    # rows of a run without continuum read back as NaN (the fill value)
+                    continuum_writer.append(np.full((n_kept, wl_count), np.nan, dtype=np.float32))
 
             params_aligned = _aligned_params(root_in, r.param_names, union_names)
             if not mask.all():
@@ -591,6 +638,9 @@ def main() -> None:
             offset += n_kept
 
         assert offset == out_row_count, f"row bookkeeping mismatch: wrote {offset}, expected {out_row_count}"
+        assert flux_writer.close() == out_row_count, "flux row bookkeeping mismatch"
+        if continuum_writer is not None:
+            assert continuum_writer.close() == out_row_count, "continuum row bookkeeping mismatch"
 
         # ---- Names / ids / scalars --------------------------------------------
         param_names_u32 = _to_u32_param_names(union_names)

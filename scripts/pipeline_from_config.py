@@ -163,6 +163,21 @@ def _generate_grid(pipeline_cfg: Mapping[str, Any], config_dir: str) -> Dict[str
                 "atmosphere_path": _abs_from(config_dir, atmosphere_path),
             }
 
+    # Interpolated atmospheres: the grid drops rows without a complete bracket
+    # using the same selection settings synthesis will use.
+    ts_cfg = pipeline_cfg.get("turbospectrum") or {}
+    atm_cfg = dict(ts_cfg.get("model_atmosphere") or {})
+    if str(atm_cfg.get("selection", "nearest")).strip().lower() == "interpolate":
+        if "bracket_prefilter" in grid_cfg:
+            raise ValueError(
+                "grid.bracket_prefilter is derived from turbospectrum.model_atmosphere; do not set it by hand"
+            )
+        atmosphere_path = str(((ts_cfg.get("paths") or {}).get("model_atmosphere_path")) or "").strip()
+        grid_cfg["bracket_prefilter"] = {
+            "atmosphere_path": _abs_from(config_dir, atmosphere_path) if atmosphere_path else "",
+            **{key: atm_cfg[key] for key in ("turb_label", "max_widen", "spherical_below_logg") if key in atm_cfg},
+        }
+
     run_root = _abs_from(config_dir, outputs.get("run_root")) or ""
     grid_csv = _abs_output_from(run_root, config_dir, outputs.get("grid_csv"))
     grid_zarr = _abs_output_from(run_root, config_dir, outputs.get("grid_zarr"))

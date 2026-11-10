@@ -50,6 +50,20 @@ class LinelistExpansionTests(unittest.TestCase):
 
         self.assertEqual(resolved, [self.alpha, self.beta])
 
+    def test_resolve_linelist_paths_under_pbs_array_jobfs_name(self) -> None:
+        # PBS array subjobs stage to /jobfs/<id>[<index>].gadi-pbs; "[0]" must not act as a glob class.
+        root = os.path.join(self.project_root, "jobfs", "182402945[0].gadi-pbs", "linelists")
+        os.makedirs(os.path.join(root, "molecules"))
+        plain = os.path.join(root, "plain_list")
+        mol = os.path.join(root, "molecules", "a.bsyn")
+        for path in (plain, mol):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("x")
+
+        resolved = resolve_linelist_paths(root, ["plain_list", "molecules/*.bsyn"])
+
+        self.assertEqual(resolved, [plain, mol])
+
     def test_create_linelist_file_writes_expanded_paths(self) -> None:
         tmp_dir = os.path.join(self.project_root, "tmp")
         os.makedirs(tmp_dir, exist_ok=True)

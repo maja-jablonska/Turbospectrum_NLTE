@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+from collections import Counter
 from itertools import islice, product
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -588,6 +589,87 @@ def _resolve_rerun_csv_sampling(config: Mapping[str, Any], base_dir: str | None 
     return columns
 
 
+def _prefilter_atmosphere_path(spec: Mapping[str, Any], base_dir: str | None, block: str) -> str:
+    """Resolve a prefilter block's ``atmosphere_path``; empty auto-locates the
+    repo's MARCS store exactly like TurbospectrumConfig does."""
+    atmosphere_path = str(spec.get("atmosphere_path", "") or "").strip()
+    if atmosphere_path:
+        atmosphere_path = os.path.expanduser(os.path.expandvars(atmosphere_path))
+        if base_dir and not os.path.isabs(atmosphere_path):
+            atmosphere_path = os.path.join(base_dir, atmosphere_path)
+    else:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(repo_root, "input_files", "model_atmospheres", "1D", "marcs_standard_comp")
+        nested = os.path.join(candidate, "marcs_standard_comp")
+        atmosphere_path = nested if os.path.isdir(nested) else candidate
+    if not os.path.isdir(atmosphere_path):
+        raise FileNotFoundError(f"grid.{block} atmosphere_path does not exist: {atmosphere_path}")
+    return atmosphere_path
+
+
+def apply_bracket_prefilter(columns: Dict[str, np.ndarray], config: Mapping[str, Any], base_dir: str | None = None) -> Dict[str, np.ndarray]:
+    """Drop grid rows that have no complete interpol_modeles bracket.
+
+    Enabled by a ``grid.bracket_prefilter`` block (``pipeline_from_config``
+    derives it from ``turbospectrum.model_atmosphere`` when ``selection`` is
+    ``"interpolate"``, so grid and synthesis use the same rule)::
+
+        "bracket_prefilter": {"atmosphere_path": "", "turb_label": "02",
+                              "max_widen": 1, "spherical_below_logg": 3.0}
+
+    Each row runs the production bracket search
+    (``ModelInterpolator.find_interpolation_bracket``); rows outside the MARCS
+    node range or in regions without converged models (e.g. hot, low-gravity
+    models near the Eddington limit) are removed before synthesis, where they
+    would only fail. Like the snap prefilter, rows kept = f(config, store).
+    """
+    spec = config.get("bracket_prefilter")
+    if not isinstance(spec, Mapping):
+        return columns
+    if isinstance(config.get("snap_prefilter"), Mapping):
+        raise ValueError("grid.bracket_prefilter and grid.snap_prefilter are mutually exclusive")
+    atmosphere_path = _prefilter_atmosphere_path(spec, base_dir, "bracket_prefilter")
+    try:
+        from run_turbospectrum import ModelInterpolator
+    except ImportError:
+        from .run_turbospectrum import ModelInterpolator  # type: ignore
+    from types import SimpleNamespace
+
+    lib = ModelInterpolator(SimpleNamespace(model_atmosphere_path=atmosphere_path))
+    turb_label = f"{int(float(spec.get('turb_label', '02'))):02d}"
+    max_widen = int(spec.get("max_widen", 1))
+    spherical_below_logg = float(spec.get("spherical_below_logg", 3.0))
+    teff = np.asarray(columns["teff"], dtype=float).ravel()
+    logg = np.asarray(columns["logg"], dtype=float).ravel()
+    feh = np.asarray(columns["feh"], dtype=float).ravel()
+    n = len(teff)
+    keep = np.ones(n, dtype=bool)
+    widen_counts: Counter = Counter()
+    for i in range(n):
+        try:
+            b = lib.find_interpolation_bracket(
+                teff[i], logg[i], feh[i], turb_label,
+                max_widen=max_widen, spherical_below_logg=spherical_below_logg,
+            )
+            widen_counts[b["widen"]] += 1
+        except ValueError:
+            keep[i] = False
+
+    log = logging.getLogger("generate_grid")
+    log.info(
+        "bracket_prefilter: kept %d/%d rows (widening steps: %s; t%s, store: %s)",
+        int(keep.sum()), n, dict(sorted(widen_counts.items())), turb_label, atmosphere_path,
+    )
+    if not keep.any():
+        raise ValueError(f"grid.bracket_prefilter dropped every row (store: {atmosphere_path})")
+    if not keep.all():
+        columns = {name: np.asarray(values)[keep] for name, values in columns.items()}
+    if "t_value" in columns:
+        # Every row is synthesised on the fixed t-label (vmicro only enters bsyn).
+        columns["t_value"] = np.full(int(keep.sum()), turb_label, dtype=np.asarray(columns["t_value"]).dtype)
+    return columns
+
+
 def apply_snap_prefilter(columns: Dict[str, np.ndarray], config: Mapping[str, Any], base_dir: str | None = None) -> Dict[str, np.ndarray]:
     """Drop grid rows whose predicted atmosphere snap exceeds tolerance.
 
@@ -619,18 +701,7 @@ def apply_snap_prefilter(columns: Dict[str, np.ndarray], config: Mapping[str, An
     if all(v is None for v in thresholds.values()):
         raise ValueError("grid.snap_prefilter needs at least one of max_dteff/max_dlogg/max_dfeh")
 
-    atmosphere_path = str(spec.get("atmosphere_path", "") or "").strip()
-    if atmosphere_path:
-        atmosphere_path = os.path.expanduser(os.path.expandvars(atmosphere_path))
-        if base_dir and not os.path.isabs(atmosphere_path):
-            atmosphere_path = os.path.join(base_dir, atmosphere_path)
-    else:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        candidate = os.path.join(repo_root, "input_files", "model_atmospheres", "1D", "marcs_standard_comp")
-        nested = os.path.join(candidate, "marcs_standard_comp")
-        atmosphere_path = nested if os.path.isdir(nested) else candidate
-    if not os.path.isdir(atmosphere_path):
-        raise FileNotFoundError(f"grid.snap_prefilter atmosphere_path does not exist: {atmosphere_path}")
+    atmosphere_path = _prefilter_atmosphere_path(spec, base_dir, "snap_prefilter")
 
     try:
         from filter_bad_snap_rows import _model_arrays, compute_correct_snap
@@ -732,6 +803,7 @@ def resolve_grid_columns(config: Mapping[str, Any], rng: np.random.Generator, ba
 
     warn_outside_marcs_bounds(columns, config)
     columns = apply_snap_prefilter(columns, config, base_dir=base_dir)
+    columns = apply_bracket_prefilter(columns, config, base_dir=base_dir)
     return columns
 
 

@@ -143,10 +143,15 @@ def classify_rows(src, atmosphere_path: str, *, max_dteff=None, max_dlogg=None, 
     (``correct_teff``/``correct_logg``/``correct_feh``), and the loaded
     ``requested`` columns.
     """
-    cols = _load_columns(src, _REQUIRED + ("t_value", "vmicro", "turbvel"))
+    cols = _load_columns(src, _REQUIRED + ("t_value", "vmicro", "turbvel", "marcs_interp"))
     missing = [name for name in _REQUIRED if name not in cols]
     if missing:
         raise SystemExit(f"Store lacks required per-row columns: {', '.join(missing)}")
+    if "marcs_interp" in cols and np.isfinite(cols["marcs_interp"]).any():
+        raise SystemExit(
+            "Store was synthesised with interpolated atmospheres (marcs_interp present); "
+            "there is no nearest-neighbour snap to check. Do not use --filter-bad-snaps on it."
+        )
     n = len(cols["teff"])
 
     # The t-label actually targeted at synthesis time. t_value records it
